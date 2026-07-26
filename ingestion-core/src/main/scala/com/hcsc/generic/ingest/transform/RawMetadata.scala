@@ -4,6 +4,11 @@ import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.functions._
 
 object RawMetadata {
+
+  /** Adds RAW metadata plus run lineage for replay and audit. */
+  def add(df: DataFrame, rawFlag: String, runId: String): DataFrame =
+    add(df, rawFlag).withColumn("run_id", lit(runId))
+
   def add(df: DataFrame, rawFlag: String): DataFrame = {
     val withSource =
       if (df.columns.exists(_.equalsIgnoreCase("source_file"))) df

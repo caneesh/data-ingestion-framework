@@ -1,6 +1,7 @@
 package com.hcsc.generic.ingest.file
 
 import com.hcsc.generic.ingest.config.ConfigUtils
+import com.hcsc.generic.ingest.schema.{SchemaContract, SchemaValidator}
 import com.hcsc.generic.ingest.source.{Source, SourceRegistry}
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
@@ -14,7 +15,6 @@ object FileSource extends Source {
   override def sourceType: String = "file"
 
   override def read(spark: SparkSession, sourceConf: Config): DataFrame = {
-    val path = sourceConf.getString("path")
     val format = ConfigUtils.optString(sourceConf, "file_type").getOrElse("csv")
     val header = ConfigUtils.optBoolean(sourceConf, "header").getOrElse(false)
     val delimiter = ConfigUtils.optString(sourceConf, "delimiter").getOrElse(",")
@@ -30,11 +30,67 @@ object FileSource extends Source {
     ConfigUtils.optString(sourceConf, "quote").foreach(v => reader = reader.option("quote", v))
     ConfigUtils.optString(sourceConf, "escape").foreach(v => reader = reader.option("escape", v))
 
-    val loaded = reader.load(path).withColumn("source_file", input_file_name())
-    val renamed = applyHeaderAliases(loaded, sourceConf)
-    val mapped = applyConfiguredColumns(renamed, sourceConf, header)
+    // Managed feeds pass explicit staged file paths; legacy feeds use a glob.
+    val explicitPaths = ConfigUtils.stringList(sourceConf, "paths")
+    val loaded0 =
+      if (explicitPaths.nonEmpty) reader.load(explicitPaths: _*)
+      else reader.load(sourceConf.getString("path"))
+    val loaded = loaded0.withColumn("source_file", input_file_name())
+
+    val mapped = SchemaContract.parse(sourceConf) match {
+      case Some(contract) =>
+        applyContract(loaded, contract, sourceConf, header)
+      case None =>
+        val renamed = applyHeaderAliases(loaded, sourceConf)
+        applyConfiguredColumns(renamed, sourceConf, header)
+    }
+
     val withoutTrailer = removeTrailer(mapped, sourceConf)
     skipFirstRows(withoutTrailer, sourceConf)
+  }
+
+  /**
+    * Contract-driven column resolution. With a header, columns are matched by
+    * name or declared alias and every drift (missing, extra, renamed,
+    * reordered, duplicated columns) is validated against the feed's policies.
+    * Positional mapping is never applied silently: it requires either
+    * header=false or an explicit force_columns_by_position=true, always
+    * validates the column count against the contract, and with a header the
+    * headers are still validated first so drift is surfaced before recovery.
+    */
+  private def applyContract(df: DataFrame, contract: SchemaContract, source: Config, header: Boolean): DataFrame = {
+    val businessColumns = df.columns.filterNot(_.equalsIgnoreCase("source_file"))
+    val forceByPosition = ConfigUtils.optBoolean(source, "force_columns_by_position").getOrElse(false)
+
+    if (header) {
+      val resolution = SchemaValidator.validateHeaders(businessColumns, contract, logger)
+      SchemaValidator.enforce(resolution.violations, contract.policies, logger)
+
+      if (forceByPosition) mapByPosition(df, businessColumns, contract)
+      else
+        resolution.renames.foldLeft(df) {
+          case (acc, (from, to)) => acc.withColumnRenamed(from, to)
+        }
+    } else {
+      mapByPosition(df, businessColumns, contract)
+    }
+  }
+
+  private def mapByPosition(df: DataFrame, businessColumns: Seq[String], contract: SchemaContract): DataFrame = {
+    val ordered = contract.positionalOrder
+    require(
+      businessColumns.length == ordered.length,
+      s"Positional mapping requires exactly ${ordered.length} source columns, found ${businessColumns.length}. " +
+        s"Actual=${businessColumns.mkString(",")} Contract=${ordered.map(_.name).mkString(",")}"
+    )
+    logger.warn(
+      s"[FileSource] Applying positional column mapping from schema contract v${contract.version}: " +
+        ordered.map(_.name).mkString(",")
+    )
+    businessColumns.zip(ordered.map(_.name)).foldLeft(df) {
+      case (acc, (actual, target)) =>
+        if (actual == target) acc else acc.withColumnRenamed(actual, target)
+    }
   }
 
   private def applyHeaderAliases(df: DataFrame, source: Config): DataFrame = {

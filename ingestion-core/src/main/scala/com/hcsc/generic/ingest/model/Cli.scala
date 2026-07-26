@@ -6,7 +6,12 @@ case class Cli(
   confPath: Option[String] = None,
   rawFlag: Option[String] = None,
   stage: String = "all",
-  resumeIngestDt: Option[String] = None
+  resumeIngestDt: Option[String] = None,
+  runId: Option[String] = None,
+  resume: Boolean = false,
+  fileId: Option[String] = None,
+  dryRun: Boolean = false,
+  forceReprocess: Boolean = false
 )
 
 object CliParser {
@@ -39,6 +44,21 @@ object CliParser {
         case "--resume-ingest-dt" =>
           cli = cli.copy(resumeIngestDt = Some(value("--resume-ingest-dt")))
           index += 2
+        case "--run-id" =>
+          cli = cli.copy(runId = Some(value("--run-id")))
+          index += 2
+        case "--file-id" =>
+          cli = cli.copy(fileId = Some(value("--file-id")))
+          index += 2
+        case "--resume" =>
+          cli = cli.copy(resume = true)
+          index += 1
+        case "--dry-run" =>
+          cli = cli.copy(dryRun = true)
+          index += 1
+        case "--force-reprocess" =>
+          cli = cli.copy(forceReprocess = true)
+          index += 1
         case unknown =>
           throw new IllegalArgumentException(s"Unknown argument: $unknown")
       }
@@ -51,6 +71,10 @@ object CliParser {
     require(
       validStages.contains(cli.stage.toLowerCase),
       s"--stage must be one of: ${validStages.mkString(", ")}"
+    )
+    require(
+      !cli.resume || cli.runId.isDefined,
+      "--resume requires --run-id of the run to resume"
     )
     cli.copy(mode = mode)
   }

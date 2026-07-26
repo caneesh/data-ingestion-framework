@@ -1,26 +1,36 @@
 package com.hcsc.generic.ingest.stage
 
+import com.hcsc.generic.ingest.runtime.RunContext
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SparkSession}
+
+import java.util.UUID
 
 final class CuratedStageRunner(
   spark: SparkSession,
   curatedConf: Option[Config],
   logger: Logger
 ) {
-  def run(rawDf: DataFrame, mode: String): Unit = {
+
+  def run(rawDf: DataFrame, mode: String): Option[CuratedResult] =
+    run(rawDf, mode, RunContext(UUID.randomUUID().toString, "unknown", mode, "F"))
+
+  def run(rawDf: DataFrame, mode: String, ctx: RunContext): Option[CuratedResult] = {
     curatedConf match {
       case Some(conf) =>
         val service = new CuratedService(spark, conf)
         if (service.enabled) {
-          service.process(rawDf, mode)
+          val result = service.process(rawDf, mode, ctx)
           logger.info(s"[CuratedStageRunner] Curated completed mode=$mode")
+          result
         } else {
           logger.info("[CuratedStageRunner] Curated stage disabled")
+          None
         }
       case None =>
         logger.info("[CuratedStageRunner] No curated config, skipping")
+        None
     }
   }
 }

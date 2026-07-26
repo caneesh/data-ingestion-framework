@@ -34,6 +34,7 @@ data-ingestion-framework/
 
 ### Core Capabilities
 - Configuration-driven pipeline definition (Typesafe Config / HOCON)
+- **Schema contract management** with per-feed drift policies (see below)
 - Header alias mapping for vendor file format changes
 - Positional column assignment for headerless or unstable files
 - Trailer row removal by marker text or position
@@ -41,6 +42,124 @@ data-ingestion-framework/
 - Dynamic partition column derivation
 - Curated layer with type casting, derived columns, and audit fields
 - FULL overwrite and INCR upsert-union-dedup merge strategies
+
+## Schema Contract Management
+
+Every feed can declare a formal, versioned schema contract:
+
+```hocon
+feeds.my_feed.schema {
+  version = "2.1"
+  compatibility = "BACKWARD"
+
+  # Drift policies: FAIL | WARN | IGNORE
+  on_missing_column        = "FAIL"
+  on_extra_column          = "WARN"
+  on_type_change           = "FAIL"
+  on_order_change          = "WARN"
+  on_duplicate_header      = "FAIL"
+  on_nullability_violation = "FAIL"
+  on_version_mismatch      = "WARN"
+
+  columns = [
+    {
+      name = "subscriber_id"
+      type = "string"
+      nullable = false
+      aliases = ["subscriber id", "subscriberid"]
+      position = 0
+    },
+    {
+      name = "hios_id"
+      type = "string"
+      nullable = false
+      aliases = ["plan_hios_id", "hios id"]
+      position = 1
+    }
+  ]
+}
+```
+
+The framework detects and applies the configured policy to:
+
+| Drift | Detected by |
+|-------|-------------|
+| Missing required columns | Header validation against contract |
+| Unexpected (added) columns | Header validation against contract |
+| Renamed columns | Alias resolution (logged, then mapped to canonical name) |
+| Column-order changes | Actual index vs. declared `position` |
+| Duplicate headers | Two headers resolving to the same column |
+| Data-type changes | DataFrame schema vs. declared `type` |
+| Nullability violations | Runtime null scan of non-nullable columns |
+| Schema version mismatch | Contract `version` vs. the version stored on the RAW table (`ingest.schema.version` table property) |
+
+Positional mapping is never applied silently: it requires `header = false`
+or an explicit `force_columns_by_position = true`, always validates the
+column count against the contract, and with headers present the headers are
+still validated first so drift is surfaced before positional recovery.
+
+Feeds without a `schema` block keep the legacy behavior
+(`source.columns` / `source.header_aliases`).
+
+## Operational Reliability Features
+
+All features below are opt-in per feed via config blocks; feeds without them
+behave exactly as before. See the commented examples in `application.conf`
+and the table schemas in `ddl/ingest_audit.sql`.
+
+### File Validation and Quarantine (`source.folders` + `source.validation`)
+Managed folder lifecycle: `landing -> inprogress -> processed` (with optional
+`archive` copy). Configurable pre-read checks — filename pattern, extension
+whitelist, strict encoding, min/max size, checksum sidecar verification,
+header column count/names, required trailer marker. Invalid files move to
+`quarantine` with every failed check recorded in the file audit.
+
+### Content-Based Idempotency (`idempotency`)
+Every staged file's SHA-256 content checksum is checked against the
+`ingest_file_registry` Hive table (written only after a fully successful run,
+so restarts are safe). Duplicate content — even under a new file name — is
+handled per `duplicate_policy`: `SKIP` (move to processed without loading),
+`REJECT` (quarantine), or `REPROCESS_WITH_APPROVAL` (left in landing until an
+operator re-runs with `--force-reprocess`).
+
+### Record Reject Handling (`rejects`)
+Configurable SQL reject rules (plus rules derived from the schema contract's
+non-nullable columns) split records into accepted and rejected. Rejected rows
+are persisted with `run_id`, `file_id`, `source_file`, `row_idx`, the full
+`raw_record` as JSON, `error_code`, `error_message`, `reject_category` and a
+timestamp. `max_reject_count` / `max_reject_percent` fail the run when
+exceeded. RAW receives accepted records only.
+
+### Audit and Reconciliation (`audit`)
+File-level events (validated, quarantined, skipped-duplicate, processed) and
+stage-level runs (validate/raw/curated with STARTED/SUCCESS/FAILED/SKIPPED)
+are persisted with source/raw/accepted/rejected/insert/update/delete counts
+and an optional `control_total_expr`. After each run, cross-stage
+reconciliation checks (e.g. source = accepted + rejected) are persisted to
+`ingest_reconciliation`; mismatches WARN or FAIL per
+`audit.reconciliation.on_mismatch`.
+
+### Transactional Publishing (`curated.publish`)
+Curated data is materialized into a per-run staging table, validated BEFORE
+the target is touched (non-empty unless `allow_empty`, plus an optional
+`validation_query` with a `{table}` placeholder where any returned row fails
+the publish), then swapped in with a single `INSERT OVERWRITE`. On any
+failure the staging table is dropped and the target is untouched. Stale
+staging tables from crashed runs are cleaned up on the next publish.
+
+### Stage Restart and Replay (CLI)
+
+| Flag | Behavior |
+|------|----------|
+| `--run-id <id>` | Pin the run identifier (also stamped on RAW rows as `run_id`) |
+| `--resume` | Re-run a failed run: stages already SUCCESS are skipped; curated replays from the RAW `run_id` slice without re-appending |
+| `--file-id <id>` | Restrict processing to one file (name or checksum prefix) |
+| `--dry-run` | Validate and audit everything, write and move nothing |
+| `--force-reprocess` | Override duplicate detection for approved reprocessing |
+
+File intake is restart-safe: files left in `inprogress` by a crashed run are
+picked up automatically, and the checksum registry is only written after full
+success.
 
 ## Configuration
 

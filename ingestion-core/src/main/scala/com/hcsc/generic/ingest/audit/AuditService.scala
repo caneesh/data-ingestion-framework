@@ -1,0 +1,195 @@
+package com.hcsc.generic.ingest.audit
+
+import com.hcsc.generic.ingest.config.ConfigUtils
+import com.typesafe.config.Config
+import org.apache.log4j.Logger
+import org.apache.spark.sql.{SaveMode, SparkSession}
+
+import java.sql.Timestamp
+
+/** Per-stage counters captured for the run audit. Use -1 for "not measured". */
+final case class StageCounts(
+  sourceCount: Long = -1L,
+  rawCount: Long = -1L,
+  acceptedCount: Long = -1L,
+  rejectedCount: Long = -1L,
+  insertCount: Long = -1L,
+  updateCount: Long = -1L,
+  deleteCount: Long = -1L,
+  controlTotal: Option[String] = None
+)
+
+final case class FileAuditRecord(
+  run_id: String,
+  entity: String,
+  file_name: String,
+  file_path: String,
+  checksum: String,
+  size_bytes: Long,
+  status: String,
+  reason: String,
+  event_ts: Timestamp
+)
+
+final case class RunAuditRecord(
+  run_id: String,
+  entity: String,
+  stage: String,
+  status: String,
+  source_count: Long,
+  raw_count: Long,
+  accepted_count: Long,
+  rejected_count: Long,
+  insert_count: Long,
+  update_count: Long,
+  delete_count: Long,
+  control_total: String,
+  message: String,
+  event_ts: Timestamp
+)
+
+final case class ReconciliationRecord(
+  run_id: String,
+  entity: String,
+  check_name: String,
+  expected: String,
+  actual: String,
+  passed: Boolean,
+  event_ts: Timestamp
+)
+
+/**
+  * Persists file-level, stage-level and reconciliation audit records to Hive.
+  * Entirely opt-in: when the feed has no `audit` block (or enabled=false)
+  * every call is a logged no-op, so feeds keep working without audit
+  * infrastructure.
+  *
+  * Config:
+  * audit {
+  *   enabled = true
+  *   database = "ingest_audit"
+  *   file_table = "ingest_file_audit"
+  *   run_table = "ingest_run_audit"
+  *   reconciliation_table = "ingest_reconciliation"
+  * }
+  */
+final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
+  private val logger = Logger.getLogger(getClass.getName)
+
+  val enabled: Boolean =
+    auditConf.exists(c => ConfigUtils.optBoolean(c, "enabled").getOrElse(true))
+
+  private lazy val database: String =
+    ConfigUtils.sqlIdentifier(auditConf.get, "database")
+
+  private def table(key: String, default: String): String = {
+    val name = auditConf.flatMap(c => ConfigUtils.optString(c, key)).getOrElse(default)
+    require(name.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"audit.$key '$name' is not a safe SQL identifier")
+    s"$database.$name"
+  }
+
+  private lazy val fileTable = table("file_table", "ingest_file_audit")
+  private lazy val runTable = table("run_table", "ingest_run_audit")
+  private lazy val reconciliationTable = table("reconciliation_table", "ingest_reconciliation")
+
+  private def now(): Timestamp = new Timestamp(System.currentTimeMillis())
+
+  private def ensureDatabase(): Unit =
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS $database")
+
+  private def append(rows: org.apache.spark.sql.DataFrame, fullTable: String): Unit = {
+    ensureDatabase()
+    if (spark.catalog.tableExists(fullTable))
+      rows.write.mode(SaveMode.Append).insertInto(fullTable)
+    else
+      rows.write.format("orc").saveAsTable(fullTable)
+  }
+
+  def recordFile(
+    ctx: com.hcsc.generic.ingest.runtime.RunContext,
+    fileName: String,
+    filePath: String,
+    checksum: String,
+    sizeBytes: Long,
+    status: String,
+    reason: String = ""
+  ): Unit = {
+    if (!enabled) {
+      logger.info(s"[Audit] (disabled) file=$fileName status=$status reason=$reason")
+      return
+    }
+    import spark.implicits._
+    val record = FileAuditRecord(ctx.runId, ctx.entity, fileName, filePath, checksum, sizeBytes, status, reason, now())
+    append(Seq(record).toDF(), fileTable)
+    logger.info(s"[Audit] file=$fileName status=$status reason=$reason")
+  }
+
+  def recordStage(
+    ctx: com.hcsc.generic.ingest.runtime.RunContext,
+    stage: String,
+    status: String,
+    counts: StageCounts = StageCounts(),
+    message: String = ""
+  ): Unit = {
+    if (!enabled) {
+      logger.info(s"[Audit] (disabled) stage=$stage status=$status")
+      return
+    }
+    import spark.implicits._
+    val record = RunAuditRecord(
+      ctx.runId, ctx.entity, stage, status,
+      counts.sourceCount, counts.rawCount, counts.acceptedCount, counts.rejectedCount,
+      counts.insertCount, counts.updateCount, counts.deleteCount,
+      counts.controlTotal.orNull, message, now()
+    )
+    append(Seq(record).toDF(), runTable)
+    logger.info(s"[Audit] stage=$stage status=$status counts=$counts")
+  }
+
+  def recordReconciliation(
+    ctx: com.hcsc.generic.ingest.runtime.RunContext,
+    entries: Seq[(String, String, String, Boolean)]
+  ): Unit = {
+    if (!enabled || entries.isEmpty) return
+    import spark.implicits._
+    val ts = now()
+    val records = entries.map { case (check, expected, actual, passed) =>
+      ReconciliationRecord(ctx.runId, ctx.entity, check, expected, actual, passed, ts)
+    }
+    append(records.toDF(), reconciliationTable)
+    entries.foreach { case (check, expected, actual, passed) =>
+      logger.info(s"[Audit] reconciliation check=$check expected=$expected actual=$actual passed=$passed")
+    }
+  }
+
+  /** Latest recorded status for a stage of a given run, used by --resume.
+    * Terminal statuses win over STARTED when timestamps tie. */
+  def stageStatus(runId: String, entity: String, stage: String): Option[String] = {
+    if (!enabled || !spark.catalog.tableExists(runTable)) return None
+    import org.apache.spark.sql.functions._
+    spark.table(runTable)
+      .filter(col("run_id") === runId && col("entity") === entity && col("stage") === stage)
+      .orderBy(col("event_ts").desc, when(col("status") === "STARTED", 1).otherwise(0))
+      .select("status")
+      .collect()
+      .headOption
+      .map(_.getString(0))
+  }
+
+  /** All file audit rows for a run (used by reconciliation and replay). */
+  def fileStatuses(runId: String, entity: String): Map[String, String] = {
+    if (!enabled || !spark.catalog.tableExists(fileTable)) return Map.empty
+    import org.apache.spark.sql.functions._
+    spark.table(fileTable)
+      .filter(col("run_id") === runId && col("entity") === entity)
+      .select("file_name", "status")
+      .collect()
+      .map(r => r.getString(0) -> r.getString(1))
+      .toMap
+  }
+}
+
+object AuditService {
+  def apply(spark: SparkSession, feedConf: Config): AuditService =
+    new AuditService(spark, ConfigUtils.optConfig(feedConf, "audit"))
+}

@@ -113,4 +113,36 @@ class WatermarksTest extends AnyFunSuite with SharedSparkSession {
     assert(InMemoryWatermarkStore.entries("e1").map(_._2) == List("run2", "run1"))
     assert(InMemoryWatermarkStore.latest("other").isEmpty)
   }
+
+  test("bounded predicate uses overlap only on the lower edge") {
+    val p = Watermarks.boundedPredicate(tsConfig(Some(BigDecimal(60))), GenericDialect,
+      WatermarkValue(Seq("2026-01-15 10:00:00")), WatermarkValue(Seq("2026-01-15 12:00:00")))
+    assert(p == "(\"modified_ts\" > '2026-01-15 09:59:00.0') AND " +
+      "NOT (\"modified_ts\" > '2026-01-15 12:00:00.0')")
+  }
+
+  test("bounded composite predicate keeps the tie-breaker on both edges") {
+    val p = Watermarks.boundedPredicate(compositeConfig, SqlServerDialect,
+      WatermarkValue(Seq("2026-01-01 00:00:00", "10")),
+      WatermarkValue(Seq("2026-02-01 00:00:00", "20")))
+    assert(p.contains("[modified_ts] > '2026-01-01 00:00:00.0'"))
+    assert(p.contains("NOT ((([modified_ts] > '2026-02-01 00:00:00.0')"))
+    assert(p.contains("[id] > 20"))
+  }
+
+  test("optimistic version check: stale version fails with JDBC_005") {
+    InMemoryWatermarkStore.clear()
+    InMemoryWatermarkStore.recordIfVersion("cas", WatermarkValue(Seq("1")), "runA", 0L)
+    assert(InMemoryWatermarkStore.latestVersioned("cas").get.version == 1L)
+
+    // A second run that read version 0 must not be able to commit
+    val ex = intercept[WatermarkConflictException] {
+      InMemoryWatermarkStore.recordIfVersion("cas", WatermarkValue(Seq("2")), "runB", 0L)
+    }
+    assert(ex.getMessage.contains("JDBC_005"))
+
+    // The run holding the current version commits fine
+    InMemoryWatermarkStore.recordIfVersion("cas", WatermarkValue(Seq("3")), "runC", 1L)
+    assert(InMemoryWatermarkStore.latestVersioned("cas").get == VersionedWatermark(WatermarkValue(Seq("3")), 2L))
+  }
 }

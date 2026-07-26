@@ -75,10 +75,12 @@ CREATE TABLE IF NOT EXISTS ingest_audit.ingest_header_audit (
 ) STORED AS ORC;
 
 CREATE TABLE IF NOT EXISTS ingest_audit.ingest_watermarks (
-  entity          STRING,
-  watermark_value STRING,   -- composite values joined with '|'
-  run_id          STRING,
-  updated_ts      TIMESTAMP
+  entity            STRING,
+  watermark_value   STRING,   -- composite values joined with '|'
+  run_id            STRING,
+  watermark_version BIGINT,   -- optimistic concurrency: commits verify the
+                              -- version observed at read (JDBC_005 conflicts)
+  updated_ts        TIMESTAMP
 ) STORED AS ORC;
 
 CREATE TABLE IF NOT EXISTS ingest_audit.ingest_rejects (

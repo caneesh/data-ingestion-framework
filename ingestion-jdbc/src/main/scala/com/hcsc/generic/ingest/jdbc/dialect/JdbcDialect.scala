@@ -25,6 +25,12 @@ trait JdbcDialect {
 
   /** Health-check probe statement. */
   def validationQuery: String = "SELECT 1"
+
+  /** SELECT of one row ordered as given (SQL-standard FETCH FIRST default;
+    * engine-specific overrides where needed). Used for composite upper
+    * watermark capture. */
+  def selectTopOne(projection: String, from: String, orderBy: String): String =
+    s"SELECT $projection FROM $from ORDER BY $orderBy FETCH FIRST 1 ROWS ONLY"
 }
 
 object SqlServerDialect extends JdbcDialect {
@@ -39,6 +45,8 @@ object SqlServerDialect extends JdbcDialect {
   )
   override def quoteIdentifier(identifier: String): String =
     "[" + identifier.replace("]", "]]") + "]"
+  override def selectTopOne(projection: String, from: String, orderBy: String): String =
+    s"SELECT TOP 1 $projection FROM $from ORDER BY $orderBy"
 }
 
 object PostgresDialect extends JdbcDialect {
@@ -67,6 +75,8 @@ object MySqlDialect extends JdbcDialect {
   val urlPrefix = "jdbc:mysql://"
   override def quoteIdentifier(identifier: String): String =
     "`" + identifier.replace("`", "``") + "`"
+  override def selectTopOne(projection: String, from: String, orderBy: String): String =
+    s"SELECT $projection FROM $from ORDER BY $orderBy LIMIT 1"
 }
 
 /** Fallback for engines without a dedicated dialect (H2 in tests, etc.).

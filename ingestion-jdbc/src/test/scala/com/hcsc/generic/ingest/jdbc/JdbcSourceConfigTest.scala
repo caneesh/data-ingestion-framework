@@ -66,11 +66,15 @@ class JdbcSourceConfigTest extends AnyFunSuite {
     }.getMessage.contains("source.sql is required"))
   }
 
-  test("partitioning fields must be configured together") {
-    val ex = intercept[IllegalArgumentException] {
+  test("partitioning is atomic: all four options or none") {
+    assert(intercept[IllegalArgumentException] {
       parse(sqlServerBase + """partitionColumn = "id"""")
-    }
-    assert(ex.getMessage.contains("configured together"))
+    }.getMessage.contains("configured together"))
+
+    // numPartitions alone is also a partial group now
+    assert(intercept[IllegalArgumentException] {
+      parse(sqlServerBase + """numPartitions = 8""")
+    }.getMessage.contains("configured together"))
 
     val ok = parse(sqlServerBase +
       """
@@ -80,6 +84,56 @@ class JdbcSourceConfigTest extends AnyFunSuite {
         |upperBound = 1000000
       """.stripMargin)
     assert(ok.partitioning.numPartitions.contains(8))
+  }
+
+  test("partition bounds and counts are validated") {
+    def withPartitioning(n: Int, lo: Long, hi: Long, extra: String = "") = sqlServerBase +
+      s"""
+         |numPartitions = $n
+         |partitionColumn = "id"
+         |lowerBound = $lo
+         |upperBound = $hi
+         |$extra
+       """.stripMargin
+
+    assert(intercept[IllegalArgumentException] { parse(withPartitioning(0, 1, 100)) }
+      .getMessage.contains("greater than zero"))
+    assert(intercept[IllegalArgumentException] { parse(withPartitioning(8, 100, 100)) }
+      .getMessage.contains("less than upperBound"))
+    assert(intercept[IllegalArgumentException] { parse(withPartitioning(500, 1, 100)) }
+      .getMessage.contains("operational maximum"))
+    // The cap can be raised deliberately
+    assert(parse(withPartitioning(500, 1, 100000, "max_partitions = 512"))
+      .partitioning.numPartitions.contains(500))
+  }
+
+  test("unprotected TIMESTAMP watermark warns by default and can be made to fail") {
+    def incremental(policy: String) = sqlServerBase +
+      s"""
+         |mode = "INCREMENTAL"
+         |incremental {
+         |  watermark_type = "TIMESTAMP"
+         |  watermark_columns = ["modified_ts"]
+         |  initial_value = "1900-01-01 00:00:00"
+         |  $policy
+         |}
+       """.stripMargin
+
+    // Default WARN: parses (overlap-less timestamp accepted with a warning)
+    assert(parse(incremental("")).watermark.isDefined)
+
+    // FAIL policy rejects the unprotected configuration
+    assert(intercept[IllegalArgumentException] {
+      parse(incremental("""on_unprotected_watermark = "FAIL""""))
+    }.getMessage.contains("equal-timestamp"))
+
+    // An overlap or a composite tie-breaker satisfies the guard
+    assert(parse(incremental("""overlap = "300", on_unprotected_watermark = "FAIL"""")).watermark.isDefined)
+  }
+
+  test("diagnostics.log_sql defaults off") {
+    assert(!parse(sqlServerBase).logSql)
+    assert(parse(sqlServerBase + """diagnostics { log_sql = true }""").logSql)
   }
 
   test("INCREMENTAL requires a full incremental block") {

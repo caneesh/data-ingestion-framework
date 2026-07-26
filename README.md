@@ -199,26 +199,53 @@ pushed into the database), `CUSTOM_SQL`, and `INCREMENTAL`.
 (`env` / `file` / `sysprop` / `inline`); plaintext inline secrets log a
 warning. URLs are masked in every log line.
 
-**Incremental loading**: `TIMESTAMP`, `NUMERIC`, or `COMPOSITE`
-(lexicographic multi-column) watermarks with a configurable overlap window.
-Watermark values are type-validated on read (JDBC_004) so a corrupt stored
-value can never become SQL. The watermark **advances only after the entire
-run — RAW write, CURATED publish — has succeeded** (`WatermarkAdvancing`
-pipeline hook), never moves backwards (overlap re-reads can't regress it),
-and keeps its full history in `ingest_watermarks`. A failed publish means
-the next run re-extracts the same rows: restart-safe, at-least-once into
-RAW, deduplicated by the curated merge.
+**Incremental loading (bounded windows)**: `TIMESTAMP`, `NUMERIC`, or
+`COMPOSITE` (lexicographic multi-column) watermarks. Every incremental read
+is **bounded**: the source's upper watermark is captured on the driver
+before extraction, the predicate is `> lower AND <= captured upper`, and on
+success the *captured* upper is committed — a reproducible window that is
+immune to rows arriving mid-extraction. The overlap window widens only the
+lower edge. Watermark values are type-validated on read (JDBC_004) so a
+corrupt stored value can never become SQL.
 
-**Hardening**: fail-fast connection health checks (JDBC_001/002), linear
-back-off retries around the read (config errors never retried), Spark
-partitioned reads (`partitionColumn`/bounds) with `fetchsize` control, and
-schema drift detection through the same schema-contract system files use —
-renamed database columns resolve via aliases, unknown/missing columns follow
-the feed's policies, and missing optional columns get defaults.
+The watermark **advances only after the entire run — RAW write, CURATED
+publish — has succeeded** (`WatermarkAdvancing` pipeline hook), with an
+**optimistic version check**: a commit verifies the version observed at
+read time and fails with `JDBC_005` if a concurrent run advanced the same
+entity (the Hive store gives best-effort compare-and-set; a transactional
+control table can be plugged in via a custom `WatermarkStore`). Advance-only
+semantics mean overlap re-reads can't regress the position, and the full
+history stays in `ingest_watermarks`. A failed publish means the next run
+re-extracts the same window: restart-safe, at-least-once into RAW,
+deduplicated by the curated merge.
+
+A timestamp-only watermark with no overlap can miss equal-timestamp rows;
+the framework warns by default and rejects it when
+`incremental.on_unprotected_watermark = "FAIL"` — prefer a `COMPOSITE`
+watermark with a primary-key tie-breaker.
+
+### JDBC retry model (three layers)
+
+| Layer | Covers | Mechanism |
+|-------|--------|-----------|
+| Driver-side retry | Health checks, schema fetch, upper-watermark capture, watermark-store ops | `RetryPolicy`: bounded exponential backoff + jitter, retrying **only transient categories** classified by `SqlFailureClassifier` (SQLState, Azure SQL vendor codes, cause chain). Auth, syntax, missing-object and unknown errors fail immediately. |
+| Executor partition reads | Connection resets / throttling during extraction | Spark task retry (`spark.task.maxFailures`) — **not** the framework wrapper; wrapping `DataFrameReader.load()` cannot retry executor reads. |
+| Whole-run restart | Anything else | Pipeline restart: the watermark never advanced, so replay re-extracts the same bounded window idempotently. |
+
+Note: the driver health check proves driver→database connectivity only;
+executors open their own connections, so firewall rules must cover executor
+egress as well.
+
+**Hardening**: atomic partition configuration (all of
+`numPartitions`/`partitionColumn`/bounds or none, `lower < upper`, capped by
+`max_partitions`), `fetchsize` control, sanitized logging (query hash by
+default; full SQL only under `diagnostics.log_sql = true`), and schema drift
+detection through the same schema-contract system files use.
 
 JDBC error codes: `JDBC_001` connection failure, `JDBC_002` authentication /
 secret resolution failure, `JDBC_003` invalid configuration, `JDBC_004`
-invalid watermark value.
+invalid watermark value, `JDBC_005` watermark version conflict (concurrent
+run).
 
 ### Validate-Only Mode
 

@@ -2,8 +2,8 @@ package com.hcsc.generic.ingest.jdbc
 
 import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.jdbc.health.JdbcHealthCheck
-import com.hcsc.generic.ingest.jdbc.read.{QueryBuilder, RetryPolicy}
-import com.hcsc.generic.ingest.jdbc.watermark.{WatermarkStores, Watermarks}
+import com.hcsc.generic.ingest.jdbc.read.{DriverQueries, QueryBuilder, RetryPolicy}
+import com.hcsc.generic.ingest.jdbc.watermark.{WatermarkStores, WatermarkValue, Watermarks}
 import com.hcsc.generic.ingest.schema.{SchemaContract, SchemaValidator}
 import com.hcsc.generic.ingest.source.{Source, SourceRegistry, WatermarkAdvancing}
 import com.typesafe.config.Config
@@ -14,18 +14,25 @@ import org.apache.spark.sql.functions.lit
 /**
   * Pluggable JDBC source (Azure SQL Server first; dialects for PostgreSQL,
   * Oracle, DB2, MySQL and a generic fallback). Modes: FULL_TABLE,
-  * SELECT_QUERY, CUSTOM_SQL, INCREMENTAL (watermark-driven with overlap).
+  * SELECT_QUERY, CUSTOM_SQL, INCREMENTAL.
   *
-  * Reuses the framework's schema-contract system for JDBC schema drift:
-  * source columns are resolved by canonical name/alias, unexpected and
-  * missing columns follow the feed's policies, and missing optional columns
-  * receive configured defaults — the same guarantees files get.
+  * Incremental extraction is BOUNDED: the source's upper watermark is
+  * captured on the driver before the read, the predicate becomes
+  * `> lower AND <= captured upper`, and on success the CAPTURED upper (not
+  * the extracted max) is committed with an optimistic version check —
+  * a reproducible window that concurrent runs cannot double-advance.
   *
+  * Reuses the framework's schema-contract system for JDBC schema drift.
   * Watermarks advance only after successful publish (WatermarkAdvancing,
   * invoked by IngestPipeline at the end of a fully successful run).
   */
 object JdbcSource extends Source with WatermarkAdvancing {
   private val logger = Logger.getLogger(getClass.getName)
+
+  /** Extraction window observed at read time, keyed by entity, consumed by
+    * advanceWatermark after a successful publish in the same driver JVM. */
+  private final case class ReadWindow(lower: WatermarkValue, capturedUpper: Option[WatermarkValue], version: Long)
+  private val readWindows = new java.util.concurrent.ConcurrentHashMap[String, ReadWindow]()
 
   override def sourceType: String = "jdbc"
 
@@ -42,16 +49,25 @@ object JdbcSource extends Source with WatermarkAdvancing {
     val watermarkPredicate = cfg.watermark.map { wm =>
       val entity = entityKey(sourceConf, cfg)
       val store = WatermarkStores.from(wm, spark)
-      val latest = store.latest(entity)
-        .getOrElse(com.hcsc.generic.ingest.jdbc.watermark.WatermarkValue.deserialize(wm.initialValue))
-      val predicate = Watermarks.predicate(wm, cfg.dialect, latest)
-      logger.info(s"[JdbcSource] entity=$entity incremental watermark=${latest.serialized} predicate=$predicate")
+      val versioned = store.latestVersioned(entity)
+      val lower = versioned.map(_.value).getOrElse(WatermarkValue.deserialize(wm.initialValue))
+      val version = versioned.map(_.version).getOrElse(0L)
+
+      // Bounded window: capture the source's upper watermark BEFORE the read
+      val upper = captureUpper(cfg, wm)
+      readWindows.put(entity, ReadWindow(lower, upper, version))
+
+      val predicate = upper match {
+        case Some(u) => Watermarks.boundedPredicate(wm, cfg.dialect, lower, u)
+        case None    => Watermarks.predicate(wm, cfg.dialect, lower) // empty source; extract is empty anyway
+      }
+      logger.info(s"[JdbcSource] entity=$entity incremental window " +
+        s"columns=[${wm.columns.mkString(",")}] version=$version bounded=${upper.isDefined}")
       predicate
     }
 
     val dbtable = QueryBuilder.dbtable(cfg, watermarkPredicate)
-    logger.info(s"[JdbcSource] dialect=${cfg.dialect.name} mode=${cfg.mode} " +
-      s"url=${JdbcHealthCheck.sanitized(cfg.url)} dbtable=$dbtable fetchsize=${cfg.fetchSize}")
+    logQuery(cfg, dbtable)
 
     var reader = spark.read
       .format("jdbc")
@@ -64,18 +80,63 @@ object JdbcSource extends Source with WatermarkAdvancing {
     cfg.password.foreach(p => reader = reader.option("password", p))
     cfg.connectionProperties.foreach { case (k, v) => reader = reader.option(k, v) }
 
-    cfg.partitioning.numPartitions.foreach(n => reader = reader.option("numPartitions", n.toString))
     cfg.partitioning.partitionColumn.foreach { c =>
-      reader = reader.option("partitionColumn", c)
+      reader = reader
+        .option("numPartitions", cfg.partitioning.numPartitions.get.toString)
+        .option("partitionColumn", c)
         .option("lowerBound", cfg.partitioning.lowerBound.get.toString)
         .option("upperBound", cfg.partitioning.upperBound.get.toString)
     }
 
-    val df = RetryPolicy.withRetries(s"JDBC read (${cfg.dialect.name})", cfg.retry, logger) {
+    // Retry layering: this wrapper protects DRIVER-side plan construction and
+    // schema retrieval only. Executor partition reads are retried by Spark
+    // task retry; whole-run failures are handled by pipeline restart (the
+    // watermark never advanced, so replay re-extracts the same window).
+    val df = RetryPolicy.withRetries(s"JDBC schema fetch (${cfg.dialect.name})", cfg.retry, logger) {
       reader.load()
     }
 
     applyContract(df, sourceConf)
+  }
+
+  /** Driver-side capture of the source's current maximum watermark, so the
+    * extraction window has a stable, reproducible upper edge. */
+  private def captureUpper(cfg: JdbcSourceConfig, wm: WatermarkConfig): Option[WatermarkValue] = {
+    val baseFrom = (cfg.table, cfg.sql) match {
+      case (Some(t), _)   => t
+      case (None, Some(s)) => s"($s) base"
+      case _ => throw new IllegalArgumentException("JDBC_003 INCREMENTAL requires table or sql")
+    }
+    val whereClause = cfg.where.map(w => s" WHERE $w").getOrElse("")
+
+    val sql =
+      if (wm.columns.size == 1)
+        s"SELECT MAX(${cfg.dialect.quoteIdentifier(wm.columns.head)}) FROM $baseFrom$whereClause"
+      else
+        cfg.dialect.selectTopOne(
+          wm.columns.map(cfg.dialect.quoteIdentifier).mkString(", "),
+          s"$baseFrom$whereClause",
+          wm.columns.map(c => s"${cfg.dialect.quoteIdentifier(c)} DESC").mkString(", ")
+        )
+
+    DriverQueries.firstRow(cfg, sql, logger).flatMap { row =>
+      if (row.exists(_.isEmpty)) None // any null component -> no usable upper
+      else Some(WatermarkValue(row.map(_.get)))
+    }
+  }
+
+  /** Sanitized by default: query hash + structure, never literals (watermark
+    * values and business predicates can carry PII). Full SQL only under
+    * diagnostics.log_sql = true. */
+  private def logQuery(cfg: JdbcSourceConfig, dbtable: String): Unit = {
+    val hash = java.security.MessageDigest.getInstance("SHA-256")
+      .digest(dbtable.getBytes("UTF-8")).map("%02x".format(_)).mkString.take(12)
+    logger.info(s"[JdbcSource] dialect=${cfg.dialect.name} mode=${cfg.mode} " +
+      s"url=${JdbcHealthCheck.sanitized(cfg.url)} table=${cfg.table.getOrElse("<sql>")} " +
+      s"queryHash=$hash fetchsize=${cfg.fetchSize} " +
+      s"partitions=${cfg.partitioning.numPartitions.getOrElse(1)}")
+    if (cfg.logSql)
+      logger.info(s"[JdbcSource] DIAGNOSTIC (diagnostics.log_sql=true) dbtable=$dbtable")
   }
 
   /** JDBC schema drift handling via the shared contract system: canonical
@@ -101,9 +162,13 @@ object JdbcSource extends Source with WatermarkAdvancing {
           }
     }
 
-  /** Advances the watermark from the accepted data — called by the pipeline
-    * only after a fully successful publish. Advance-only: the position never
-    * moves backwards (overlap re-reads cannot regress it). */
+  /**
+    * Commits the extraction window after a fully successful publish:
+    * the CAPTURED upper watermark (exactly what the bounded read extracted),
+    * with an optimistic version check — if a concurrent run advanced the
+    * same entity since our read, this fails with JDBC_005 instead of
+    * silently overwriting.
+    */
   override def advanceWatermark(
     spark: SparkSession,
     sourceConf: Config,
@@ -114,16 +179,27 @@ object JdbcSource extends Source with WatermarkAdvancing {
     val cfg = JdbcSourceConfig.parse(sourceConf)
     cfg.watermark.foreach { wm =>
       val store = WatermarkStores.from(wm, spark)
-      Watermarks.computeNext(accepted, wm) match {
+      val window = Option(readWindows.remove(entity))
+
+      val (lower, version) = window match {
+        case Some(w) => (w.lower, w.version)
+        case None => // e.g. resume replay where the read stage was skipped
+          val v = store.latestVersioned(entity)
+          (v.map(_.value).getOrElse(WatermarkValue.deserialize(wm.initialValue)),
+            v.map(_.version).getOrElse(0L))
+      }
+
+      val candidate = window.flatMap(_.capturedUpper)
+        .orElse(Watermarks.computeNext(accepted, wm))
+        .filter(next => Watermarks.compare(wm, next, lower) > 0) // advance-only
+
+      candidate match {
         case None =>
-          logger.info(s"[JdbcSource] entity=$entity no rows extracted; watermark unchanged")
+          logger.info(s"[JdbcSource] entity=$entity nothing beyond current watermark; not advanced")
         case Some(next) =>
-          val advanced = store.latest(entity) match {
-            case Some(current) => Watermarks.max(wm, current, next)
-            case None          => next
-          }
-          store.record(entity, advanced, runId)
-          logger.info(s"[JdbcSource] entity=$entity watermark advanced to ${advanced.serialized} (runId=$runId)")
+          store.recordIfVersion(entity, next, runId, version)
+          logger.info(s"[JdbcSource] entity=$entity watermark committed " +
+            s"version=${version + 1} columns=[${wm.columns.mkString(",")}] (runId=$runId)")
       }
     }
   }

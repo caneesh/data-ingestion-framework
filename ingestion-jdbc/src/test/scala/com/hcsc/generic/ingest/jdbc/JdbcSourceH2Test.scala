@@ -137,6 +137,69 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
     assert(InMemoryWatermarkStore.latest("empty_feed").isEmpty)
   }
 
+  test("bounded window: rows arriving after upper capture wait for the next run") {
+    val incremental = conf(
+      """
+        |mode = "INCREMENTAL"
+        |table = "members"
+        |entity = "bounded_feed"
+        |incremental {
+        |  watermark_type = "TIMESTAMP"
+        |  watermark_columns = ["modified_ts"]
+        |  initial_value = "1900-01-01 00:00:00"
+        |  watermark_store { type = "memory" }
+        |}
+      """.stripMargin)
+
+    // Read captures the upper bound at read time
+    val df = JdbcSource.read(spark, incremental)
+    val extracted = df.count()
+
+    // A row arrives AFTER the window was captured, before the commit
+    H2TestDatabase.execute("INSERT INTO members VALUES ('S_LATE','HL',999,'2030-01-01 00:00:00')")
+
+    // Commit uses the CAPTURED upper, not the extracted/current max — the
+    // late row stays beyond the committed watermark for the next run
+    JdbcSource.advanceWatermark(spark, incremental, "bounded_feed", "run-b1", df)
+    val committed = InMemoryWatermarkStore.latest("bounded_feed").get.values.head
+    assert(!committed.startsWith("2030"), s"committed=$committed must be the captured upper")
+
+    val next = JdbcSource.read(spark, incremental)
+    assert(next.count() == 1)
+    assert(next.selectExpr("subscriber_id").collect().head.getString(0) == "S_LATE")
+    assert(extracted >= 4)
+
+    H2TestDatabase.execute("DELETE FROM members WHERE subscriber_id = 'S_LATE'")
+  }
+
+  test("concurrent watermark advancement is detected (JDBC_005)") {
+    val incremental = conf(
+      """
+        |mode = "INCREMENTAL"
+        |table = "members"
+        |entity = "race_feed"
+        |incremental {
+        |  watermark_type = "NUMERIC"
+        |  watermark_columns = ["amount"]
+        |  initial_value = "0"
+        |  watermark_store { type = "memory" }
+        |}
+      """.stripMargin)
+
+    // Run A reads (captures version 0)
+    val dfA = JdbcSource.read(spark, incremental)
+
+    // A competing run commits first
+    InMemoryWatermarkStore.recordIfVersion("race_feed",
+      com.hcsc.generic.ingest.jdbc.watermark.WatermarkValue(Seq("35")), "competitor", 0L)
+
+    // Run A's commit must now conflict instead of silently overwriting
+    val ex = intercept[com.hcsc.generic.ingest.jdbc.watermark.WatermarkConflictException] {
+      JdbcSource.advanceWatermark(spark, incremental, "race_feed", "run-a", dfA)
+    }
+    assert(ex.getMessage.contains("JDBC_005"))
+  }
+
   test("NUMERIC watermarks work end to end") {
     val incremental = conf(
       """

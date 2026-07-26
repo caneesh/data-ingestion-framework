@@ -27,12 +27,31 @@ object WatermarkValue {
   */
 object Watermarks {
 
-  def predicate(cfg: WatermarkConfig, dialect: JdbcDialect, latest: WatermarkValue): String = {
+  /** Bounded extraction window: strictly greater than `lower` AND at most
+    * `upper` (the upper watermark captured on the driver before extraction),
+    * so every Spark partition observes the same reproducible window even
+    * while the source keeps changing. */
+  def boundedPredicate(
+    cfg: WatermarkConfig,
+    dialect: JdbcDialect,
+    lower: WatermarkValue,
+    upper: WatermarkValue
+  ): String =
+    // Overlap widens only the LOWER side of the window; the captured upper
+    // is exact so the committed boundary equals what was extracted.
+    s"(${predicate(cfg, dialect, lower)}) AND NOT (${predicate(cfg, dialect, upper, useOverlap = false)})"
+
+  def predicate(
+    cfg: WatermarkConfig,
+    dialect: JdbcDialect,
+    latest: WatermarkValue,
+    useOverlap: Boolean = true
+  ): String = {
     require(latest.values.size == cfg.columns.size,
       s"JDBC_004 Watermark value has ${latest.values.size} part(s), expected ${cfg.columns.size}")
 
     val overlapped = latest.values.zipWithIndex.map { case (v, i) =>
-      if (i == 0) applyOverlap(cfg.columnTypes.head, v, cfg.overlap) else v
+      if (i == 0 && useOverlap) applyOverlap(cfg.columnTypes.head, v, cfg.overlap) else v
     }
 
     if (cfg.columns.size == 1) {

@@ -56,7 +56,8 @@ final case class JdbcSourceConfig(
   partitioning: JdbcPartitioning,
   retry: RetryConfig,
   watermark: Option[WatermarkConfig],
-  healthCheckEnabled: Boolean
+  healthCheckEnabled: Boolean,
+  logSql: Boolean = false
 )
 
 object JdbcSourceConfig {
@@ -98,10 +99,22 @@ object JdbcSourceConfig {
       lowerBound = ConfigUtils.optLong(source, "lowerBound"),
       upperBound = ConfigUtils.optLong(source, "upperBound")
     )
-    val partitionFields =
-      Seq(partitioning.partitionColumn.isDefined, partitioning.lowerBound.isDefined, partitioning.upperBound.isDefined)
+    // Range partitioning is atomic: all four options or none of them.
+    val partitionFields = Seq(
+      partitioning.numPartitions.isDefined,
+      partitioning.partitionColumn.isDefined,
+      partitioning.lowerBound.isDefined,
+      partitioning.upperBound.isDefined)
     if (partitionFields.exists(identity) && !partitionFields.forall(identity))
-      fail("partitionColumn, lowerBound and upperBound must be configured together")
+      fail("numPartitions, partitionColumn, lowerBound and upperBound must all be configured together (or none)")
+    partitioning.numPartitions.foreach { n =>
+      if (n <= 0) fail(s"numPartitions must be greater than zero, found $n")
+      val maxPartitions = ConfigUtils.optInt(source, "max_partitions").getOrElse(64)
+      if (n > maxPartitions)
+        fail(s"numPartitions $n exceeds the operational maximum $maxPartitions (raise max_partitions deliberately)")
+    }
+    for (lo <- partitioning.lowerBound; hi <- partitioning.upperBound)
+      if (lo >= hi) fail(s"lowerBound $lo must be less than upperBound $hi")
 
     val retryConf = ConfigUtils.optConfig(source, "retry")
     val retry = RetryConfig(
@@ -133,7 +146,9 @@ object JdbcSourceConfig {
       retry = retry,
       watermark = watermark,
       healthCheckEnabled = ConfigUtils.optConfig(source, "health_check")
-        .flatMap(h => ConfigUtils.optBoolean(h, "enabled")).getOrElse(true)
+        .flatMap(h => ConfigUtils.optBoolean(h, "enabled")).getOrElse(true),
+      logSql = ConfigUtils.optConfig(source, "diagnostics")
+        .flatMap(d => ConfigUtils.optBoolean(d, "log_sql")).getOrElse(false)
     )
   }
 
@@ -164,6 +179,28 @@ object JdbcSourceConfig {
       case t => Seq(t)
     }
 
+    // A timestamp-only watermark with no overlap can miss rows sharing the
+    // boundary timestamp (equal-timestamp inserts after commit). Require a
+    // composite tie-breaker or an overlap window; the policy decides whether
+    // an unprotected config warns or fails.
+    val overlapValue = ConfigUtils.optString(inc, "overlap").map(BigDecimal(_))
+    if (watermarkType == WatermarkType.Timestamp && overlapValue.isEmpty) {
+      val policy = ConfigUtils.optString(inc, "on_unprotected_watermark").getOrElse("WARN").toUpperCase
+      policy match {
+        case "FAIL" =>
+          fail("TIMESTAMP watermark without overlap can miss equal-timestamp rows; " +
+            "configure incremental.overlap, use a COMPOSITE watermark with a tie-breaker key, " +
+            "or set on_unprotected_watermark = WARN to accept the risk")
+        case "WARN" =>
+          org.apache.log4j.Logger.getLogger(getClass.getName).warn(
+            "[JdbcSourceConfig] TIMESTAMP watermark configured without overlap or tie-breaker: " +
+              "rows inserted later with the boundary timestamp can be missed. " +
+              "Prefer a COMPOSITE watermark or an overlap window.")
+        case other =>
+          fail(s"incremental.on_unprotected_watermark '$other' must be WARN or FAIL")
+      }
+    }
+
     val store = ConfigUtils.optConfig(inc, "watermark_store")
     WatermarkConfig(
       watermarkType = watermarkType,
@@ -171,7 +208,7 @@ object JdbcSourceConfig {
       columnTypes = columnTypes,
       initialValue = ConfigUtils.optString(inc, "initial_value").getOrElse(
         fail("incremental.initial_value is required")),
-      overlap = ConfigUtils.optString(inc, "overlap").map(BigDecimal(_)),
+      overlap = overlapValue,
       storeType = store.flatMap(s => ConfigUtils.optString(s, "type")).getOrElse("hive").toLowerCase,
       storeDatabase = store.flatMap(s => ConfigUtils.optString(s, "database")),
       storeTable = store.flatMap(s => ConfigUtils.optString(s, "table")).getOrElse("ingest_watermarks")

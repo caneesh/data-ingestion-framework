@@ -171,6 +171,17 @@ final class IngestPipeline(
     staged.foreach(files => intake.complete(ctx, files))
     reconcile(rawOutcome, curatedResult)
 
+    // Watermarks advance ONLY here, after everything above succeeded — a
+    // failed run never moves the incremental position.
+    if (!ctx.dryRun) {
+      val sourceType = ConfigUtils.optString(sourceConf, "type").getOrElse("file")
+      SourceRegistry.resolve(sourceType) match {
+        case w: com.hcsc.generic.ingest.source.WatermarkAdvancing =>
+          rawOutcome.foreach(o => w.advanceWatermark(spark, sourceConf, ctx.entity, ctx.runId, o.accepted))
+        case _ => ()
+      }
+    }
+
     logger.info(s"==== Pipeline success entity=${ctx.entity} runId=${ctx.runId} ====")
   }
 
@@ -205,8 +216,10 @@ final class IngestPipeline(
     rejectService: RejectService,
     intake: FileIntakeService
   ): RawOutcome = {
-    // Attach the schema contract for connector-side header resolution.
+    // Attach the schema contract for connector-side header resolution, and
+    // the entity name so stateful sources (JDBC watermarks) key their state.
     var effectiveSource = sourceConf
+      .withValue("entity", ConfigValueFactory.fromAnyRef(ctx.entity))
     if (feedConf.hasPath("schema"))
       effectiveSource = effectiveSource.withValue("schema", feedConf.getValue("schema"))
 

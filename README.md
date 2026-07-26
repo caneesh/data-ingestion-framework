@@ -21,7 +21,7 @@ data-ingestion-framework/
 |--------|-------------|
 | `ingestion-core` | Source/Sink traits, config utilities, partitioning, transforms, stage runners |
 | `ingestion-file` | File source: CSV, JSON, Parquet with header handling, aliases, trailer removal |
-| `ingestion-jdbc` | JDBC source: SQL Server, DB2, Oracle, PostgreSQL with partitioned reads |
+| `ingestion-jdbc` | JDBC subsystem: dialect registry (Azure SQL Server, PostgreSQL, Oracle, DB2, MySQL), four read modes, secret providers, watermark-based incremental loading, health checks, retries |
 | `ingestion-kafka` | Kafka source: batch reads with JSON/string parsing |
 | `ingestion-app` | Application entry point bundling all connectors |
 
@@ -186,6 +186,39 @@ rows inside data follow `repeated_header_policy`
 | HDR_016 | Repeated header row detected |
 | HDR_017 | Contract configuration collision (startup) |
 | HDR_018 | Required output column missing before CURATED publish |
+
+## JDBC Ingestion
+
+The JDBC subsystem is dialect-pluggable (`sqlserver`, `postgresql`,
+`oracle`, `db2`, `mysql`, `generic`; register new engines via
+`DialectRegistry`). Azure SQL Server enforces encrypted connections by
+default. Four read modes: `FULL_TABLE`, `SELECT_QUERY` (projection + WHERE
+pushed into the database), `CUSTOM_SQL`, and `INCREMENTAL`.
+
+**Credentials** come from the secret-provider abstraction
+(`env` / `file` / `sysprop` / `inline`); plaintext inline secrets log a
+warning. URLs are masked in every log line.
+
+**Incremental loading**: `TIMESTAMP`, `NUMERIC`, or `COMPOSITE`
+(lexicographic multi-column) watermarks with a configurable overlap window.
+Watermark values are type-validated on read (JDBC_004) so a corrupt stored
+value can never become SQL. The watermark **advances only after the entire
+run — RAW write, CURATED publish — has succeeded** (`WatermarkAdvancing`
+pipeline hook), never moves backwards (overlap re-reads can't regress it),
+and keeps its full history in `ingest_watermarks`. A failed publish means
+the next run re-extracts the same rows: restart-safe, at-least-once into
+RAW, deduplicated by the curated merge.
+
+**Hardening**: fail-fast connection health checks (JDBC_001/002), linear
+back-off retries around the read (config errors never retried), Spark
+partitioned reads (`partitionColumn`/bounds) with `fetchsize` control, and
+schema drift detection through the same schema-contract system files use —
+renamed database columns resolve via aliases, unknown/missing columns follow
+the feed's policies, and missing optional columns get defaults.
+
+JDBC error codes: `JDBC_001` connection failure, `JDBC_002` authentication /
+secret resolution failure, `JDBC_003` invalid configuration, `JDBC_004`
+invalid watermark value.
 
 ### Validate-Only Mode
 

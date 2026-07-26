@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS ingest_audit.ingest_header_audit (
   event_ts                   TIMESTAMP
 ) STORED AS ORC;
 
+CREATE TABLE IF NOT EXISTS ingest_audit.ingest_watermarks (
+  entity          STRING,
+  watermark_value STRING,   -- composite values joined with '|'
+  run_id          STRING,
+  updated_ts      TIMESTAMP
+) STORED AS ORC;
+
 CREATE TABLE IF NOT EXISTS ingest_audit.ingest_rejects (
   run_id          STRING,
   entity          STRING,

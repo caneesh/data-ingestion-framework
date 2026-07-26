@@ -163,10 +163,12 @@ object SchemaValidator {
         )
       }
 
-    // Renamed columns (matched through an alias, not the canonical name).
+    // Renamed columns: alias matches, plus case-only differences (JDBC
+    // engines often report uppercase names) normalized to canonical case.
     val renames = resolved.collect {
-      case (h, Some(target)) if !h.equalsIgnoreCase(target) =>
-        logger.info(s"[SchemaValidator] Header '$h' recognized as renamed column '$target'")
+      case (h, Some(target)) if h != target =>
+        if (!h.equalsIgnoreCase(target))
+          logger.info(s"[SchemaValidator] Header '$h' recognized as renamed column '$target'")
         h -> target
     }
 

@@ -1,0 +1,169 @@
+package com.hcsc.generic.ingest.jdbc
+
+import com.hcsc.generic.ingest.jdbc.dialect.SqlServerDialect
+import com.typesafe.config.ConfigFactory
+import org.scalatest.funsuite.AnyFunSuite
+
+class JdbcSourceConfigTest extends AnyFunSuite {
+
+  private def parse(hocon: String) = JdbcSourceConfig.parse(ConfigFactory.parseString(hocon))
+
+  private val sqlServerBase =
+    """
+      |url = "jdbc:sqlserver://myserver.database.windows.net:1433;databaseName=claims"
+      |table = "dbo.claims"
+    """.stripMargin
+
+  test("dialect inferred from url; sqlserver defaults applied") {
+    val cfg = parse(sqlServerBase)
+    assert(cfg.dialect == SqlServerDialect)
+    assert(cfg.driver == "com.microsoft.sqlserver.jdbc.SQLServerDriver")
+    assert(cfg.mode == JdbcMode.FullTable)
+    assert(cfg.connectionProperties("encrypt") == "true")
+    assert(cfg.connectionProperties("trustServerCertificate") == "false")
+    assert(cfg.fetchSize == 1000)
+    assert(cfg.retry.maxAttempts == 3)
+    assert(cfg.healthCheckEnabled)
+  }
+
+  test("explicit dialect must match the url prefix") {
+    val ex = intercept[IllegalArgumentException] {
+      parse("""url = "jdbc:postgresql://host/db", dialect = "sqlserver", table = "t" """)
+    }
+    assert(ex.getMessage.contains("JDBC_003"))
+  }
+
+  test("url is required") {
+    val ex = intercept[IllegalArgumentException] { parse("""table = "t" """) }
+    assert(ex.getMessage.contains("source.url is required"))
+  }
+
+  test("uninferable dialect requires explicit dialect") {
+    val ex = intercept[IllegalArgumentException] {
+      parse("""url = "jdbc:h2:mem:x", table = "t" """)
+    }
+    assert(ex.getMessage.contains("Cannot infer dialect"))
+  }
+
+  test("generic dialect requires an explicit driver") {
+    val ex = intercept[IllegalArgumentException] {
+      parse("""url = "jdbc:h2:mem:x", dialect = "generic", table = "t" """)
+    }
+    assert(ex.getMessage.contains("source.driver is required"))
+  }
+
+  test("invalid mode is rejected; each mode enforces its required fields") {
+    assert(intercept[IllegalArgumentException] {
+      parse(sqlServerBase + """mode = "GUESS"""")
+    }.getMessage.contains("JDBC_003"))
+
+    assert(intercept[IllegalArgumentException] {
+      parse("""url = "jdbc:sqlserver://h;databaseName=d", mode = "FULL_TABLE"""")
+    }.getMessage.contains("source.table is required"))
+
+    assert(intercept[IllegalArgumentException] {
+      parse("""url = "jdbc:sqlserver://h;databaseName=d", mode = "CUSTOM_SQL"""")
+    }.getMessage.contains("source.sql is required"))
+  }
+
+  test("partitioning fields must be configured together") {
+    val ex = intercept[IllegalArgumentException] {
+      parse(sqlServerBase + """partitionColumn = "id"""")
+    }
+    assert(ex.getMessage.contains("configured together"))
+
+    val ok = parse(sqlServerBase +
+      """
+        |numPartitions = 8
+        |partitionColumn = "id"
+        |lowerBound = 1
+        |upperBound = 1000000
+      """.stripMargin)
+    assert(ok.partitioning.numPartitions.contains(8))
+  }
+
+  test("INCREMENTAL requires a full incremental block") {
+    assert(intercept[IllegalArgumentException] {
+      parse(sqlServerBase + """mode = "INCREMENTAL"""")
+    }.getMessage.contains("incremental block"))
+
+    val cfg = parse(sqlServerBase +
+      """
+        |mode = "INCREMENTAL"
+        |incremental {
+        |  watermark_type = "TIMESTAMP"
+        |  watermark_columns = ["modified_ts"]
+        |  initial_value = "1900-01-01 00:00:00"
+        |  overlap = "300"
+        |  watermark_store { type = "memory" }
+        |}
+      """.stripMargin)
+    val wm = cfg.watermark.get
+    assert(wm.watermarkType == WatermarkType.Timestamp)
+    assert(wm.columns == Seq("modified_ts"))
+    assert(wm.overlap.contains(BigDecimal(300)))
+    assert(wm.storeType == "memory")
+  }
+
+  test("COMPOSITE watermarks need 2+ columns and matching column_types") {
+    assert(intercept[IllegalArgumentException] {
+      parse(sqlServerBase +
+        """
+          |mode = "INCREMENTAL"
+          |incremental {
+          |  watermark_type = "COMPOSITE"
+          |  watermark_columns = ["ts"]
+          |  initial_value = "x"
+          |}
+        """.stripMargin)
+    }.getMessage.contains("at least two"))
+
+    assert(intercept[IllegalArgumentException] {
+      parse(sqlServerBase +
+        """
+          |mode = "INCREMENTAL"
+          |incremental {
+          |  watermark_type = "COMPOSITE"
+          |  watermark_columns = ["ts", "id"]
+          |  column_types = ["TIMESTAMP"]
+          |  initial_value = "x|0"
+          |}
+        """.stripMargin)
+    }.getMessage.contains("column_types must match"))
+  }
+
+  test("single-column watermark types reject multiple columns") {
+    val ex = intercept[IllegalArgumentException] {
+      parse(sqlServerBase +
+        """
+          |mode = "INCREMENTAL"
+          |incremental {
+          |  watermark_type = "NUMERIC"
+          |  watermark_columns = ["a", "b"]
+          |  initial_value = "0"
+          |}
+        """.stripMargin)
+    }
+    assert(ex.getMessage.contains("exactly one"))
+  }
+
+  test("auth block resolves user and secret-provider password") {
+    System.setProperty("jdbc.test.pwd", "s3cret")
+    val cfg = parse(sqlServerBase +
+      """
+        |auth {
+        |  user = "svc_ingest"
+        |  password = { provider = "sysprop", key = "jdbc.test.pwd" }
+        |}
+      """.stripMargin)
+    assert(cfg.user.contains("svc_ingest"))
+    assert(cfg.password.contains("s3cret"))
+  }
+
+  test("explicit connection_properties override dialect defaults") {
+    val cfg = parse(sqlServerBase +
+      """connection_properties { encrypt = "false", applicationName = "ingest" }""")
+    assert(cfg.connectionProperties("encrypt") == "false")
+    assert(cfg.connectionProperties("applicationName") == "ingest")
+  }
+}

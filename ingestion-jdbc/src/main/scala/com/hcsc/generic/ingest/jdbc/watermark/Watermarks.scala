@@ -86,8 +86,16 @@ object Watermarks {
       .collect()
 
     top.headOption.map { row =>
-      WatermarkValue(actualCols.indices.map(i => String.valueOf(row.get(i))))
+      WatermarkValue(actualCols.indices.map(i => stringifyValue(row.get(i))))
     }
+  }
+
+  /** Canonical string forms so values round-trip through the typed parsers
+    * (rowversion binaries become hex, temporals use their SQL forms). */
+  private def stringifyValue(value: Any): String = value match {
+    case bytes: Array[Byte] => bytes.map("%02X".format(_)).mkString
+    case odt: java.time.OffsetDateTime => formatOffset(odt)
+    case other => String.valueOf(other)
   }
 
   /** Advance-only merge: never move a watermark backwards (e.g. an overlap
@@ -97,23 +105,27 @@ object Watermarks {
 
   def compare(cfg: WatermarkConfig, a: WatermarkValue, b: WatermarkValue): Int = {
     cfg.columnTypes.indices.foreach { i =>
-      val c = cfg.columnTypes(i) match {
-        case WatermarkType.Numeric =>
-          parseNumeric(a.values(i)).compare(parseNumeric(b.values(i)))
-        case _ =>
-          parseTimestamp(a.values(i)).compareTo(parseTimestamp(b.values(i)))
-      }
+      val c = compareTyped(cfg.columnTypes(i), a.values(i), b.values(i))
       if (c != 0) return c
     }
     0
   }
 
+  /** Overlap semantics per type: TIMESTAMP/DATETIMEOFFSET seconds, DATE
+    * days, NUMERIC/ROWVERSION subtraction. */
   private def applyOverlap(columnType: String, value: String, overlap: Option[BigDecimal]): String =
     overlap match {
       case None => value
       case Some(amount) => columnType match {
         case WatermarkType.Numeric =>
           (parseNumeric(value) - amount).toString
+        case WatermarkType.Date =>
+          parseDate(value).minusDays(amount.toLong).toString
+        case WatermarkType.DatetimeOffset =>
+          formatOffset(parseOffset(value).minusSeconds(amount.toLong))
+        case WatermarkType.RowVersion =>
+          val reduced = parseRowVersion(value) - BigInt(amount.toBigInt.bigInteger)
+          "%016X".format(if (reduced < 0) BigInt(0) else reduced)
         case _ =>
           val ts = parseTimestamp(value)
           new java.sql.Timestamp(ts.getTime - (amount * 1000).toLong).toString
@@ -123,8 +135,19 @@ object Watermarks {
   /** SQL literal with parse validation — the value round-trips through a
     * typed representation, so stored garbage cannot become SQL. */
   private[watermark] def literal(columnType: String, value: String): String = columnType match {
-    case WatermarkType.Numeric => parseNumeric(value).toString
-    case _                     => s"'${parseTimestamp(value).toString}'"
+    case WatermarkType.Numeric        => parseNumeric(value).toString
+    case WatermarkType.Date           => s"'${parseDate(value).toString}'"
+    case WatermarkType.DatetimeOffset => s"'${formatOffset(parseOffset(value))}'"
+    case WatermarkType.RowVersion     => "0x%016X".format(parseRowVersion(value))
+    case _                            => s"'${parseTimestamp(value).toString}'"
+  }
+
+  private[watermark] def compareTyped(columnType: String, a: String, b: String): Int = columnType match {
+    case WatermarkType.Numeric        => parseNumeric(a).compare(parseNumeric(b))
+    case WatermarkType.Date           => parseDate(a).compareTo(parseDate(b))
+    case WatermarkType.DatetimeOffset => parseOffset(a).compareTo(parseOffset(b))
+    case WatermarkType.RowVersion     => parseRowVersion(a).compare(parseRowVersion(b))
+    case _                            => parseTimestamp(a).compareTo(parseTimestamp(b))
   }
 
   private def parseNumeric(value: String): BigDecimal =
@@ -137,4 +160,35 @@ object Watermarks {
     catch { case _: IllegalArgumentException =>
       throw new IllegalArgumentException(
         s"JDBC_004 Watermark value '$value' is not a timestamp (expected yyyy-MM-dd HH:mm:ss[.fff])") }
+
+  private def parseDate(value: String): java.time.LocalDate =
+    try java.time.LocalDate.parse(value.trim)
+    catch { case _: java.time.format.DateTimeParseException =>
+      throw new IllegalArgumentException(s"JDBC_004 Watermark value '$value' is not a date (expected yyyy-MM-dd)") }
+
+  private val OffsetFormat = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS XXX")
+  private val OffsetParse = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss[.SSS] XXX")
+
+  private def parseOffset(value: String): java.time.OffsetDateTime = {
+    val v = value.trim
+    try java.time.OffsetDateTime.parse(v)
+    catch { case _: java.time.format.DateTimeParseException =>
+      try java.time.OffsetDateTime.parse(v, OffsetParse)
+      catch { case _: java.time.format.DateTimeParseException =>
+        throw new IllegalArgumentException(
+          s"JDBC_004 Watermark value '$value' is not a datetimeoffset " +
+            "(expected ISO-8601 or 'yyyy-MM-dd HH:mm:ss[.SSS] +HH:MM')") }
+    }
+  }
+
+  private def formatOffset(value: java.time.OffsetDateTime): String = value.format(OffsetFormat)
+
+  /** SQL Server rowversion: 8-byte binary, stored as hex (0x prefix optional),
+    * compared as an unsigned big integer. */
+  private def parseRowVersion(value: String): BigInt = {
+    val hex = value.trim.stripPrefix("0x").stripPrefix("0X")
+    if (!hex.matches("[0-9A-Fa-f]{1,16}"))
+      throw new IllegalArgumentException(s"JDBC_004 Watermark value '$value' is not a rowversion hex string")
+    BigInt(hex, 16)
+  }
 }

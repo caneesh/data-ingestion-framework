@@ -11,6 +11,7 @@ import java.util.Properties
 object JdbcHealthCheck {
 
   def check(cfg: JdbcSourceConfig): Either[String, String] = {
+    com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_connection_attempt_total")
     try {
       Class.forName(cfg.driver)
       val props = new Properties()
@@ -29,11 +30,44 @@ object JdbcHealthCheck {
       } finally connection.close()
     } catch {
       case e: ClassNotFoundException =>
+        com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_connection_failure_total")
         Left(s"JDBC_001 Driver class '${cfg.driver}' not found on classpath: ${e.getMessage}")
       case e: java.sql.SQLInvalidAuthorizationSpecException =>
+        com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_connection_failure_total")
         Left(s"JDBC_002 Authentication failed for ${sanitized(cfg.url)}: ${e.getMessage}")
       case e: Exception =>
+        com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_connection_failure_total")
         Left(s"JDBC_001 Connection to ${sanitized(cfg.url)} failed: ${e.getMessage}")
+    }
+  }
+
+  /**
+    * Optional distributed connectivity probe: the driver health check only
+    * proves driver -> database; executors open their own connections and may
+    * sit behind different firewall rules. Runs one lightweight validation
+    * per probe partition (rate-limited by design; keep probe_partitions
+    * small).
+    */
+  def executorProbe(spark: org.apache.spark.sql.SparkSession, cfg: JdbcSourceConfig, partitions: Int): Unit = {
+    val url = cfg.url
+    val driver = cfg.driver
+    val user = cfg.user
+    val password = cfg.password
+    val props = cfg.connectionProperties
+    val validation = cfg.dialect.validationQuery
+
+    spark.sparkContext.parallelize(1 to partitions, partitions).foreachPartition { _ =>
+      Class.forName(driver)
+      val p = new java.util.Properties()
+      user.foreach(p.setProperty("user", _))
+      password.foreach(p.setProperty("password", _))
+      props.foreach { case (k, v) => p.setProperty(k, v) }
+      val conn = java.sql.DriverManager.getConnection(url, p)
+      try {
+        val st = conn.createStatement()
+        try { st.setQueryTimeout(30); st.execute(validation) }
+        finally st.close()
+      } finally conn.close()
     }
   }
 

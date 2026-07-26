@@ -4,20 +4,42 @@ import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.jdbc.auth.SecretProviders
 import com.hcsc.generic.ingest.jdbc.dialect.{DialectRegistry, GenericDialect, JdbcDialect}
 import com.typesafe.config.Config
+import scala.collection.JavaConverters._
 
 object JdbcMode {
   val FullTable = "FULL_TABLE"
   val SelectQuery = "SELECT_QUERY"
   val CustomSql = "CUSTOM_SQL"
+  val SqlTemplate = "SQL_TEMPLATE"
   val Incremental = "INCREMENTAL"
-  val all = Seq(FullTable, SelectQuery, CustomSql, Incremental)
+  val all = Seq(FullTable, SelectQuery, CustomSql, SqlTemplate, Incremental)
 }
 
 object WatermarkType {
   val Timestamp = "TIMESTAMP"
   val Numeric = "NUMERIC"
+  val Date = "DATE"
+  val DatetimeOffset = "DATETIMEOFFSET"
+  val RowVersion = "ROWVERSION"
   val Composite = "COMPOSITE"
-  val all = Seq(Timestamp, Numeric, Composite)
+  val scalar = Seq(Timestamp, Numeric, Date, DatetimeOffset, RowVersion)
+  val all = scalar :+ Composite
+}
+
+object AuthType {
+  val SqlPassword = "SQL_PASSWORD"
+  val AzureManagedIdentity = "AZURE_MANAGED_IDENTITY"
+  val AzureServicePrincipal = "AZURE_SERVICE_PRINCIPAL"
+  val EntraIdPassword = "ENTRA_ID_PASSWORD"
+  val AccessToken = "ACCESS_TOKEN"
+  val all = Seq(SqlPassword, AzureManagedIdentity, AzureServicePrincipal, EntraIdPassword, AccessToken)
+}
+
+object PartitionStrategy {
+  val StaticRange = "STATIC_RANGE"
+  val MinMaxQuery = "MIN_MAX_QUERY"
+  val Predicates = "PREDICATES"
+  val all = Seq(StaticRange, MinMaxQuery, Predicates)
 }
 
 final case class WatermarkConfig(
@@ -35,7 +57,10 @@ final case class JdbcPartitioning(
   numPartitions: Option[Int],
   partitionColumn: Option[String],
   lowerBound: Option[Long],
-  upperBound: Option[Long]
+  upperBound: Option[Long],
+  strategy: String = PartitionStrategy.StaticRange,
+  predicates: Seq[String] = Seq.empty,
+  skewMetrics: Boolean = false
 )
 
 final case class RetryConfig(maxAttempts: Int, backoffMs: Long)
@@ -57,7 +82,13 @@ final case class JdbcSourceConfig(
   retry: RetryConfig,
   watermark: Option[WatermarkConfig],
   healthCheckEnabled: Boolean,
-  logSql: Boolean = false
+  logSql: Boolean = false,
+  authType: String = AuthType.SqlPassword,
+  projections: Seq[com.hcsc.generic.ingest.jdbc.query.QueryProjection] = Seq.empty,
+  structuredColumns: Boolean = false,
+  filters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryFilter] = Seq.empty,
+  parameters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameter] = Seq.empty,
+  executorProbePartitions: Option[Int] = None
 )
 
 object JdbcSourceConfig {
@@ -84,37 +115,82 @@ object JdbcSourceConfig {
     val table = ConfigUtils.optString(source, "table")
     val sql = ConfigUtils.optString(source, "sql").orElse(ConfigUtils.optString(source, "query"))
 
+    val structuredColumns = source.hasPath("columns") &&
+      source.getList("columns").asScala.exists(_.valueType() == com.typesafe.config.ConfigValueType.OBJECT)
+    val columns = if (structuredColumns) Seq.empty else ConfigUtils.stringList(source, "columns")
+    val projections = com.hcsc.generic.ingest.jdbc.query.QueryProjection.parseAll(source)
+    val filters = com.hcsc.generic.ingest.jdbc.query.QueryFilter.parseAll(source)
+    val parameters = com.hcsc.generic.ingest.jdbc.query.QueryParameter.parseAll(source)
+    val where = ConfigUtils.optString(source, "where")
+
     mode match {
-      case JdbcMode.FullTable | JdbcMode.SelectQuery =>
+      case JdbcMode.FullTable =>
+        if (table.isEmpty) fail(s"source.table is required for mode $mode")
+        // FULL_TABLE ignores projections and predicates: reject rather than
+        // silently dropping configured intent.
+        if (source.hasPath("columns") || where.isDefined || source.hasPath("filters"))
+          fail("FULL_TABLE mode does not apply columns/where/filters; use SELECT_QUERY or INCREMENTAL")
+      case JdbcMode.SelectQuery =>
         if (table.isEmpty) fail(s"source.table is required for mode $mode")
       case JdbcMode.CustomSql =>
         if (sql.isEmpty) fail("source.sql is required for mode CUSTOM_SQL")
+      case JdbcMode.SqlTemplate =>
+        if (sql.isEmpty) fail("source.sql (the template) is required for mode SQL_TEMPLATE")
       case JdbcMode.Incremental =>
         if (table.isEmpty && sql.isEmpty) fail("source.table or source.sql is required for mode INCREMENTAL")
     }
+
+    val strategy = ConfigUtils.optString(source, "partition_strategy").map(_.toUpperCase)
+      .getOrElse(if (source.hasPath("partition_predicates")) PartitionStrategy.Predicates
+                 else PartitionStrategy.StaticRange)
+    if (!PartitionStrategy.all.contains(strategy))
+      fail(s"partition_strategy '$strategy' must be one of ${PartitionStrategy.all.mkString(", ")}")
 
     val partitioning = JdbcPartitioning(
       numPartitions = ConfigUtils.optInt(source, "numPartitions"),
       partitionColumn = ConfigUtils.optString(source, "partitionColumn"),
       lowerBound = ConfigUtils.optLong(source, "lowerBound"),
-      upperBound = ConfigUtils.optLong(source, "upperBound")
+      upperBound = ConfigUtils.optLong(source, "upperBound"),
+      strategy = strategy,
+      predicates = ConfigUtils.stringList(source, "partition_predicates"),
+      skewMetrics = ConfigUtils.optBoolean(source, "skew_metrics").getOrElse(false)
     )
-    // Range partitioning is atomic: all four options or none of them.
-    val partitionFields = Seq(
-      partitioning.numPartitions.isDefined,
-      partitioning.partitionColumn.isDefined,
-      partitioning.lowerBound.isDefined,
-      partitioning.upperBound.isDefined)
-    if (partitionFields.exists(identity) && !partitionFields.forall(identity))
-      fail("numPartitions, partitionColumn, lowerBound and upperBound must all be configured together (or none)")
+
+    val maxPartitions = ConfigUtils.optInt(source, "max_partitions").getOrElse(64)
     partitioning.numPartitions.foreach { n =>
       if (n <= 0) fail(s"numPartitions must be greater than zero, found $n")
-      val maxPartitions = ConfigUtils.optInt(source, "max_partitions").getOrElse(64)
       if (n > maxPartitions)
         fail(s"numPartitions $n exceeds the operational maximum $maxPartitions (raise max_partitions deliberately)")
     }
-    for (lo <- partitioning.lowerBound; hi <- partitioning.upperBound)
-      if (lo >= hi) fail(s"lowerBound $lo must be less than upperBound $hi")
+
+    strategy match {
+      case PartitionStrategy.StaticRange =>
+        // Range partitioning is atomic: all four options or none of them.
+        val partitionFields = Seq(
+          partitioning.numPartitions.isDefined,
+          partitioning.partitionColumn.isDefined,
+          partitioning.lowerBound.isDefined,
+          partitioning.upperBound.isDefined)
+        if (partitionFields.exists(identity) && !partitionFields.forall(identity))
+          fail("numPartitions, partitionColumn, lowerBound and upperBound must all be configured together (or none)")
+        for (lo <- partitioning.lowerBound; hi <- partitioning.upperBound)
+          if (lo >= hi) fail(s"lowerBound $lo must be less than upperBound $hi")
+        if (partitioning.predicates.nonEmpty)
+          fail("partition_predicates requires partition_strategy = PREDICATES")
+      case PartitionStrategy.MinMaxQuery =>
+        if (partitioning.partitionColumn.isEmpty || partitioning.numPartitions.isEmpty)
+          fail("MIN_MAX_QUERY partitioning requires partitionColumn and numPartitions")
+        if (partitioning.lowerBound.isDefined || partitioning.upperBound.isDefined)
+          fail("MIN_MAX_QUERY discovers bounds; lowerBound/upperBound must not be configured")
+      case PartitionStrategy.Predicates =>
+        if (partitioning.predicates.isEmpty)
+          fail("PREDICATES partitioning requires a non-empty partition_predicates list")
+        if (partitioning.partitionColumn.isDefined || partitioning.lowerBound.isDefined ||
+            partitioning.upperBound.isDefined || partitioning.numPartitions.isDefined)
+          fail("PREDICATES partitioning is exclusive with range partitioning options")
+        if (partitioning.predicates.size > maxPartitions)
+          fail(s"partition_predicates count ${partitioning.predicates.size} exceeds max_partitions $maxPartitions")
+    }
 
     val retryConf = ConfigUtils.optConfig(source, "retry")
     val retry = RetryConfig(
@@ -126,23 +202,20 @@ object JdbcSourceConfig {
       if (mode == JdbcMode.Incremental) Some(parseWatermark(source))
       else None
 
+    val (authType, user, password, authProps) = resolveAuth(source, dialect)
+
     JdbcSourceConfig(
       url = url,
       dialect = dialect,
       driver = driver,
       mode = mode,
       table = table,
-      columns = ConfigUtils.stringList(source, "columns"),
-      where = ConfigUtils.optString(source, "where"),
+      columns = columns,
+      where = where,
       sql = sql,
-      // The user id resolves through the same provider chain as the password
-      // (CyberArk serves both from one vault object via `attribute`); a bare
-      // string stays a plain value and does not warn.
-      user = ConfigUtils.optConfig(source, "auth").flatMap(a => SecretProviders.resolveAt(a, "user", warnInline = false))
-        .orElse(ConfigUtils.optString(source, "user")),
-      password = ConfigUtils.optConfig(source, "auth").flatMap(a => SecretProviders.resolveAt(a, "password"))
-        .orElse(SecretProviders.resolveAt(source, "password")),
-      connectionProperties = dialect.defaultConnectionProperties ++
+      user = user,
+      password = password,
+      connectionProperties = dialect.defaultConnectionProperties ++ authProps ++
         ConfigUtils.optConfig(source, "connection_properties").map(c => ConfigUtils.stringMap(c.atKey("p"), "p")).getOrElse(Map.empty),
       fetchSize = ConfigUtils.optInt(source, "fetchsize").getOrElse(1000),
       partitioning = partitioning,
@@ -151,8 +224,85 @@ object JdbcSourceConfig {
       healthCheckEnabled = ConfigUtils.optConfig(source, "health_check")
         .flatMap(h => ConfigUtils.optBoolean(h, "enabled")).getOrElse(true),
       logSql = ConfigUtils.optConfig(source, "diagnostics")
-        .flatMap(d => ConfigUtils.optBoolean(d, "log_sql")).getOrElse(false)
+        .flatMap(d => ConfigUtils.optBoolean(d, "log_sql")).getOrElse(false),
+      authType = authType,
+      projections = projections,
+      structuredColumns = structuredColumns,
+      filters = filters,
+      parameters = parameters,
+      executorProbePartitions = ConfigUtils.optConfig(source, "health_check")
+        .filter(h => ConfigUtils.optBoolean(h, "executor_probe").getOrElse(false))
+        .map(h => ConfigUtils.optInt(h, "probe_partitions").getOrElse(2))
     )
+  }
+
+  /**
+    * Azure-native authentication for SQL Server / Azure SQL, mapped onto
+    * Microsoft JDBC driver properties (no Azure SDK required; the driver
+    * performs the token flows):
+    *   SQL_PASSWORD             user + password (any dialect)
+    *   AZURE_MANAGED_IDENTITY   authentication=ActiveDirectoryMSI (+ msiClientId)
+    *   AZURE_SERVICE_PRINCIPAL  authentication=ActiveDirectoryServicePrincipal
+    *   ENTRA_ID_PASSWORD        authentication=ActiveDirectoryPassword
+    *   ACCESS_TOKEN             accessToken property (secret-backed)
+    * Token lifecycle note: executor connections re-authenticate through the
+    * driver; a pre-fetched ACCESS_TOKEN can expire during long jobs — prefer
+    * MSI/service principal for long extractions.
+    */
+  private def resolveAuth(source: Config, dialect: JdbcDialect): (String, Option[String], Option[String], Map[String, String]) = {
+    val auth = ConfigUtils.optConfig(source, "auth")
+    val authType = auth.flatMap(a => ConfigUtils.optString(a, "type"))
+      .getOrElse(AuthType.SqlPassword).toUpperCase
+    if (!AuthType.all.contains(authType))
+      fail(s"auth.type '$authType' must be one of ${AuthType.all.mkString(", ")}")
+
+    def requireSqlServer(): Unit =
+      if (dialect.name != "sqlserver")
+        fail(s"auth.type $authType is only supported for the sqlserver dialect")
+
+    authType match {
+      case AuthType.SqlPassword =>
+        // The user id resolves through the same provider chain as the
+        // password (CyberArk serves both from one vault object via
+        // `attribute`); a bare string stays a plain value and does not warn.
+        val user = auth.flatMap(a => SecretProviders.resolveAt(a, "user", warnInline = false))
+          .orElse(ConfigUtils.optString(source, "user"))
+        val password = auth.flatMap(a => SecretProviders.resolveAt(a, "password"))
+          .orElse(SecretProviders.resolveAt(source, "password"))
+        (authType, user, password, Map.empty)
+
+      case AuthType.AzureManagedIdentity =>
+        requireSqlServer()
+        val props = Map("authentication" -> "ActiveDirectoryMSI") ++
+          auth.flatMap(a => ConfigUtils.optString(a, "client_id")).map("msiClientId" -> _)
+        (authType, None, None, props)
+
+      case AuthType.AzureServicePrincipal =>
+        requireSqlServer()
+        val a = auth.getOrElse(fail("auth block required for AZURE_SERVICE_PRINCIPAL"))
+        val clientId = ConfigUtils.optString(a, "client_id")
+          .orElse(SecretProviders.resolveAt(a, "client_id_secret"))
+          .getOrElse(fail("auth.client_id (or client_id_secret) is required for AZURE_SERVICE_PRINCIPAL"))
+        val clientSecret = SecretProviders.resolveAt(a, "client_secret")
+          .getOrElse(fail("auth.client_secret is required for AZURE_SERVICE_PRINCIPAL"))
+        (authType, Some(clientId), Some(clientSecret),
+          Map("authentication" -> "ActiveDirectoryServicePrincipal"))
+
+      case AuthType.EntraIdPassword =>
+        requireSqlServer()
+        val a = auth.getOrElse(fail("auth block required for ENTRA_ID_PASSWORD"))
+        val user = ConfigUtils.optString(a, "user").getOrElse(fail("auth.user is required for ENTRA_ID_PASSWORD"))
+        val password = SecretProviders.resolveAt(a, "password")
+          .getOrElse(fail("auth.password is required for ENTRA_ID_PASSWORD"))
+        (authType, Some(user), Some(password), Map("authentication" -> "ActiveDirectoryPassword"))
+
+      case AuthType.AccessToken =>
+        requireSqlServer()
+        val a = auth.getOrElse(fail("auth block required for ACCESS_TOKEN"))
+        val token = SecretProviders.resolveAt(a, "token")
+          .getOrElse(fail("auth.token secret reference is required for ACCESS_TOKEN"))
+        (authType, None, None, Map("accessToken" -> token))
+    }
   }
 
   private def parseWatermark(source: Config): WatermarkConfig = {
@@ -176,8 +326,8 @@ object JdbcSourceConfig {
         val types = ConfigUtils.stringList(inc, "column_types").map(_.toUpperCase)
         if (types.size != columns.size)
           fail("incremental.column_types must match watermark_columns length for COMPOSITE watermarks")
-        types.foreach(t => if (!Seq(WatermarkType.Timestamp, WatermarkType.Numeric).contains(t))
-          fail(s"incremental.column_types entry '$t' must be TIMESTAMP or NUMERIC"))
+        types.foreach(t => if (!WatermarkType.scalar.contains(t))
+          fail(s"incremental.column_types entry '$t' must be one of ${WatermarkType.scalar.mkString(", ")}"))
         types
       case t => Seq(t)
     }

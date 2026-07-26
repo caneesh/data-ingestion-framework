@@ -62,6 +62,15 @@ object SecretProviders {
   Seq(InlineSecretProvider, EnvSecretProvider, SysPropSecretProvider, FileSecretProvider,
     CyberArkSecretProvider).foreach(register)
 
+  /** Resolves an object-form secret reference ({ provider = ..., key/path/value }). */
+  def resolveRef(ref: Config): String = {
+    val providerName = ConfigUtils.optString(ref, "provider").getOrElse("inline")
+    val provider = Option(providers.get(providerName.toLowerCase)).getOrElse(
+      throw new IllegalArgumentException(
+        s"JDBC_002 Unknown secret provider '$providerName'. Available: ${availableNames.mkString(", ")}"))
+    provider.resolve(ref)
+  }
+
   /** Resolves a secret reference at `path` in conf: object form with a
     * `provider` field, or a bare string treated as inline. `warnInline`
     * controls the plaintext warning — user ids are provider-resolvable but
@@ -76,12 +85,7 @@ object SecretProviders {
               "(env/file/sysprop/cyberark) so credentials stay out of config files")
         Some(conf.getString(path))
       case com.typesafe.config.ConfigValueType.OBJECT =>
-        val ref = conf.getConfig(path)
-        val providerName = ConfigUtils.optString(ref, "provider").getOrElse("inline")
-        val provider = Option(providers.get(providerName.toLowerCase)).getOrElse(
-          throw new IllegalArgumentException(
-            s"JDBC_002 Unknown secret provider '$providerName'. Available: ${availableNames.mkString(", ")}"))
-        Some(provider.resolve(ref))
+        Some(resolveRef(conf.getConfig(path)))
       case other =>
         throw new IllegalArgumentException(s"JDBC_003 Secret reference at '$path' must be a string or object, found $other")
     }

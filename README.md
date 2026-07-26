@@ -249,10 +249,80 @@ egress as well.
 default; full SQL only under `diagnostics.log_sql = true`), and schema drift
 detection through the same schema-contract system files use.
 
+### Contract-Based Query Model
+
+Read modes: `FULL_TABLE` (bare table; configured projections/predicates are
+rejected rather than silently ignored), `SELECT_QUERY`, `CUSTOM_SQL`,
+`SQL_TEMPLATE`, `INCREMENTAL`. Configuration renders through the dialect —
+never raw string concatenation:
+
+```hocon
+columns = [
+  { source = "Member ID", target = "member_id" },              # -> [Member ID] AS [member_id]
+  { expression = "CONVERT(varchar(10), [dt], 23)", target = "effective_date" }
+]
+filters = [
+  { column = "state", operator = "=", value = "IL" },          # whitelisted ops, typed literals
+  { column = "amount", operator = ">=", value = "100", type = "NUMBER" }
+]
+parameters = [                                                  # SQL_TEMPLATE :name placeholders
+  { name = "region", type = "STRING", value = "WEST" },
+  { name = "floor", type = "NUMBER", from = { provider = "env", key = "MIN_AMOUNT" } }
+]
+```
+
+Identifier quoting is segment-aware (`dbo.member` → `[dbo].[member]`);
+literals validate through a typed round-trip (STRING/NUMBER/TIMESTAMP/DATE/
+BOOLEAN). Custom and templated SQL must be a single `SELECT`/`WITH`
+statement — semicolons, multi-statements and DDL/DML are rejected at
+startup. `expression` fields and legacy `where` strings remain the trusted
+administrator escape hatch, surfaced in the audited query hash. Legacy
+string `columns` render exactly as before.
+
+### Azure Authentication
+
+`auth.type`: `SQL_PASSWORD` (default), `AZURE_MANAGED_IDENTITY`
+(+`client_id`), `AZURE_SERVICE_PRINCIPAL` (`client_id` + secret-backed
+`client_secret`), `ENTRA_ID_PASSWORD`, `ACCESS_TOKEN` (secret-backed).
+Azure modes map onto Microsoft JDBC driver properties
+(`authentication=ActiveDirectoryMSI` etc. — the driver performs the token
+flows; no Azure SDK required) and are sqlserver-only. Prefer MSI/service
+principal for long extractions: a pre-fetched access token can expire
+mid-job. Azure Key Vault / Databricks scopes plug in by registering a
+`SecretProvider`.
+
+### Partitioning Strategies
+
+| `partition_strategy` | Behavior |
+|----------------------|----------|
+| `STATIC_RANGE` (default) | All four of `numPartitions`/`partitionColumn`/`lowerBound`/`upperBound`, atomic |
+| `MIN_MAX_QUERY` | Bounds discovered per run via a driver-side `MIN/MAX` query (honors `where`); degenerate ranges fall back to an unpartitioned read |
+| `PREDICATES` | `partition_predicates = [...]` — one partition per predicate, for skewed or non-numeric keys |
+
+`skew_metrics = true` logs rows-per-partition and a skew ratio (costs one
+extra pass) and warns above 3x. `health_check.executor_probe = true` runs a
+rate-limited connectivity check from executor hosts (the driver health check
+only proves the driver's own network path). Watermark codecs cover
+`TIMESTAMP`, `NUMERIC`, `DATE`, `DATETIMEOFFSET` (offset-aware) and
+`ROWVERSION` (unsigned hex) — usable in composite watermarks.
+
+Metrics counters (`jdbc_connection_attempt_total`, `jdbc_retry_total`,
+`jdbc_watermark_commit_total`, `jdbc_watermark_conflict_total`,
+`jdbc_schema_drift_total`, ...) accumulate in-process via `JdbcMetrics`;
+wire `JdbcMetrics.snapshot` into your metrics agent at the deployment
+boundary.
+
+**Deployment**: the Microsoft JDBC driver must be present on the driver AND
+executors (cluster library, `--jars`, or bundled per policy) — a missing
+driver fails fast with `JDBC_001`. SQL Server-specific integration tests
+(datetime2 precision, real AAD flows, encryption handshakes) require a
+Testcontainers/Azure environment and run outside `mvn test`.
+
 JDBC error codes: `JDBC_001` connection failure, `JDBC_002` authentication /
 secret resolution failure, `JDBC_003` invalid configuration, `JDBC_004`
 invalid watermark value, `JDBC_005` watermark version conflict (concurrent
-run).
+run — the losing run fails; re-run it to extract from the new committed
+watermark).
 
 ### Validate-Only Mode
 

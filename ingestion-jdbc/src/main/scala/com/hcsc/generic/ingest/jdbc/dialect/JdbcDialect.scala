@@ -23,6 +23,46 @@ trait JdbcDialect {
   def quoteIdentifier(identifier: String): String =
     "\"" + identifier.replace("\"", "\"\"") + "\""
 
+  /** Segment-aware quoting: dbo.member.ts -> [dbo].[member].[ts], never
+    * [dbo.member.ts]. Each segment must be a plain identifier. */
+  def quoteQualified(qualified: String): String = {
+    val segments = qualified.split("\\.", -1)
+    require(segments.forall(s => s.nonEmpty && s.matches("[A-Za-z_][A-Za-z0-9_ $#]*")),
+      s"JDBC_003 '$qualified' is not a safe qualified identifier")
+    segments.map(quoteIdentifier).mkString(".")
+  }
+
+  /** Typed literal rendering for query parameters and structured filters.
+    * Values are validated through a typed round-trip so configuration or
+    * secret content can never inject SQL. */
+  def renderLiteral(paramType: String, value: String): String = paramType.toUpperCase match {
+    case "STRING" => "'" + value.replace("'", "''") + "'"
+    case "NUMBER" =>
+      try BigDecimal(value.trim).toString
+      catch { case _: NumberFormatException =>
+        throw new IllegalArgumentException(s"JDBC_003 literal '$value' is not a valid NUMBER") }
+    case "TIMESTAMP" =>
+      try "'" + java.sql.Timestamp.valueOf(value.trim).toString + "'"
+      catch { case _: IllegalArgumentException =>
+        throw new IllegalArgumentException(s"JDBC_003 literal '$value' is not a valid TIMESTAMP") }
+    case "DATE" =>
+      try "'" + java.time.LocalDate.parse(value.trim).toString + "'"
+      catch { case _: java.time.format.DateTimeParseException =>
+        throw new IllegalArgumentException(s"JDBC_003 literal '$value' is not a valid DATE (yyyy-MM-dd)") }
+    case "BOOLEAN" =>
+      value.trim.toLowerCase match {
+        case "true"  => booleanTrueLiteral
+        case "false" => booleanFalseLiteral
+        case other   => throw new IllegalArgumentException(s"JDBC_003 literal '$other' is not a valid BOOLEAN")
+      }
+    case other =>
+      throw new IllegalArgumentException(
+        s"JDBC_003 Unknown parameter type '$other'; expected STRING, NUMBER, TIMESTAMP, DATE or BOOLEAN")
+  }
+
+  protected def booleanTrueLiteral: String = "TRUE"
+  protected def booleanFalseLiteral: String = "FALSE"
+
   /** Health-check probe statement. */
   def validationQuery: String = "SELECT 1"
 
@@ -47,6 +87,8 @@ object SqlServerDialect extends JdbcDialect {
     "[" + identifier.replace("]", "]]") + "]"
   override def selectTopOne(projection: String, from: String, orderBy: String): String =
     s"SELECT TOP 1 $projection FROM $from ORDER BY $orderBy"
+  override protected def booleanTrueLiteral: String = "1"
+  override protected def booleanFalseLiteral: String = "0"
 }
 
 object PostgresDialect extends JdbcDialect {

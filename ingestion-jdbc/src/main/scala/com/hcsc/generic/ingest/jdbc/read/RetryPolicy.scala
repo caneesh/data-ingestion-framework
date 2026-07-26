@@ -33,12 +33,15 @@ object RetryPolicy {
         case NonFatal(e) =>
           val category = SqlFailureClassifier.classify(e)
           if (!category.retryable) {
+            com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_permanent_failure_total")
             logger.error(s"[RetryPolicy] $operation failed with permanent error " +
               s"(category=$category); not retrying: ${e.getMessage}")
             throw e
           }
+          com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_transient_failure_total")
           lastError = e
           if (attempt < maxAttempts) {
+            com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_retry_total")
             val sleepMs = backoffWithJitter(retry.backoffMs, attempt)
             logger.warn(s"[RetryPolicy] $operation attempt $attempt/$maxAttempts failed " +
               s"(category=$category, ${e.getClass.getSimpleName}: ${e.getMessage}); " +

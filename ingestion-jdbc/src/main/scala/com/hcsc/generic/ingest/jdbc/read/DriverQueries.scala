@@ -43,6 +43,9 @@ object DriverQueries {
   private def stringify(value: Object): String = value match {
     case t: java.sql.Timestamp => t.toString
     case d: java.sql.Date => d.toString
+    case odt: java.time.OffsetDateTime =>
+      odt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS XXX"))
+    case bytes: Array[Byte] => bytes.map("%02X".format(_)).mkString
     case other => String.valueOf(other)
   }
 }

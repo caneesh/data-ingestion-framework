@@ -45,6 +45,10 @@ object JdbcSource extends Source with WatermarkAdvancing {
         case Right(status) => logger.info(s"[JdbcSource] $status")
       }
     }
+    cfg.executorProbePartitions.foreach { n =>
+      logger.info(s"[JdbcSource] Running executor connectivity probe across $n partition(s)")
+      JdbcHealthCheck.executorProbe(spark, cfg, n)
+    }
 
     val watermarkPredicate = cfg.watermark.map { wm =>
       val entity = entityKey(sourceConf, cfg)
@@ -69,34 +73,109 @@ object JdbcSource extends Source with WatermarkAdvancing {
     val dbtable = QueryBuilder.dbtable(cfg, watermarkPredicate)
     logQuery(cfg, dbtable)
 
-    var reader = spark.read
-      .format("jdbc")
-      .option("url", cfg.url)
-      .option("driver", cfg.driver)
-      .option("dbtable", dbtable)
-      .option("fetchsize", cfg.fetchSize.toString)
-
-    cfg.user.foreach(u => reader = reader.option("user", u))
-    cfg.password.foreach(p => reader = reader.option("password", p))
-    cfg.connectionProperties.foreach { case (k, v) => reader = reader.option(k, v) }
-
-    cfg.partitioning.partitionColumn.foreach { c =>
-      reader = reader
-        .option("numPartitions", cfg.partitioning.numPartitions.get.toString)
-        .option("partitionColumn", c)
-        .option("lowerBound", cfg.partitioning.lowerBound.get.toString)
-        .option("upperBound", cfg.partitioning.upperBound.get.toString)
-    }
-
     // Retry layering: this wrapper protects DRIVER-side plan construction and
     // schema retrieval only. Executor partition reads are retried by Spark
     // task retry; whole-run failures are handled by pipeline restart (the
     // watermark never advanced, so replay re-extracts the same window).
     val df = RetryPolicy.withRetries(s"JDBC schema fetch (${cfg.dialect.name})", cfg.retry, logger) {
-      reader.load()
+      buildReader(spark, cfg, dbtable)
     }
 
+    JdbcMetrics.increment("jdbc_partitions_total", df.rdd.getNumPartitions)
+    if (cfg.partitioning.skewMetrics) logSkew(df)
+
     applyContract(df, sourceConf)
+  }
+
+  private def buildReader(spark: SparkSession, cfg: JdbcSourceConfig, dbtable: String): DataFrame = {
+    cfg.partitioning.strategy match {
+      case PartitionStrategy.Predicates =>
+        // Explicit per-partition predicates via the spark.read.jdbc API —
+        // for keys where range striding is unsuitable or badly skewed.
+        val props = new java.util.Properties()
+        props.setProperty("driver", cfg.driver)
+        props.setProperty("fetchsize", cfg.fetchSize.toString)
+        cfg.user.foreach(props.setProperty("user", _))
+        cfg.password.foreach(props.setProperty("password", _))
+        cfg.connectionProperties.foreach { case (k, v) => props.setProperty(k, v) }
+        spark.read.jdbc(cfg.url, dbtable, cfg.partitioning.predicates.toArray, props)
+
+      case strategy =>
+        var reader = spark.read
+          .format("jdbc")
+          .option("url", cfg.url)
+          .option("driver", cfg.driver)
+          .option("dbtable", dbtable)
+          .option("fetchsize", cfg.fetchSize.toString)
+        cfg.user.foreach(u => reader = reader.option("user", u))
+        cfg.password.foreach(p => reader = reader.option("password", p))
+        cfg.connectionProperties.foreach { case (k, v) => reader = reader.option(k, v) }
+
+        val bounds: Option[(Long, Long)] = strategy match {
+          case PartitionStrategy.MinMaxQuery =>
+            discoverBounds(cfg) // stale static bounds problem: discover per run
+          case _ =>
+            for (lo <- cfg.partitioning.lowerBound; hi <- cfg.partitioning.upperBound) yield (lo, hi)
+        }
+
+        (cfg.partitioning.partitionColumn, bounds) match {
+          case (Some(column), Some((lo, hi))) =>
+            reader = reader
+              .option("numPartitions", cfg.partitioning.numPartitions.get.toString)
+              .option("partitionColumn", column)
+              .option("lowerBound", lo.toString)
+              .option("upperBound", hi.toString)
+          case _ => () // unpartitioned read
+        }
+        reader.load()
+    }
+  }
+
+  /** MIN_MAX_QUERY strategy: driver-side bound discovery so partition
+    * strides track the actual key range instead of stale static config. */
+  private def discoverBounds(cfg: JdbcSourceConfig): Option[(Long, Long)] = {
+    val column = cfg.partitioning.partitionColumn.get
+    val baseFrom = (cfg.table, cfg.sql) match {
+      case (Some(t), _)    => t
+      case (None, Some(s)) => s"($s) base"
+      case _ => return None
+    }
+    val whereClause = cfg.where.map(w => s" WHERE $w").getOrElse("")
+    val quoted = cfg.dialect.quoteQualified(column)
+    val sql = s"SELECT MIN($quoted), MAX($quoted) FROM $baseFrom$whereClause"
+
+    DriverQueries.firstRow(cfg, sql, logger) match {
+      case Some(Seq(Some(lo), Some(hi))) =>
+        val (l, h) = (BigDecimal(lo).toLong, BigDecimal(hi).toLong)
+        if (l < h) {
+          logger.info(s"[JdbcSource] MIN_MAX_QUERY discovered bounds [$l, $h] for $column")
+          Some((l, h))
+        } else {
+          logger.info(s"[JdbcSource] MIN_MAX_QUERY bounds degenerate [$l, $h]; reading unpartitioned")
+          None
+        }
+      case _ =>
+        logger.info("[JdbcSource] MIN_MAX_QUERY found no rows; reading unpartitioned")
+        None
+    }
+  }
+
+  /** Rows per Spark partition + skew ratio (gated by skew_metrics: this
+    * costs one extra pass over the extracted data). */
+  private def logSkew(df: DataFrame): Unit = {
+    val counts = df.rdd.mapPartitionsWithIndex { case (i, it) => Iterator((i, it.size)) }.collect()
+    if (counts.nonEmpty) {
+      val sizes = counts.map(_._2.toLong)
+      val max = sizes.max
+      val avg = sizes.sum.toDouble / sizes.length
+      val ratio = if (avg > 0) max / avg else 0.0
+      logger.info(f"[JdbcSource] partition skew: partitions=${sizes.length} " +
+        f"min=${sizes.min} max=$max avg=$avg%.1f skewRatio=$ratio%.2f " +
+        s"counts=${counts.sortBy(_._1).map(_._2).mkString(",")}")
+      if (ratio > 3.0)
+        logger.warn(f"[JdbcSource] significant partition skew (ratio $ratio%.2f); " +
+          "consider PREDICATES partitioning or a different partition column")
+    }
   }
 
   /** Driver-side capture of the source's current maximum watermark, so the
@@ -147,6 +226,7 @@ object JdbcSource extends Source with WatermarkAdvancing {
       case None => df
       case Some(contract) =>
         val resolution = SchemaValidator.validateHeaders(df.columns.toSeq, contract, logger)
+        if (resolution.violations.nonEmpty) JdbcMetrics.increment("jdbc_schema_drift_total")
         logger.info(s"[JdbcSource] Schema drift check: columns=[${df.columns.mkString(",")}] " +
           s"missingRequired=[${resolution.missingRequired.mkString(",")}]")
         SchemaValidator.enforce(resolution.violations, contract.policies, logger, Some(resolution))
@@ -197,7 +277,14 @@ object JdbcSource extends Source with WatermarkAdvancing {
         case None =>
           logger.info(s"[JdbcSource] entity=$entity nothing beyond current watermark; not advanced")
         case Some(next) =>
-          store.recordIfVersion(entity, next, runId, version)
+          try {
+            store.recordIfVersion(entity, next, runId, version)
+            JdbcMetrics.increment("jdbc_watermark_commit_total")
+          } catch {
+            case e: com.hcsc.generic.ingest.jdbc.watermark.WatermarkConflictException =>
+              JdbcMetrics.increment("jdbc_watermark_conflict_total")
+              throw e
+          }
           logger.info(s"[JdbcSource] entity=$entity watermark committed " +
             s"version=${version + 1} columns=[${wm.columns.mkString(",")}] (runId=$runId)")
       }

@@ -1,16 +1,18 @@
 package com.hcsc.generic.ingest.jdbc.read
 
 import com.hcsc.generic.ingest.jdbc.{JdbcMode, JdbcSourceConfig}
+import com.hcsc.generic.ingest.jdbc.query.{QueryTemplate, SqlStatementValidator}
 
 /**
-  * Builds the Spark `dbtable` expression for each read mode. Filters
-  * expressed here (WHERE clauses, watermark predicates) execute inside the
-  * database — guaranteed predicate pushdown, independent of Spark's own
-  * pushdown heuristics.
+  * Builds the Spark `dbtable` expression for each read mode from the
+  * contract-based query model. Filters expressed here (structured filters,
+  * legacy WHERE clauses, watermark predicates) execute inside the database —
+  * guaranteed predicate pushdown.
   *
-  * Trust boundary: `where` and `sql` are operator-authored SQL from feed
-  * configuration (same trust level as reject rules); table names are
-  * validated against a strict identifier pattern.
+  * Legacy configuration (plain string columns, free-form where) renders
+  * byte-for-byte as before; structured projections/filters render through
+  * the dialect (segment-aware quoting, typed literals). Custom and
+  * templated SQL pass SqlStatementValidator (single SELECT, no ';').
   */
 object QueryBuilder {
 
@@ -24,29 +26,46 @@ object QueryBuilder {
         cfg.table.get
 
       case JdbcMode.SelectQuery =>
-        val projection = if (cfg.columns.nonEmpty) cfg.columns.mkString(", ") else "*"
-        val whereClause = cfg.where.map(w => s" WHERE $w").getOrElse("")
-        s"(SELECT $projection FROM ${cfg.table.get}$whereClause) src"
+        s"(SELECT ${projection(cfg)} FROM ${cfg.table.get}${whereClause(cfg, None)}) src"
 
       case JdbcMode.CustomSql =>
-        s"(${cfg.sql.get}) src"
+        s"(${SqlStatementValidator.validate(cfg.sql.get)}) src"
+
+      case JdbcMode.SqlTemplate =>
+        val rendered = QueryTemplate.render(cfg.sql.get, cfg.parameters, cfg.dialect)
+        s"(${SqlStatementValidator.validate(rendered)}) src"
 
       case JdbcMode.Incremental =>
         val base = (cfg.table, cfg.sql) match {
-          case (Some(t), _) =>
-            val projection = if (cfg.columns.nonEmpty) cfg.columns.mkString(", ") else "*"
-            s"SELECT $projection FROM $t"
-          case (None, Some(s)) =>
-            s"SELECT * FROM ($s) base"
+          case (Some(t), _)    => s"SELECT ${projection(cfg)} FROM $t"
+          case (None, Some(s)) => s"SELECT * FROM (${SqlStatementValidator.validate(s)}) base"
           case _ =>
             throw new IllegalArgumentException("JDBC_003 INCREMENTAL requires table or sql")
         }
-        val predicates = cfg.where.toSeq ++ watermarkPredicate.toSeq
-        val whereClause =
-          if (predicates.isEmpty) ""
-          else predicates.map(p => s"($p)").mkString(" WHERE ", " AND ", "")
-        s"($base$whereClause) src"
+        s"($base${whereClause(cfg, watermarkPredicate, parenthesized = true)}) src"
     }
+  }
+
+  private def projection(cfg: JdbcSourceConfig): String =
+    if (cfg.structuredColumns) cfg.projections.map(_.render(cfg.dialect)).mkString(", ")
+    else if (cfg.columns.nonEmpty) cfg.columns.mkString(", ")
+    else "*"
+
+  /** SELECT_QUERY keeps the historical plain rendering for a lone legacy
+    * where; anything structured (or multiple predicates) renders each
+    * predicate parenthesized and AND-combined. */
+  private def whereClause(
+    cfg: JdbcSourceConfig,
+    watermarkPredicate: Option[String],
+    parenthesized: Boolean = false
+  ): String = {
+    val structural = cfg.filters.filter(_.expression.isEmpty).map(_.render(cfg.dialect))
+    val legacy = cfg.filters.filter(f => f.expression.isDefined).map(_.expression.get)
+
+    val all = structural ++ legacy ++ watermarkPredicate.toSeq
+    if (all.isEmpty) ""
+    else if (!parenthesized && structural.isEmpty && all.size == 1) s" WHERE ${all.head}"
+    else all.map(p => s"($p)").mkString(" WHERE ", " AND ", "")
   }
 
   private def validateTableName(table: String): Unit =

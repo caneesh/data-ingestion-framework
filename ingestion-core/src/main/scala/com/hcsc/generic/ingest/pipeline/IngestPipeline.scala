@@ -6,7 +6,7 @@ import com.hcsc.generic.ingest.files.{FileIntakeService, StagedFile}
 import com.hcsc.generic.ingest.model.Cli
 import com.hcsc.generic.ingest.reject.RejectService
 import com.hcsc.generic.ingest.runtime.{RunContext, StageStatus, Stages}
-import com.hcsc.generic.ingest.schema.{SchemaContract, SchemaValidator}
+import com.hcsc.generic.ingest.schema.{SchemaContract, SchemaValidator, SchemaVersions}
 import com.hcsc.generic.ingest.sink.SinkRegistry
 import com.hcsc.generic.ingest.source.SourceRegistry
 import com.hcsc.generic.ingest.stage.{CuratedResult, CuratedStageRunner}
@@ -47,7 +47,20 @@ final class IngestPipeline(
     resume = cli.resume
   )
 
-  def run(): Unit = {
+  /** DataFrames persisted during the run; released in run()'s finally so a
+    * long-lived shared SparkSession does not accumulate executor cache. */
+  private val cached = scala.collection.mutable.ArrayBuffer.empty[DataFrame]
+
+  private def track(df: DataFrame): DataFrame = { cached += df; df }
+
+  def run(): Unit =
+    try runInternal()
+    finally {
+      cached.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
+      cached.clear()
+    }
+
+  private def runInternal(): Unit = {
     logger.info(s"==== Pipeline start entity=${ctx.entity} mode=${ctx.mode} runId=${ctx.runId} " +
       s"dryRun=${ctx.dryRun} resume=${ctx.resume} ====")
 
@@ -149,12 +162,17 @@ final class IngestPipeline(
     val source = SourceRegistry.resolve(sourceType)
     val df0 = source.read(spark, effectiveSource)
 
+    val rawDatabase = ConfigUtils.sqlIdentifier(rawConf, "database")
+    val rawTable = ConfigUtils.sqlIdentifier(rawConf, "table")
+    val rawFullTable = s"$rawDatabase.$rawTable"
+
     contract.foreach { c =>
       // Row-level nullability is diverted to the reject stage when configured;
       // failing the whole run here would preempt record-level handling.
       val violations = SchemaValidator.validateData(df0, c).filterNot(v =>
         rejectService.handlesContractNullability &&
-          v.kind == com.hcsc.generic.ingest.schema.ViolationKind.NullabilityViolation)
+          v.kind == com.hcsc.generic.ingest.schema.ViolationKind.NullabilityViolation) ++
+        SchemaValidator.versionMismatch(SchemaVersions.stored(spark, rawDatabase, rawTable), c)
       SchemaValidator.enforce(violations, c.policies, logger)
     }
 
@@ -164,14 +182,24 @@ final class IngestPipeline(
       case _ => withMeta0
     }
 
-    val sourceCount = withMeta.persist(StorageLevel.MEMORY_AND_DISK).count()
+    val sourceCount = track(withMeta.persist(StorageLevel.MEMORY_AND_DISK)).count()
 
     val split = rejectService.split(withMeta, ctx)
-    val accepted = split.accepted.persist(StorageLevel.MEMORY_AND_DISK)
+    val accepted = track(split.accepted.persist(StorageLevel.MEMORY_AND_DISK))
 
     if (!ctx.dryRun) {
-      val sinkType = ConfigUtils.optString(rawConf, "type").getOrElse("hive")
-      SinkRegistry.resolve(sinkType).write(spark, accepted, rawConf)
+      // Idempotency guard: if a prior attempt committed this run's rows to
+      // RAW but died before recording stage SUCCESS, do not append twice.
+      val alreadyLoaded = spark.catalog.tableExists(rawFullTable) &&
+        spark.table(rawFullTable).columns.contains("run_id") &&
+        spark.table(rawFullTable).filter(col("run_id") === lit(ctx.runId)).limit(1).count() > 0
+      if (alreadyLoaded) {
+        logger.warn(s"[Pipeline] RAW already holds rows for run ${ctx.runId}; skipping write (idempotent replay)")
+      } else {
+        val sinkType = ConfigUtils.optString(rawConf, "type").getOrElse("hive")
+        SinkRegistry.resolve(sinkType).write(spark, accepted, rawConf)
+      }
+      contract.foreach(c => SchemaVersions.record(spark, rawDatabase, rawTable, c.version, logger))
     } else {
       logger.info("[Pipeline] DRY-RUN: skipping RAW write")
     }
@@ -203,7 +231,8 @@ final class IngestPipeline(
   private def filterByFileId(files: Seq[StagedFile]): Seq[StagedFile] =
     ctx.fileIdFilter match {
       case Some(id) =>
-        val matched = files.filter(f => f.checksum.startsWith(id) || f.name == id)
+        // Exact match only: a checksum prefix could select multiple files.
+        val matched = files.filter(f => f.checksum == id || f.name == id)
         logger.info(s"[Pipeline] --file-id $id matched ${matched.size} of ${files.size} staged file(s)")
         matched
       case None => files

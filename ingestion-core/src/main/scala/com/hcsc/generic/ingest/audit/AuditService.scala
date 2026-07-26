@@ -94,15 +94,25 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
 
   private def now(): Timestamp = new Timestamp(System.currentTimeMillis())
 
-  private def ensureDatabase(): Unit =
-    spark.sql(s"CREATE DATABASE IF NOT EXISTS $database")
+  private val fileTableDdl =
+    "run_id STRING, entity STRING, file_name STRING, file_path STRING, checksum STRING, " +
+      "size_bytes BIGINT, status STRING, reason STRING, event_ts TIMESTAMP"
 
-  private def append(rows: org.apache.spark.sql.DataFrame, fullTable: String): Unit = {
-    ensureDatabase()
-    if (spark.catalog.tableExists(fullTable))
-      rows.write.mode(SaveMode.Append).insertInto(fullTable)
-    else
-      rows.write.format("orc").saveAsTable(fullTable)
+  private val runTableDdl =
+    "run_id STRING, entity STRING, stage STRING, status STRING, source_count BIGINT, " +
+      "raw_count BIGINT, accepted_count BIGINT, rejected_count BIGINT, insert_count BIGINT, " +
+      "update_count BIGINT, delete_count BIGINT, control_total STRING, message STRING, event_ts TIMESTAMP"
+
+  private val reconciliationTableDdl =
+    "run_id STRING, entity STRING, check_name STRING, expected STRING, actual STRING, " +
+      "passed BOOLEAN, event_ts TIMESTAMP"
+
+  /** CREATE IF NOT EXISTS + append: concurrent first runs race safely at the
+    * metastore instead of one saveAsTable(Overwrite) wiping the other. */
+  private def append(rows: org.apache.spark.sql.DataFrame, fullTable: String, columnsDdl: String): Unit = {
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS $database")
+    spark.sql(s"CREATE TABLE IF NOT EXISTS $fullTable ($columnsDdl) USING ORC")
+    rows.write.mode(SaveMode.Append).insertInto(fullTable)
   }
 
   def recordFile(
@@ -120,7 +130,7 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
     }
     import spark.implicits._
     val record = FileAuditRecord(ctx.runId, ctx.entity, fileName, filePath, checksum, sizeBytes, status, reason, now())
-    append(Seq(record).toDF(), fileTable)
+    append(Seq(record).toDF(), fileTable, fileTableDdl)
     logger.info(s"[Audit] file=$fileName status=$status reason=$reason")
   }
 
@@ -142,7 +152,7 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
       counts.insertCount, counts.updateCount, counts.deleteCount,
       counts.controlTotal.orNull, message, now()
     )
-    append(Seq(record).toDF(), runTable)
+    append(Seq(record).toDF(), runTable, runTableDdl)
     logger.info(s"[Audit] stage=$stage status=$status counts=$counts")
   }
 
@@ -156,7 +166,7 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
     val records = entries.map { case (check, expected, actual, passed) =>
       ReconciliationRecord(ctx.runId, ctx.entity, check, expected, actual, passed, ts)
     }
-    append(records.toDF(), reconciliationTable)
+    append(records.toDF(), reconciliationTable, reconciliationTableDdl)
     entries.foreach { case (check, expected, actual, passed) =>
       logger.info(s"[Audit] reconciliation check=$check expected=$expected actual=$actual passed=$passed")
     }

@@ -98,11 +98,14 @@ final class PublishService(spark: SparkSession, logger: Logger) {
     if (!spark.catalog.databaseExists(database)) return
     val prefix = stagingPrefix(table)
     val stale = spark.catalog.listTables(database).collect()
-      .map(t => s"$database.${t.name}")
-      .filter(name => name.startsWith(s"$database.$prefix") && name != currentStaging)
+      .map(_.name)
+      .filter(name =>
+        name.startsWith(prefix) &&
+          name.matches("[a-zA-Z_][a-zA-Z0-9_]*") && // never interpolate an unvalidated name
+          s"$database.$name" != currentStaging)
     stale.foreach { name =>
-      logger.warn(s"[Publish] Dropping stale staging table $name")
-      spark.sql(s"DROP TABLE IF EXISTS $name")
+      logger.warn(s"[Publish] Dropping stale staging table $database.$name")
+      spark.sql(s"DROP TABLE IF EXISTS `$database`.`$name`")
     }
   }
 }

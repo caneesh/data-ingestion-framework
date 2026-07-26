@@ -106,17 +106,22 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     val cleaned = transform.filterNullKeys(incoming, keys, dropNull, blanksAsNull)
     val deduped = transform.deduplicate(cleaned, keys, orderBy)
     val alignedIncoming = transform.align(deduped, target.schema).persist()
-
     val incomingKeys = alignedIncoming.select(keys.map(col): _*).distinct().persist()
-    val targetKeys = target.select(keys.map(col): _*).distinct()
+    try {
+      val targetKeys = target.select(keys.map(col): _*).distinct()
 
-    val updateCount = incomingKeys.join(targetKeys, keys, "inner").count()
-    val insertCount = incomingKeys.count() - updateCount
+      val totalIncoming = incomingKeys.count()
+      val updateCount = incomingKeys.join(targetKeys, keys, "inner").count()
+      val insertCount = totalIncoming - updateCount
 
-    val unchanged = target.join(broadcast(incomingKeys), keys, "left_anti")
-    val merged = unchanged.unionByName(alignedIncoming)
+      val unchanged = target.join(broadcast(incomingKeys), keys, "left_anti")
+      val merged = unchanged.unionByName(alignedIncoming)
 
-    val published = publisher.publish(merged, request, ctx)
-    CuratedResult(published.publishedCount, insertCount, updateCount, deleteCount = 0L)
+      val published = publisher.publish(merged, request, ctx)
+      CuratedResult(published.publishedCount, insertCount, updateCount, deleteCount = 0L)
+    } finally {
+      incomingKeys.unpersist(false)
+      alignedIncoming.unpersist(false)
+    }
   }
 }

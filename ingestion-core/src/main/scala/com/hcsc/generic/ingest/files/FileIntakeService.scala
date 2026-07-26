@@ -86,12 +86,15 @@ final class FileIntakeService(
   /** Stages landing files for processing. None = feed uses a static path. */
   def stage(ctx: RunContext): Option[Seq[StagedFile]] = layout.map { l =>
     val fs = FsUtils.fileSystem(l.landing, hadoopConf)
-    val candidates = FsUtils.listFiles(fs, l.landing) ++ FsUtils.listFiles(fs, l.inprogress)
+    // fromLanding=false marks leftovers of a crashed run already in inprogress
+    val candidates =
+      FsUtils.listFiles(fs, l.landing).map(_ -> true) ++
+        FsUtils.listFiles(fs, l.inprogress).map(_ -> false)
     logger.info(s"[FileIntake] Found ${candidates.size} candidate file(s) in landing/inprogress")
 
-    val knownChecksums = if (idempotencyEnabled) processedChecksums() else Set.empty[String]
+    val knownChecksums = if (idempotencyEnabled) processedChecksums(ctx.entity) else Set.empty[String]
 
-    candidates.flatMap { status =>
+    candidates.flatMap { case (status, fromLanding) =>
       val file = status.getPath
       val name = file.getName
       // Skip validator sidecar files themselves
@@ -110,7 +113,12 @@ final class FileIntakeService(
             handleDuplicate(ctx, fs, l, status, checksum)
           } else {
             val staged = if (ctx.dryRun) file else FsUtils.moveToDir(fs, file, l.inprogress)
-            audit.recordFile(ctx, name, staged.toString, checksum, status.getLen, FileStatuses.Validated)
+            // Re-staged leftovers were audited VALIDATED when first staged;
+            // don't write a duplicate audit row on restart.
+            if (fromLanding)
+              audit.recordFile(ctx, name, staged.toString, checksum, status.getLen, FileStatuses.Validated)
+            else
+              logger.info(s"[FileIntake] Re-staged leftover inprogress file $name (restart)")
             Some(StagedFile(name, file.toString, staged.toString, checksum, status.getLen))
           }
         }
@@ -170,12 +178,12 @@ final class FileIntakeService(
     name.endsWith(suffix)
   }
 
-  private def processedChecksums(): Set[String] = {
+  private def processedChecksums(entity: String): Set[String] = {
     if (!spark.catalog.tableExists(registryTable)) Set.empty
     else {
       import org.apache.spark.sql.functions.col
       spark.table(registryTable)
-        .filter(col("status") === FileStatuses.Processed)
+        .filter(col("entity") === entity && col("status") === FileStatuses.Processed)
         .select("checksum")
         .collect()
         .map(_.getString(0))
@@ -187,16 +195,20 @@ final class FileIntakeService(
     import spark.implicits._
     val c = idempotencyConf.get
     val db = ConfigUtils.sqlIdentifier(c, "database")
-    spark.sql(s"CREATE DATABASE IF NOT EXISTS $db")
     val ts = new Timestamp(System.currentTimeMillis())
     val rows = files.map(f =>
       (f.checksum, ctx.entity, f.name, f.stagedPath, f.sizeBytes, ctx.runId, FileStatuses.Processed, ts)
     ).toDF("checksum", "entity", "file_name", "file_path", "size_bytes", "run_id", "status", "processed_ts")
 
-    if (spark.catalog.tableExists(registryTable))
-      rows.write.mode(SaveMode.Append).insertInto(registryTable)
-    else
-      rows.write.format("orc").saveAsTable(registryTable)
+    // CREATE IF NOT EXISTS + append avoids the create/overwrite race between
+    // concurrent first runs sharing one registry.
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS $db")
+    spark.sql(
+      s"""CREATE TABLE IF NOT EXISTS $registryTable (
+         |  checksum STRING, entity STRING, file_name STRING, file_path STRING,
+         |  size_bytes BIGINT, run_id STRING, status STRING, processed_ts TIMESTAMP
+         |) USING ORC""".stripMargin)
+    rows.write.mode(SaveMode.Append).insertInto(registryTable)
   }
 }
 

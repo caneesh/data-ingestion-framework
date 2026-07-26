@@ -16,7 +16,8 @@ object HiveSink extends Sink {
     val database = ConfigUtils.sqlIdentifier(sinkConf, "database")
     val table = ConfigUtils.sqlIdentifier(sinkConf, "table")
     val fullTable = s"$database.$table"
-    val path = sinkConf.getString("path")
+    // Optional: absent path = managed table in the Hive warehouse
+    val path = ConfigUtils.optString(sinkConf, "path")
     val format = if (sinkConf.hasPath("format")) sinkConf.getString("format") else "orc"
 
     val partitionSpec = Partitioning.parse(sinkConf)
@@ -41,10 +42,10 @@ object HiveSink extends Sink {
         .mode(SaveMode.Append)
         .insertInto(fullTable)
     } else {
-      val writer = withPartitions.write
+      var writer = withPartitions.write
         .format(format)
         .mode(SaveMode.Overwrite)
-        .option("path", path)
+      path.foreach(p => writer = writer.option("path", p))
 
       if (partitionSpec.keys.nonEmpty)
         writer.partitionBy(partitionSpec.keys: _*).saveAsTable(fullTable)

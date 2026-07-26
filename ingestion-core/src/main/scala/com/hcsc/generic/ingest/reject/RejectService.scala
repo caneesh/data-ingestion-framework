@@ -76,9 +76,11 @@ final class RejectService(
       if (!ConfigUtils.optBoolean(c, "use_contract_nullability").getOrElse(false)) Seq.empty
       else contract.toSeq.flatMap(_.columns.filter(!_.nullable)).collect {
         case col if df.columns.exists(_.equalsIgnoreCase(col.name)) =>
+          // Backtick-quote so unusual column names cannot alter the parsed SQL
+          val quoted = s"`${col.name.replace("`", "``")}`"
           RejectRule(
             name = s"nullability_${col.name}",
-            condition = s"${col.name} IS NULL OR trim(cast(${col.name} as string)) = ''",
+            condition = s"$quoted IS NULL OR trim(cast($quoted as string)) = ''",
             errorCode = "NULLABILITY",
             message = s"Column '${col.name}' is declared non-nullable",
             category = "NULLABILITY"
@@ -108,9 +110,10 @@ final class RejectService(
     def firstMatch(f: RejectRule => String): Column =
       coalesce(flags.map { case (r, cond) => when(cond, lit(f(r))) }: _*)
 
-    val cached = df.persist()
-    val accepted = cached.filter(!isRejected)
-    val rejected = cached.filter(isRejected)
+    // Caller is expected to have persisted df (IngestPipeline does); this
+    // service does not manage its cache lifecycle.
+    val accepted = df.filter(!isRejected)
+    val rejected = df.filter(isRejected)
 
     val businessCols = df.columns
       .filterNot(c => Seq("row_idx", "load_timestamp", "file_type", "file_id").exists(c.equalsIgnoreCase))
@@ -141,15 +144,19 @@ final class RejectService(
   }
 
   private def persist(rejectRows: DataFrame): Long = {
-    val cached = rejectRows.persist()
-    val count = cached.count()
+    val count = rejectRows.count()
     if (count > 0) {
       val db = rejectTable.split("\\.")(0)
+      // CREATE IF NOT EXISTS + append avoids the create/overwrite race
+      // between concurrent first runs sharing one reject table.
       spark.sql(s"CREATE DATABASE IF NOT EXISTS $db")
-      if (spark.catalog.tableExists(rejectTable))
-        cached.write.mode(SaveMode.Append).insertInto(rejectTable)
-      else
-        cached.write.format("orc").saveAsTable(rejectTable)
+      spark.sql(
+        s"""CREATE TABLE IF NOT EXISTS $rejectTable (
+           |  run_id STRING, entity STRING, file_id STRING, source_file STRING,
+           |  row_idx BIGINT, raw_record STRING, error_code STRING,
+           |  error_message STRING, reject_category STRING, reject_ts TIMESTAMP
+           |) USING ORC""".stripMargin)
+      rejectRows.write.mode(SaveMode.Append).insertInto(rejectTable)
     }
     count
   }

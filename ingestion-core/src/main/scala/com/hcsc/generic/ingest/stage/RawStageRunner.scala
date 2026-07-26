@@ -2,7 +2,7 @@ package com.hcsc.generic.ingest.stage
 
 import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.model.Cli
-import com.hcsc.generic.ingest.schema.{SchemaContract, SchemaValidator}
+import com.hcsc.generic.ingest.schema.{SchemaContract, SchemaValidator, SchemaVersions}
 import com.hcsc.generic.ingest.sink.SinkRegistry
 import com.hcsc.generic.ingest.source.SourceRegistry
 import com.hcsc.generic.ingest.transform.RawMetadata
@@ -42,38 +42,21 @@ final class RawStageRunner(
 
         val df = source.read(spark, sourceConf)
 
+        val database = ConfigUtils.sqlIdentifier(rawConf, "database")
+        val table = ConfigUtils.sqlIdentifier(rawConf, "table")
+
         contract.foreach { c =>
           val violations = SchemaValidator.validateData(df, c) ++
-            SchemaValidator.versionMismatch(storedSchemaVersion(rawConf), c)
+            SchemaValidator.versionMismatch(SchemaVersions.stored(spark, database, table), c)
           SchemaValidator.enforce(violations, c.policies, logger)
         }
 
         val rawReady = RawMetadata.add(df, rawFlag).persist(StorageLevel.MEMORY_AND_DISK)
         sink.write(spark, rawReady, rawConf)
-        contract.foreach(c => recordSchemaVersion(rawConf, c.version))
+        contract.foreach(c => SchemaVersions.record(spark, database, table, c.version, logger))
         logger.info(s"[RawStageRunner] RAW completed rows=${rawReady.count()}")
         rawReady
     }
-  }
-
-  private val SchemaVersionProperty = "ingest.schema.version"
-
-  private def storedSchemaVersion(rawConf: Config): Option[String] = {
-    val database = ConfigUtils.sqlIdentifier(rawConf, "database")
-    val table = ConfigUtils.sqlIdentifier(rawConf, "table")
-    val fullTable = s"$database.$table"
-    if (!spark.catalog.tableExists(fullTable)) None
-    else
-      spark.sql(s"SHOW TBLPROPERTIES $fullTable")
-        .collect()
-        .collectFirst { case row if row.getString(0) == SchemaVersionProperty => row.getString(1) }
-  }
-
-  private def recordSchemaVersion(rawConf: Config, version: String): Unit = {
-    val database = ConfigUtils.sqlIdentifier(rawConf, "database")
-    val table = ConfigUtils.sqlIdentifier(rawConf, "table")
-    val escaped = version.replace("'", "''")
-    spark.sql(s"ALTER TABLE $database.$table SET TBLPROPERTIES ('$SchemaVersionProperty'='$escaped')")
   }
 
   private def readFromRaw(rawConf: Config): DataFrame = {

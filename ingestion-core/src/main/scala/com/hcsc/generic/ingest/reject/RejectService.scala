@@ -105,7 +105,11 @@ final class RejectService(
     }
 
     val flags: Seq[(RejectRule, Column)] = activeRules.map(r => r -> expr(r.condition))
-    val isRejected = flags.map(_._2).reduce(_ || _)
+    // SQL three-valued logic: a condition evaluating to NULL (e.g. a
+    // comparison against a null column) matches neither filter(isRejected)
+    // nor filter(!isRejected) and the row would silently vanish. NULL means
+    // "rule did not match", so it must resolve to false.
+    val isRejected = coalesce(flags.map(_._2).reduce(_ || _), lit(false))
 
     def firstMatch(f: RejectRule => String): Column =
       coalesce(flags.map { case (r, cond) => when(cond, lit(f(r))) }: _*)
@@ -133,7 +137,7 @@ final class RejectService(
 
     val rejectedCount =
       if (ctx.dryRun) rejected.count()
-      else persist(rejectRows)
+      else persist(rejectRows, ctx)
 
     val acceptedCount = accepted.count()
 
@@ -143,7 +147,7 @@ final class RejectService(
     RejectSplit(accepted, acceptedCount, rejectedCount)
   }
 
-  private def persist(rejectRows: DataFrame): Long = {
+  private def persist(rejectRows: DataFrame, ctx: RunContext): Long = {
     val count = rejectRows.count()
     if (count > 0) {
       val db = rejectTable.split("\\.")(0)
@@ -156,7 +160,17 @@ final class RejectService(
            |  row_idx BIGINT, raw_record STRING, error_code STRING,
            |  error_message STRING, reject_category STRING, reject_ts TIMESTAMP
            |) USING ORC""".stripMargin)
-      rejectRows.write.mode(SaveMode.Append).insertInto(rejectTable)
+      // Idempotency guard (mirrors the RAW one): a run that failed after this
+      // append and was resumed with the same --run-id must not append the same
+      // reject rows a second time.
+      val alreadyPersisted = spark.table(rejectTable)
+        .filter(col("run_id") === ctx.runId && col("entity") === ctx.entity)
+        .limit(1).count() > 0
+      if (alreadyPersisted)
+        logger.warn(s"[RejectService] Reject table already holds rows for run ${ctx.runId}; " +
+          "skipping append (idempotent replay)")
+      else
+        rejectRows.write.mode(SaveMode.Append).insertInto(rejectTable)
     }
     count
   }

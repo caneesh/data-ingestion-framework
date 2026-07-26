@@ -120,6 +120,11 @@
             <reportsDirectory>${project.build.directory}/surefire-reports</reportsDirectory>
             <junitxml>.</junitxml>
             <filereports>TestSuiteReport.txt</filereports>
+            <!-- Spark needs access to JDK internals; without these flags every
+                 Spark-touching suite aborts on JDK 17+ with IllegalAccessError
+                 (sun.nio.ch.DirectBuffer). IgnoreUnrecognizedVMOptions keeps
+                 the same argLine working on older JDKs. -->
+            <argLine>-XX:+IgnoreUnrecognizedVMOptions --add-exports=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/sun.nio.cs=ALL-UNNAMED --add-opens=java.base/sun.security.action=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED</argLine>
           </configuration>
           <executions>
             <execution>

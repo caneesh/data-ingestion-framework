@@ -100,4 +100,19 @@ class PhysicalHeaderReaderTest extends AnyFunSuite with BeforeAndAfterAll {
     val h = read("\uFEFFsubscriber_id,hios_id\nS1,H1\n")
     assert(h.fields.head == "subscriber_id")
   }
+
+  test("unknown charset name is reported as HDR_012, not thrown") {
+    val h = PhysicalHeaderReader.read(fs, write("a,b\nx,y\n"), ',', '"', '\\', "NOT-A-CHARSET")
+    assert(h.issues.exists(v => v.kind == ViolationKind.UnsupportedEncoding && v.toString.contains("HDR_012")))
+  }
+
+  test("content invalid in the configured charset is reported as HDR_012, not silently replaced") {
+    counter += 1
+    val f = tempDir.resolve(s"file_$counter.csv")
+    // 0xFF 0xFE is not valid UTF-8
+    Files.write(f, Array[Byte]('a'.toByte, ','.toByte, 0xFF.toByte, 0xFE.toByte, '\n'.toByte))
+    val h = PhysicalHeaderReader.read(fs, new Path(f.toUri), ',', '"', '\\', "UTF-8")
+    assert(h.issues.exists(_.kind == ViolationKind.UnsupportedEncoding))
+    assert(h.fields.isEmpty)
+  }
 }

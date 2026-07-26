@@ -24,12 +24,19 @@ object FsUtils {
   }
 
   /** Moves a file into destDir (creating it if needed), returning the new path.
+    * A same-named file already in destDir is never overwritten — the incoming
+    * file gets a numeric suffix instead (member.csv -> member.csv.1), so a
+    * re-delivered file can never destroy an earlier processed/quarantined one.
     * Falls back to copy+delete when rename is not supported across volumes. */
   def moveToDir(fs: FileSystem, file: Path, destDir: Path): Path = {
     if (!fs.exists(destDir)) fs.mkdirs(destDir)
-    val dest = new Path(destDir, file.getName)
+    var dest = new Path(destDir, file.getName)
     if (fs.makeQualified(dest) == fs.makeQualified(file)) return file // already in place
-    if (fs.exists(dest)) fs.delete(dest, false)
+    var suffix = 1
+    while (fs.exists(dest)) {
+      dest = new Path(destDir, s"${file.getName}.$suffix")
+      suffix += 1
+    }
     if (!fs.rename(file, dest)) {
       FileUtil.copy(fs, file, fs, dest, true, fs.getConf)
     }

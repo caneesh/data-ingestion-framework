@@ -154,13 +154,18 @@ final class IngestPipeline(
     )
 
     // ---- Stage: curated + publish -------------------------------------------
-    val curatedResult: Option[CuratedResult] = runStage(Stages.Curated) {
-      val result = new CuratedStageRunner(spark, curatedConf, logger).run(acceptedDf, ctx.mode, ctx, contract)
-      val counts = result.map(r => StageCounts(
-        insertCount = r.insertCount, updateCount = r.updateCount, deleteCount = r.deleteCount
-      )).getOrElse(StageCounts())
-      (result, counts)
-    }.getOrElse(None)
+    val curatedResult: Option[CuratedResult] =
+      if (cli.stage.equalsIgnoreCase("raw")) {
+        audit.recordStage(ctx, Stages.Curated, StageStatus.Skipped, message = "--stage raw")
+        logger.info("[Pipeline] --stage raw: curated stage skipped")
+        None
+      } else runStage(Stages.Curated) {
+        val result = new CuratedStageRunner(spark, curatedConf, logger).run(acceptedDf, ctx.mode, ctx, contract)
+        val counts = result.map(r => StageCounts(
+          insertCount = r.insertCount, updateCount = r.updateCount, deleteCount = r.deleteCount
+        )).getOrElse(StageCounts())
+        (result, counts)
+      }.getOrElse(None)
 
     // ---- Completion: file lifecycle, registry, reconciliation ---------------
     staged.foreach(files => intake.complete(ctx, files))
@@ -294,9 +299,19 @@ final class IngestPipeline(
     }
 
     val acceptedCount = if (split.acceptedCount >= 0) split.acceptedCount else sourceCount
+    // Measure rawCount from the table itself so the raw_equals_accepted
+    // reconciliation check verifies the write instead of restating its input.
+    // Tables without a run_id column (legacy) cannot attribute rows to this
+    // run, so the count stays unmeasured there.
+    val rawCount =
+      if (ctx.dryRun) 0L
+      else if (spark.catalog.tableExists(rawFullTable) &&
+               spark.table(rawFullTable).columns.contains("run_id"))
+        spark.table(rawFullTable).filter(col("run_id") === lit(ctx.runId)).count()
+      else -1L
     val counts = StageCounts(
       sourceCount = sourceCount,
-      rawCount = if (ctx.dryRun) 0L else acceptedCount,
+      rawCount = rawCount,
       acceptedCount = acceptedCount,
       rejectedCount = split.rejectedCount,
       controlTotal = controlTotal(accepted)

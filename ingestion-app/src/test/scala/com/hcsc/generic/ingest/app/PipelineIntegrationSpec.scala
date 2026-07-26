@@ -375,4 +375,29 @@ class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(stageStatuses.contains(("raw", "SKIPPED")))
     assert(stageStatuses.contains(("curated", "SUCCESS")))
   }
+
+  // ---------------------------------------------------------------------------
+  // --stage raw stops after the RAW write
+  // ---------------------------------------------------------------------------
+
+  test("--stage raw loads RAW but leaves curated untouched") {
+    writeLanding("member_rawonly.csv", "subscriber id,plan_hios_id\nS600,H6\n")
+
+    val curatedBefore = spark.table("p_curated.member").count()
+    run(feedConf(), baseCli.copy(runId = Some("run-rawonly-1"), stage = "raw"))
+
+    import org.apache.spark.sql.functions.col
+    assert(spark.table("p_raw.member").filter(col("run_id") === "run-rawonly-1").count() == 1)
+    assert(spark.table("p_curated.member").count() == curatedBefore,
+      "--stage raw must not publish curated")
+    assert(listNames("processed").contains("member_rawonly.csv"),
+      "file lifecycle still completes after a raw-only run")
+
+    val stageStatuses = spark.table("p_audit.ingest_run_audit")
+      .filter(col("run_id") === "run-rawonly-1")
+      .select("stage", "status").collect()
+      .map(r => (r.getString(0), r.getString(1))).toSet
+    assert(stageStatuses.contains(("raw", "SUCCESS")))
+    assert(stageStatuses.contains(("curated", "SKIPPED")))
+  }
 }

@@ -52,6 +52,10 @@ final class PublishService(spark: SparkSession, logger: Logger) {
 
     logger.info(s"[Publish] Materializing staging table $stagingTable")
     df.write.format(req.format).mode(SaveMode.Overwrite).saveAsTable(stagingTable)
+    // Stamp the creation time so cleanupStaleStaging can distinguish a
+    // concurrent run's live staging table from a crashed run's leftover.
+    spark.sql(s"ALTER TABLE $stagingTable SET TBLPROPERTIES " +
+      s"('${PublishService.StagingCreatedProperty}'='${System.currentTimeMillis()}')")
 
     try {
       val stagedCount = spark.table(stagingTable).count()
@@ -93,19 +97,47 @@ final class PublishService(spark: SparkSession, logger: Logger) {
     }
   }
 
-  /** Drops leftover staging tables from crashed runs of the same target. */
+  /** Drops leftover staging tables from crashed runs of the same target.
+    * Tables younger than [[PublishService.StaleStagingAgeMillis]] are presumed
+    * to belong to a concurrent live run and are left alone — dropping another
+    * run's staging table mid-publish would fail that run. */
   private def cleanupStaleStaging(database: String, table: String, currentStaging: String): Unit = {
     if (!spark.catalog.databaseExists(database)) return
     val prefix = stagingPrefix(table)
-    val stale = spark.catalog.listTables(database).collect()
+    val candidates = spark.catalog.listTables(database).collect()
       .map(_.name)
       .filter(name =>
         name.startsWith(prefix) &&
           name.matches("[a-zA-Z_][a-zA-Z0-9_]*") && // never interpolate an unvalidated name
           s"$database.$name" != currentStaging)
-    stale.foreach { name =>
-      logger.warn(s"[Publish] Dropping stale staging table $database.$name")
-      spark.sql(s"DROP TABLE IF EXISTS `$database`.`$name`")
+    candidates.foreach { name =>
+      if (isStale(database, name)) {
+        logger.warn(s"[Publish] Dropping stale staging table $database.$name")
+        spark.sql(s"DROP TABLE IF EXISTS `$database`.`$name`")
+      } else {
+        logger.info(s"[Publish] Staging table $database.$name looks live (younger than " +
+          s"${PublishService.StaleStagingAgeMillis / 3600000}h); leaving it for its own run")
+      }
     }
   }
+
+  /** A staging table is stale when its creation stamp is older than the
+    * threshold. A missing/unparseable stamp means a leftover from a version
+    * without stamping — treated as stale, matching the previous behavior. */
+  private def isStale(database: String, name: String): Boolean = {
+    val created = spark.sql(s"SHOW TBLPROPERTIES `$database`.`$name`").collect()
+      .collectFirst {
+        case row if row.getString(0) == PublishService.StagingCreatedProperty => row.getString(1)
+      }
+      .flatMap(v => scala.util.Try(v.toLong).toOption)
+    created.forall(ts => System.currentTimeMillis() - ts > PublishService.StaleStagingAgeMillis)
+  }
+}
+
+object PublishService {
+  /** Table property stamping a staging table's creation time (epoch millis). */
+  val StagingCreatedProperty = "ingest.staging.created"
+
+  /** Staging tables younger than this are presumed live and never cleaned up. */
+  val StaleStagingAgeMillis: Long = 24L * 60 * 60 * 1000
 }

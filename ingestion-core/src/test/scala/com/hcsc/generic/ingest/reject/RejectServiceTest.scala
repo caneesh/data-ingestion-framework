@@ -73,6 +73,23 @@ class RejectServiceTest extends AnyFunSuite with SharedSparkSession {
     assert(result.acceptedCount == 1L)
   }
 
+  test("rule conditions evaluating to NULL do not drop rows (three-valued logic)") {
+    // "hios_id > 'H1'" is NULL for the null-hios row; without coalescing the
+    // combined predicate that row would match neither accepted nor rejected.
+    val svc = service(
+      """
+        |database = ingest_audit
+        |rules = [
+        |  { name = "hios_after_h1", condition = "hios_id > 'H1'" }
+        |]
+      """.stripMargin)
+
+    val result = svc.split(df, ctx)
+    assert(result.acceptedCount + result.rejectedCount == 3L, "no row may vanish")
+    assert(result.rejectedCount == 1L)
+    assert(result.accepted.select("subscriber_id").as[String].collect().toSet == Set("S001", "S003"))
+  }
+
   test("max_reject_count threshold fails the run") {
     val svc = service(
       """

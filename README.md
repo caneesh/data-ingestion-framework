@@ -314,7 +314,9 @@ the target is touched (non-empty unless `allow_empty`, plus an optional
 `validation_query` with a `{table}` placeholder where any returned row fails
 the publish), then swapped in with a single `INSERT OVERWRITE`. On any
 failure the staging table is dropped and the target is untouched. Stale
-staging tables from crashed runs are cleaned up on the next publish.
+staging tables from crashed runs are cleaned up on the next publish — but
+only once they are older than 24 hours, so a concurrent run's live staging
+table is never dropped.
 
 ### Stage Restart and Replay (CLI)
 

@@ -4,6 +4,7 @@ import com.hcsc.generic.ingest.schema.{SchemaViolation, ViolationKind}
 import org.apache.hadoop.fs.{FileSystem, Path}
 
 import java.io.{BufferedReader, InputStreamReader}
+import java.nio.charset.{CharacterCodingException, Charset, CodingErrorAction, IllegalCharsetNameException, UnsupportedCharsetException}
 
 /** Result of inspecting a physical file's first logical record. */
 final case class PhysicalHeader(
@@ -37,7 +38,27 @@ object PhysicalHeaderReader {
   ): PhysicalHeader = {
     val issues = scala.collection.mutable.ArrayBuffer.empty[SchemaViolation]
 
-    val (firstLine, hasDataRows) = readFirstAndProbeSecond(fs, file, encoding)
+    // HDR_012: an unknown charset name, or content that is not valid in the
+    // configured charset, must surface as a violation — never as a silent
+    // replacement-character read or an uncaught exception.
+    val charset: Charset =
+      try Charset.forName(encoding)
+      catch {
+        case _: IllegalCharsetNameException | _: UnsupportedCharsetException =>
+          issues += SchemaViolation(ViolationKind.UnsupportedEncoding,
+            s"Configured encoding '$encoding' is not a supported charset")
+          return PhysicalHeader(Seq.empty, "", hasDataRows = false, issues.toList)
+      }
+
+    val readResult: (Option[String], Boolean) =
+      try readFirstAndProbeSecond(fs, file, charset)
+      catch {
+        case e: CharacterCodingException =>
+          issues += SchemaViolation(ViolationKind.UnsupportedEncoding,
+            s"File content is not valid $encoding: $e")
+          return PhysicalHeader(Seq.empty, "", hasDataRows = false, issues.toList)
+      }
+    val (firstLine, hasDataRows) = readResult
 
     firstLine match {
       case None =>
@@ -94,8 +115,13 @@ object PhysicalHeaderReader {
     }
   }
 
-  private def readFirstAndProbeSecond(fs: FileSystem, file: Path, encoding: String): (Option[String], Boolean) = {
-    val reader = new BufferedReader(new InputStreamReader(fs.open(file), encoding))
+  private def readFirstAndProbeSecond(fs: FileSystem, file: Path, charset: Charset): (Option[String], Boolean) = {
+    // REPORT (not the InputStreamReader default of REPLACE) so bytes invalid
+    // in the configured charset raise CharacterCodingException -> HDR_012.
+    val decoder = charset.newDecoder()
+      .onMalformedInput(CodingErrorAction.REPORT)
+      .onUnmappableCharacter(CodingErrorAction.REPORT)
+    val reader = new BufferedReader(new InputStreamReader(fs.open(file), decoder))
     try {
       var first = Option(reader.readLine())
       // Strip a UTF-8 BOM that survives decoding as

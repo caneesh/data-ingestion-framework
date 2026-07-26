@@ -99,7 +99,53 @@ column count against the contract, and with headers present the headers are
 still validated first so drift is surfaced before positional recovery.
 
 Feeds without a `schema` block keep the legacy behavior
-(`source.columns` / `source.header_aliases`).
+(`source.columns` / `source.header_aliases`). Legacy options still work but
+log a deprecation warning — migrate to a schema contract for validated
+header handling.
+
+### Header Change Protection
+
+The core safety rule: **the framework aliases known header changes, fails
+unknown required-header changes, and never silently substitutes null for a
+missing required source column.**
+
+Headers are normalized centrally (trim, lowercase, non-alphanumerics to a
+single `_`, edge underscores stripped) before any comparison, so
+`" Plan HIOS-ID "`, `"plan hios id"` and `"PLAN_HIOS_ID"` all resolve
+identically. Matching order: canonical name, then approved alias, then (only
+under the fallback strategy) guarded positional mapping — otherwise the file
+fails validation.
+
+Matching strategies (`schema.header_validation.strategy`):
+
+| Strategy | Behavior |
+|----------|----------|
+| `STRICT_NAME` | Canonical names only; aliases are ignored |
+| `NAME_WITH_ALIASES` (default) | Canonical names plus approved aliases |
+| `NAME_ALIAS_POSITION_FALLBACK` | Names/aliases first; if required columns are still missing, a guarded positional fallback maps by declared `position` (exact column count enforced, content validation recommended). Only safe when the vendor guarantees stable column order. |
+
+Per-column contract options: `required` (default true), `default` (applied
+when an optional column is missing, cast to the contract type), `category`
+(business/audit/generated/deprecated), and content rules (`regex`,
+`min_length`, `max_length`, `allowed_values`, `nonblank`) evaluated by the
+content validator (`content_validation`: SAMPLE/FULL mode with a failure
+percentage threshold) to catch swapped or mismapped columns.
+
+Guarantees enforced in code, not convention:
+
+- A hard guard runs before every RAW write: all required canonical columns
+  must exist, for every source type.
+- Schema alignment refuses to auto-create a required business column as
+  null; optional columns get their configured default; only non-contract
+  technical/audit columns may be null-filled.
+- Header validation failures are persisted to `ingest_header_audit` with
+  stable error codes (`HDR_001` missing required … `HDR_007` content
+  validation failure) — audit is written before any file is moved — and the
+  staged files move to quarantine when
+  `header_validation.quarantine_on_failure = true`.
+
+See `application.conf` for a complete Health Sherpa example where
+`"Plan HIOS ID"` maps to canonical `hios_id`.
 
 ## Operational Reliability Features
 

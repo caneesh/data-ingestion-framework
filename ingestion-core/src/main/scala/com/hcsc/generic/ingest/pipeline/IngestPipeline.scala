@@ -1,12 +1,12 @@
 package com.hcsc.generic.ingest.pipeline
 
-import com.hcsc.generic.ingest.audit.{AuditService, StageCounts}
+import com.hcsc.generic.ingest.audit.{AuditService, HeaderAuditRecord, StageCounts}
 import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.files.{FileIntakeService, StagedFile}
 import com.hcsc.generic.ingest.model.Cli
 import com.hcsc.generic.ingest.reject.RejectService
 import com.hcsc.generic.ingest.runtime.{RunContext, StageStatus, Stages}
-import com.hcsc.generic.ingest.schema.{SchemaContract, SchemaValidator, SchemaVersions}
+import com.hcsc.generic.ingest.schema.{ContentValidator, SchemaContract, SchemaContractViolationException, SchemaValidator, SchemaVersions, SchemaViolation, ViolationKind}
 import com.hcsc.generic.ingest.sink.SinkRegistry
 import com.hcsc.generic.ingest.source.SourceRegistry
 import com.hcsc.generic.ingest.stage.{CuratedResult, CuratedStageRunner}
@@ -94,7 +94,7 @@ final class IngestPipeline(
       spark, ConfigUtils.optConfig(feedConf, "rejects"), contract, logger)
 
     val rawOutcome: Option[RawOutcome] = runStage(Stages.Raw) {
-      val outcome = runRaw(sourceConf, rawConf, staged, rejectService)
+      val outcome = runRaw(sourceConf, rawConf, staged, rejectService, intake)
       (Some(outcome), outcome.counts)
     }.getOrElse(readRawSlice(rawConf))
 
@@ -104,7 +104,7 @@ final class IngestPipeline(
 
     // ---- Stage: curated + publish -------------------------------------------
     val curatedResult: Option[CuratedResult] = runStage(Stages.Curated) {
-      val result = new CuratedStageRunner(spark, curatedConf, logger).run(acceptedDf, ctx.mode, ctx)
+      val result = new CuratedStageRunner(spark, curatedConf, logger).run(acceptedDf, ctx.mode, ctx, contract)
       val counts = result.map(r => StageCounts(
         insertCount = r.insertCount, updateCount = r.updateCount, deleteCount = r.deleteCount
       )).getOrElse(StageCounts())
@@ -146,7 +146,8 @@ final class IngestPipeline(
     sourceConf: Config,
     rawConf: Config,
     staged: Option[Seq[StagedFile]],
-    rejectService: RejectService
+    rejectService: RejectService,
+    intake: FileIntakeService
   ): RawOutcome = {
     // Point the source at the staged files (managed feeds) and attach the
     // schema contract for connector-side header resolution.
@@ -160,21 +161,45 @@ final class IngestPipeline(
 
     val sourceType = ConfigUtils.optString(effectiveSource, "type").getOrElse("file")
     val source = SourceRegistry.resolve(sourceType)
-    val df0 = source.read(spark, effectiveSource)
 
     val rawDatabase = ConfigUtils.sqlIdentifier(rawConf, "database")
     val rawTable = ConfigUtils.sqlIdentifier(rawConf, "table")
     val rawFullTable = s"$rawDatabase.$rawTable"
 
-    contract.foreach { c =>
-      // Row-level nullability is diverted to the reject stage when configured;
-      // failing the whole run here would preempt record-level handling.
-      val violations = SchemaValidator.validateData(df0, c).filterNot(v =>
-        rejectService.handlesContractNullability &&
-          v.kind == com.hcsc.generic.ingest.schema.ViolationKind.NullabilityViolation) ++
-        SchemaValidator.versionMismatch(SchemaVersions.stored(spark, rawDatabase, rawTable), c)
-      SchemaValidator.enforce(violations, c.policies, logger)
-    }
+    // Header/content/data validation all run BEFORE any RAW write. On a
+    // contract violation the outcome is audited (and staged files
+    // quarantined when configured) before the failure propagates.
+    val df0 =
+      try {
+        val df = source.read(spark, effectiveSource)
+        contract.foreach { c =>
+          // Hard guard: required canonical columns must exist before RAW.
+          // Connectors enforce this too; this covers every source type.
+          val missingRequired = c.requiredColumns.map(_.name)
+            .filterNot(n => df.columns.exists(_.equalsIgnoreCase(n)))
+          if (missingRequired.nonEmpty)
+            throw new SchemaContractViolationException(missingRequired.map(n =>
+              SchemaViolation(ViolationKind.MissingColumn,
+                s"Required column '$n' absent before RAW write")))
+
+          val contentViolations = ContentValidator.validate(df, c, logger)
+          if (contentViolations.nonEmpty)
+            throw new SchemaContractViolationException(contentViolations)
+
+          // Row-level nullability is diverted to the reject stage when
+          // configured; failing here would preempt record-level handling.
+          val violations = SchemaValidator.validateData(df, c).filterNot(v =>
+            rejectService.handlesContractNullability &&
+              v.kind == ViolationKind.NullabilityViolation) ++
+            SchemaValidator.versionMismatch(SchemaVersions.stored(spark, rawDatabase, rawTable), c)
+          SchemaValidator.enforce(violations, c.policies, logger)
+        }
+        df
+      } catch {
+        case e: SchemaContractViolationException =>
+          handleContractFailure(e, staged, intake)
+          throw e
+      }
 
     val withMeta0 = RawMetadata.add(df0, ctx.rawFlag, ctx.runId)
     val withMeta = ctx.fileIdFilter match {
@@ -213,6 +238,51 @@ final class IngestPipeline(
       controlTotal = controlTotal(accepted)
     )
     RawOutcome(accepted, counts)
+  }
+
+  /** Audits a header/content contract failure and quarantines the staged
+    * files when configured. The audit record is written BEFORE any file is
+    * moved so validation information is captured safely first. */
+  private def handleContractFailure(
+    e: SchemaContractViolationException,
+    staged: Option[Seq[StagedFile]],
+    intake: FileIntakeService
+  ): Unit = contract.foreach { c =>
+    def byKind(kind: ViolationKind): String =
+      e.violations.filter(_.kind == kind).map(_.message).mkString("; ")
+
+    val quarantinePath =
+      if (c.quarantineOnFailure) intake.quarantineDir.getOrElse("") else ""
+
+    val record = HeaderAuditRecord(
+      run_id = ctx.runId,
+      entity = ctx.entity,
+      source_files = staged.map(_.map(_.name).mkString(",")).getOrElse(""),
+      validation_stage = "header_contract",
+      validation_status = "FAILED",
+      expected_canonical_columns = c.columnNames.mkString(","),
+      actual_source_headers = e.resolution.map(_.actualHeaders.mkString(",")).getOrElse(""),
+      normalized_source_headers = e.resolution.map(_.normalizedHeaders.mkString(",")).getOrElse(""),
+      resolved_mappings = e.resolution
+        .map(_.canonicalToActual.map { case (canonical, actual) => s"$actual->$canonical" }.mkString(","))
+        .getOrElse(""),
+      missing_required_columns = e.resolution.map(_.missingRequired.mkString(","))
+        .filter(_.nonEmpty).getOrElse(byKind(ViolationKind.MissingColumn)),
+      missing_optional_columns = e.resolution.map(_.missingOptional.map(_.name).mkString(",")).getOrElse(""),
+      unexpected_columns = byKind(ViolationKind.ExtraColumn),
+      duplicate_columns = byKind(ViolationKind.DuplicateHeader),
+      positional_fallback_used = e.resolution.exists(_.positionalFallbackUsed),
+      error_code = e.violations.headOption.map(_.kind.code).getOrElse(""),
+      error_message = e.violations.map(_.toString).mkString("; "),
+      quarantine_path = quarantinePath,
+      event_ts = new java.sql.Timestamp(System.currentTimeMillis())
+    )
+    audit.recordHeaderValidation(ctx, record)
+
+    if (c.quarantineOnFailure)
+      staged.filter(_.nonEmpty).foreach { files =>
+        intake.quarantineStaged(ctx, files, record.error_message)
+      }
   }
 
   /** For --resume runs whose RAW stage already succeeded: re-read this run's

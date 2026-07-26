@@ -1,6 +1,7 @@
 package com.hcsc.generic.ingest.stage
 
 import com.hcsc.generic.ingest.runtime.RunContext
+import com.hcsc.generic.ingest.schema.SchemaContract
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SparkSession}
@@ -16,12 +17,15 @@ final class CuratedStageRunner(
   def run(rawDf: DataFrame, mode: String): Option[CuratedResult] =
     run(rawDf, mode, RunContext(UUID.randomUUID().toString, "unknown", mode, "F"))
 
-  def run(rawDf: DataFrame, mode: String, ctx: RunContext): Option[CuratedResult] = {
+  def run(rawDf: DataFrame, mode: String, ctx: RunContext): Option[CuratedResult] =
+    run(rawDf, mode, ctx, None)
+
+  def run(rawDf: DataFrame, mode: String, ctx: RunContext, contract: Option[SchemaContract]): Option[CuratedResult] = {
     curatedConf match {
       case Some(conf) =>
         val service = new CuratedService(spark, conf)
         if (service.enabled) {
-          val result = service.process(rawDf, mode, ctx)
+          val result = service.process(rawDf, mode, ctx, contract)
           logger.info(s"[CuratedStageRunner] Curated completed mode=$mode")
           result
         } else {

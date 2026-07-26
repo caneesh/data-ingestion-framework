@@ -1,7 +1,7 @@
 package com.hcsc.generic.ingest.file
 
 import com.hcsc.generic.ingest.config.ConfigUtils
-import com.hcsc.generic.ingest.schema.{SchemaContract, SchemaValidator}
+import com.hcsc.generic.ingest.schema.{HeaderStrategy, SchemaContract, SchemaValidator, SchemaViolation, ViolationKind}
 import com.hcsc.generic.ingest.source.{Source, SourceRegistry}
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
@@ -41,6 +41,10 @@ object FileSource extends Source {
       case Some(contract) =>
         applyContract(loaded, contract, sourceConf, header)
       case None =>
+        if (sourceConf.hasPath("header_aliases") || sourceConf.hasPath("columns"))
+          logger.warn(
+            "[FileSource] DEPRECATED: source.columns / source.header_aliases are legacy options; " +
+              "migrate this feed to a schema contract (schema { columns = [...] }) for validated header handling")
         val renamed = applyHeaderAliases(loaded, sourceConf)
         applyConfiguredColumns(renamed, sourceConf, header)
     }
@@ -50,37 +54,97 @@ object FileSource extends Source {
   }
 
   /**
-    * Contract-driven column resolution. With a header, columns are matched by
-    * name or declared alias and every drift (missing, extra, renamed,
-    * reordered, duplicated columns) is validated against the feed's policies.
-    * Positional mapping is never applied silently: it requires either
-    * header=false or an explicit force_columns_by_position=true, always
-    * validates the column count against the contract, and with a header the
-    * headers are still validated first so drift is surfaced before recovery.
+    * Contract-driven column resolution.
+    *
+    * With a header, columns are matched per the configured strategy
+    * (STRICT_NAME: canonical names only; NAME_WITH_ALIASES: names + approved
+    * aliases; NAME_ALIAS_POSITION_FALLBACK: names + aliases, then a guarded
+    * positional fallback). Every drift (missing, extra, renamed, reordered,
+    * duplicated columns) is validated against the feed's policies.
+    *
+    * Positional mapping is never applied silently: it runs only for
+    * header=false feeds, explicit force_columns_by_position=true, or as the
+    * audited fallback after name/alias matching fails — and always validates
+    * the column count against the contract. Position mapping is only safe
+    * when the vendor guarantees stable column order.
+    *
+    * Missing optional columns are added with their configured default cast
+    * to the contract type. Required columns are never auto-added.
     */
   private def applyContract(df: DataFrame, contract: SchemaContract, source: Config, header: Boolean): DataFrame = {
     val businessColumns = df.columns.filterNot(_.equalsIgnoreCase("source_file"))
     val forceByPosition = ConfigUtils.optBoolean(source, "force_columns_by_position").getOrElse(false)
 
-    if (header) {
-      val resolution = SchemaValidator.validateHeaders(businessColumns, contract, logger)
-      SchemaValidator.enforce(resolution.violations, contract.policies, logger)
+    if (!header) return addOptionalDefaults(mapByPosition(df, businessColumns, contract), contract)
 
-      if (forceByPosition) mapByPosition(df, businessColumns, contract)
-      else
-        resolution.renames.foldLeft(df) {
-          case (acc, (from, to)) => acc.withColumnRenamed(from, to)
-        }
+    val resolution = SchemaValidator.validateHeaders(businessColumns, contract, logger)
+    logger.info(
+      s"[FileSource] Header validation: actual=[${resolution.actualHeaders.mkString(",")}] " +
+        s"normalized=[${resolution.normalizedHeaders.mkString(",")}] " +
+        s"mapped=${resolution.canonicalToActual.map { case (c, a) => s"$a->$c" }.mkString(",")} " +
+        s"missingRequired=[${resolution.missingRequired.mkString(",")}]"
+    )
+
+    if (forceByPosition) {
+      SchemaValidator.enforce(resolution.violations, contract.policies, logger, Some(resolution))
+      return addOptionalDefaults(mapByPosition(df, businessColumns, contract), contract)
+    }
+
+    val fallbackEligible =
+      contract.strategy == HeaderStrategy.NameAliasPositionFallback &&
+        contract.positionalFallback.enabled &&
+        resolution.missingRequired.nonEmpty
+
+    if (fallbackEligible) {
+      if (contract.positionalFallback.requireExactColumnCount &&
+          businessColumns.length != contract.columns.size) {
+        val violations = resolution.violations :+ SchemaViolation(
+          ViolationKind.CountMismatch,
+          s"Positional fallback requires exactly ${contract.columns.size} source columns, " +
+            s"found ${businessColumns.length}"
+        )
+        SchemaValidator.enforce(violations, contract.policies, logger, Some(resolution))
+      }
+      if (contract.positionalFallback.requireContentValidation)
+        require(
+          contract.contentValidation.enabled,
+          "HDR_006 positional_fallback.require_content_validation=true but content_validation is not enabled"
+        )
+      logger.warn(
+        s"[FileSource] Name/alias matching failed for required columns " +
+          s"[${resolution.missingRequired.mkString(",")}]; engaging POSITIONAL FALLBACK " +
+          s"(strategy=NAME_ALIAS_POSITION_FALLBACK, contract v${contract.version})"
+      )
+      addOptionalDefaults(mapByPosition(df, businessColumns, contract), contract)
     } else {
-      mapByPosition(df, businessColumns, contract)
+      SchemaValidator.enforce(resolution.violations, contract.policies, logger, Some(resolution))
+      val renamed = resolution.renames.foldLeft(df) {
+        case (acc, (from, to)) => acc.withColumnRenamed(from, to)
+      }
+      addOptionalDefaults(renamed, contract)
     }
   }
+
+  /** Missing optional columns receive their configured default (or null)
+    * cast to the contract type. Required columns are never auto-added. */
+  private def addOptionalDefaults(df: DataFrame, contract: SchemaContract): DataFrame =
+    contract.optionalColumns
+      .filterNot(c => df.columns.exists(_.equalsIgnoreCase(c.name)))
+      .foldLeft(df) { (acc, c) =>
+        logger.info(s"[FileSource] Adding missing optional column '${c.name}' with default=${c.default.getOrElse("null")}")
+        acc.withColumn(c.name, lit(c.default.orNull).cast(c.dataType))
+      }
 
   private def mapByPosition(df: DataFrame, businessColumns: Seq[String], contract: SchemaContract): DataFrame = {
     val ordered = contract.positionalOrder
     require(
+      ordered.flatMap(_.position).forall(p => p >= 0 && p < ordered.length),
+      s"HDR_006 Contract positions must be contiguous and in range 0..${ordered.length - 1}: " +
+        ordered.map(c => s"${c.name}=${c.position.get}").mkString(",")
+    )
+    require(
       businessColumns.length == ordered.length,
-      s"Positional mapping requires exactly ${ordered.length} source columns, found ${businessColumns.length}. " +
+      s"HDR_005 Positional mapping requires exactly ${ordered.length} source columns, found ${businessColumns.length}. " +
         s"Actual=${businessColumns.mkString(",")} Contract=${ordered.map(_.name).mkString(",")}"
     )
     logger.warn(

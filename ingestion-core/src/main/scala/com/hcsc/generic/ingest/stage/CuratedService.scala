@@ -3,6 +3,7 @@ package com.hcsc.generic.ingest.stage
 import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.publish.{PublishRequest, PublishService}
 import com.hcsc.generic.ingest.runtime.RunContext
+import com.hcsc.generic.ingest.schema.SchemaContract
 import com.hcsc.generic.ingest.transform.CuratedTransform
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
@@ -22,6 +23,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
   private val logger = Logger.getLogger(getClass.getName)
   private val transform = new CuratedTransform(spark)
   private val publisher = new PublishService(spark, logger)
+  private var contract: Option[SchemaContract] = None
 
   val enabled: Boolean =
     ConfigUtils.optBoolean(conf, "enabled").getOrElse(true)
@@ -30,7 +32,11 @@ final class CuratedService(spark: SparkSession, conf: Config) {
   def process(rawDf: DataFrame, runMode: String): Option[CuratedResult] =
     process(rawDf, runMode, RunContext(UUID.randomUUID().toString, "unknown", runMode, "F"))
 
-  def process(rawDf: DataFrame, runMode: String, ctx: RunContext): Option[CuratedResult] = {
+  def process(rawDf: DataFrame, runMode: String, ctx: RunContext): Option[CuratedResult] =
+    process(rawDf, runMode, ctx, None)
+
+  def process(rawDf: DataFrame, runMode: String, ctx: RunContext, contract: Option[SchemaContract]): Option[CuratedResult] = {
+    this.contract = contract
     if (!enabled) return None
 
     val database = ConfigUtils.sqlIdentifier(conf, "database")
@@ -74,7 +80,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     ctx: RunContext
   ): CuratedResult = {
     val publishDf =
-      if (spark.catalog.tableExists(fullTable)) transform.align(df, spark.table(fullTable).schema)
+      if (spark.catalog.tableExists(fullTable)) transform.align(df, spark.table(fullTable).schema, contract)
       else df
 
     val published = publisher.publish(publishDf, request, ctx)
@@ -105,7 +111,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
 
     val cleaned = transform.filterNullKeys(incoming, keys, dropNull, blanksAsNull)
     val deduped = transform.deduplicate(cleaned, keys, orderBy)
-    val alignedIncoming = transform.align(deduped, target.schema).persist()
+    val alignedIncoming = transform.align(deduped, target.schema, contract).persist()
     val incomingKeys = alignedIncoming.select(keys.map(col): _*).distinct().persist()
     try {
       val targetKeys = target.select(keys.map(col): _*).distinct()

@@ -7,62 +7,92 @@ import org.apache.spark.sql.types.DataType
 
 sealed trait ViolationKind {
   def label: String
+  def code: String
   def policyOf(p: SchemaPolicies): PolicyAction
 }
 
 object ViolationKind {
   case object MissingColumn extends ViolationKind {
-    val label = "missing_column"
+    val label = "missing_column"; val code = "HDR_001"
     def policyOf(p: SchemaPolicies): PolicyAction = p.onMissingColumn
   }
+  case object DuplicateHeader extends ViolationKind {
+    val label = "duplicate_header"; val code = "HDR_002"
+    def policyOf(p: SchemaPolicies): PolicyAction = p.onDuplicateHeader
+  }
+  case object AmbiguousMapping extends ViolationKind {
+    val label = "ambiguous_mapping"; val code = "HDR_003"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
   case object ExtraColumn extends ViolationKind {
-    val label = "extra_column"
+    val label = "extra_column"; val code = "HDR_004"
     def policyOf(p: SchemaPolicies): PolicyAction = p.onExtraColumn
   }
+  case object CountMismatch extends ViolationKind {
+    val label = "column_count_mismatch"; val code = "HDR_005"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
+  case object InvalidPositional extends ViolationKind {
+    val label = "invalid_positional_mapping"; val code = "HDR_006"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
+  case object ContentValidation extends ViolationKind {
+    val label = "content_validation_failure"; val code = "HDR_007"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
   case object TypeChange extends ViolationKind {
-    val label = "type_change"
+    val label = "type_change"; val code = "type_change"
     def policyOf(p: SchemaPolicies): PolicyAction = p.onTypeChange
   }
   case object OrderChange extends ViolationKind {
-    val label = "order_change"
+    val label = "order_change"; val code = "order_change"
     def policyOf(p: SchemaPolicies): PolicyAction = p.onOrderChange
   }
-  case object DuplicateHeader extends ViolationKind {
-    val label = "duplicate_header"
-    def policyOf(p: SchemaPolicies): PolicyAction = p.onDuplicateHeader
-  }
   case object NullabilityViolation extends ViolationKind {
-    val label = "nullability_violation"
+    val label = "nullability_violation"; val code = "nullability_violation"
     def policyOf(p: SchemaPolicies): PolicyAction = p.onNullabilityViolation
   }
   case object VersionMismatch extends ViolationKind {
-    val label = "version_mismatch"
+    val label = "version_mismatch"; val code = "version_mismatch"
     def policyOf(p: SchemaPolicies): PolicyAction = p.onVersionMismatch
   }
 }
 
 final case class SchemaViolation(kind: ViolationKind, message: String) {
-  override def toString: String = s"[${kind.label}] $message"
+  override def toString: String = s"[${kind.code}] $message"
 }
 
-final class SchemaContractViolationException(val violations: Seq[SchemaViolation])
-  extends RuntimeException(
+final class SchemaContractViolationException(
+  val violations: Seq[SchemaViolation],
+  val resolution: Option[HeaderResolution] = None
+) extends RuntimeException(
     s"Schema contract violated:\n${violations.map(v => s"  - $v").mkString("\n")}"
   )
 
 /** Result of resolving raw source headers against a contract. */
 final case class HeaderResolution(
   renames: Seq[(String, String)],
-  violations: Seq[SchemaViolation]
-)
+  violations: Seq[SchemaViolation],
+  actualHeaders: Seq[String] = Seq.empty,
+  normalizedHeaders: Seq[String] = Seq.empty,
+  canonicalToActual: Map[String, String] = Map.empty,
+  missingRequired: Seq[String] = Seq.empty,
+  missingOptional: Seq[ColumnContract] = Seq.empty,
+  positionalFallbackUsed: Boolean = false
+) {
+  def valid: Boolean = violations.isEmpty
+}
 
 object SchemaValidator {
 
   /**
     * Validates raw source headers against the contract. Detects duplicate
-    * headers, renamed columns (matched via aliases), missing columns, extra
-    * columns and column-order changes. Returns the renames needed to map
-    * actual headers to canonical contract names, plus all violations found.
+    * headers, renamed columns (matched via aliases per strategy), missing
+    * required/optional columns, extra columns and column-order changes.
+    * Returns the renames needed to map actual headers to canonical names,
+    * plus all violations found. Missing optional columns are NOT violations
+    * (unless header_validation.on_missing_optional = FAIL); the caller adds
+    * their configured defaults.
     */
   def validateHeaders(headers: Seq[String], contract: SchemaContract, logger: Logger): HeaderResolution = {
     val violations = scala.collection.mutable.ArrayBuffer.empty[SchemaViolation]
@@ -90,9 +120,20 @@ object SchemaValidator {
 
     val matched = resolved.collect { case (h, Some(target)) => target }
 
-    // Missing required columns.
-    contract.columnNames.filterNot(n => matched.exists(_.equalsIgnoreCase(n))).foreach { n =>
+    // Missing columns: required ones are violations; optional ones get their
+    // configured defaults downstream.
+    val missingRequired = contract.requiredColumns.map(_.name)
+      .filterNot(n => matched.exists(_.equalsIgnoreCase(n)))
+    missingRequired.foreach { n =>
       violations += SchemaViolation(ViolationKind.MissingColumn, s"Required column '$n' not found in source headers")
+    }
+
+    val missingOptional = contract.optionalColumns
+      .filterNot(c => matched.exists(_.equalsIgnoreCase(c.name)))
+    if (contract.policies.failOnMissingOptional) {
+      missingOptional.foreach { c =>
+        violations += SchemaViolation(ViolationKind.MissingColumn, s"Optional column '${c.name}' not found and on_missing_optional=FAIL")
+      }
     }
 
     // Unexpected columns.
@@ -113,7 +154,15 @@ object SchemaValidator {
       }
     }
 
-    HeaderResolution(renames, violations.toList)
+    HeaderResolution(
+      renames = renames,
+      violations = violations.toList,
+      actualHeaders = headers,
+      normalizedHeaders = headers.map(SchemaContract.normalize),
+      canonicalToActual = resolved.collect { case (h, Some(t)) => t -> h }.toMap,
+      missingRequired = missingRequired,
+      missingOptional = missingOptional
+    )
   }
 
   /**
@@ -185,7 +234,12 @@ object SchemaValidator {
     * logged, IGNORE violations dropped, and if any FAIL violation is present
     * a SchemaContractViolationException carrying all of them is thrown.
     */
-  def enforce(violations: Seq[SchemaViolation], policies: SchemaPolicies, logger: Logger): Unit = {
+  def enforce(
+    violations: Seq[SchemaViolation],
+    policies: SchemaPolicies,
+    logger: Logger,
+    resolution: Option[HeaderResolution] = None
+  ): Unit = {
     val actionable = violations.map(v => v -> v.kind.policyOf(policies))
 
     actionable.collect { case (v, PolicyAction.Warn) => v }
@@ -194,7 +248,7 @@ object SchemaValidator {
     val failures = actionable.collect { case (v, PolicyAction.Fail) => v }
     if (failures.nonEmpty) {
       failures.foreach(v => logger.error(s"[SchemaValidator] $v"))
-      throw new SchemaContractViolationException(failures)
+      throw new SchemaContractViolationException(failures, resolution)
     }
   }
 }

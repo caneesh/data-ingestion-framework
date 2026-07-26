@@ -53,6 +53,27 @@ CREATE TABLE IF NOT EXISTS ingest_audit.ingest_file_registry (
   processed_ts TIMESTAMP
 ) STORED AS ORC;
 
+CREATE TABLE IF NOT EXISTS ingest_audit.ingest_header_audit (
+  run_id                     STRING,
+  entity                     STRING,
+  source_files               STRING,
+  validation_stage           STRING,
+  validation_status          STRING,
+  expected_canonical_columns STRING,
+  actual_source_headers      STRING,
+  normalized_source_headers  STRING,
+  resolved_mappings          STRING,
+  missing_required_columns   STRING,
+  missing_optional_columns   STRING,
+  unexpected_columns         STRING,
+  duplicate_columns          STRING,
+  positional_fallback_used   BOOLEAN,
+  error_code                 STRING,   -- HDR_001..HDR_007
+  error_message              STRING,
+  quarantine_path            STRING,
+  event_ts                   TIMESTAMP
+) STORED AS ORC;
+
 CREATE TABLE IF NOT EXISTS ingest_audit.ingest_rejects (
   run_id          STRING,
   entity          STRING,

@@ -282,6 +282,39 @@ class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   // ---------------------------------------------------------------------------
+  // Header contract: unknown required header -> audit + quarantine, no RAW write
+  // ---------------------------------------------------------------------------
+
+  test("unknown renamed required header fails before RAW, audits and quarantines the file") {
+    writeLanding("member_hdr.csv", "totally_unknown,plan_hios_id\nS777,H7\n")
+
+    val rawBefore = spark.table("p_raw.member").count()
+    val conf = ConfigFactory.parseString(
+      """schema.header_validation.quarantine_on_failure = true""")
+      .withFallback(feedConf())
+
+    intercept[com.hcsc.generic.ingest.schema.SchemaContractViolationException] {
+      run(conf, baseCli.copy(runId = Some("run-hdr-1")))
+    }
+
+    // No RAW write happened and the file is quarantined, not left inprogress
+    assert(spark.table("p_raw.member").count() == rawBefore)
+    assert(listNames("quarantine").contains("member_hdr.csv"))
+    assert(!listNames("inprogress").contains("member_hdr.csv"))
+
+    // Header validation outcome persisted with a stable error code
+    import org.apache.spark.sql.functions.col
+    val headerAudit = spark.table("p_audit.ingest_header_audit")
+      .filter(col("run_id") === "run-hdr-1")
+    assert(headerAudit.count() == 1)
+    val record = headerAudit.collect().head
+    assert(record.getAs[String]("validation_status") == "FAILED")
+    assert(record.getAs[String]("error_code") == "HDR_001")
+    assert(record.getAs[String]("missing_required_columns").contains("subscriber_id"))
+    assert(record.getAs[String]("actual_source_headers").contains("totally_unknown"))
+  }
+
+  // ---------------------------------------------------------------------------
   // 06 + 07: failed publish -> rollback -> resume replays curated from RAW
   // ---------------------------------------------------------------------------
 

@@ -86,7 +86,7 @@ class SchemaValidatorTest extends AnyFunSuite {
       SchemaValidator.enforce(violations, base.policies, logger)
     }
     assert(ex.violations.size == 1)
-    assert(ex.getMessage.contains("missing_column"))
+    assert(ex.getMessage.contains("HDR_001"))
   }
 
   test("enforce does not throw for WARN violations") {

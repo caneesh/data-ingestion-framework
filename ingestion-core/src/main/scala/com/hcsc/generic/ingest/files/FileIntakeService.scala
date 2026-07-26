@@ -156,6 +156,27 @@ final class FileIntakeService(
     }
   }
 
+  /** Moves already-staged files to quarantine (post-read validation failures
+    * such as header contract or content validation). Returns the quarantine
+    * destination paths. Audit records must be written by the caller BEFORE
+    * invoking this, so validation information is captured before any move. */
+  def quarantineStaged(ctx: RunContext, files: Seq[StagedFile], reason: String): Seq[String] =
+    layout.toSeq.flatMap { l =>
+      if (ctx.dryRun) files.map(_.stagedPath)
+      else {
+        val fs = FsUtils.fileSystem(l.quarantine, hadoopConf)
+        files.map { f =>
+          val dest = FsUtils.moveToDir(fs, new org.apache.hadoop.fs.Path(f.stagedPath), l.quarantine)
+          audit.recordFile(ctx, f.name, dest.toString, f.checksum, f.sizeBytes, FileStatuses.Quarantined, reason)
+          logger.warn(s"[FileIntake] Quarantined staged file ${f.name}: $reason")
+          dest.toString
+        }
+      }
+    }
+
+  /** The configured quarantine directory, if this feed is managed. */
+  def quarantineDir: Option[String] = layout.map(_.quarantine.toString)
+
   /** Moves staged files to processed (+archive copy) and registers checksums.
     * Only called after the whole pipeline succeeded — restart-safe. */
   def complete(ctx: RunContext, files: Seq[StagedFile]): Unit = layout.foreach { l =>

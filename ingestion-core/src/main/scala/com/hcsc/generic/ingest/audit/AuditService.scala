@@ -58,6 +58,27 @@ final case class ReconciliationRecord(
   event_ts: Timestamp
 )
 
+final case class HeaderAuditRecord(
+  run_id: String,
+  entity: String,
+  source_files: String,
+  validation_stage: String,
+  validation_status: String,
+  expected_canonical_columns: String,
+  actual_source_headers: String,
+  normalized_source_headers: String,
+  resolved_mappings: String,
+  missing_required_columns: String,
+  missing_optional_columns: String,
+  unexpected_columns: String,
+  duplicate_columns: String,
+  positional_fallback_used: Boolean,
+  error_code: String,
+  error_message: String,
+  quarantine_path: String,
+  event_ts: Timestamp
+)
+
 /**
   * Persists file-level, stage-level and reconciliation audit records to Hive.
   * Entirely opt-in: when the feed has no `audit` block (or enabled=false)
@@ -91,6 +112,7 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
   private lazy val fileTable = table("file_table", "ingest_file_audit")
   private lazy val runTable = table("run_table", "ingest_run_audit")
   private lazy val reconciliationTable = table("reconciliation_table", "ingest_reconciliation")
+  private lazy val headerTable = table("header_table", "ingest_header_audit")
 
   private def now(): Timestamp = new Timestamp(System.currentTimeMillis())
 
@@ -106,6 +128,14 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
   private val reconciliationTableDdl =
     "run_id STRING, entity STRING, check_name STRING, expected STRING, actual STRING, " +
       "passed BOOLEAN, event_ts TIMESTAMP"
+
+  private val headerTableDdl =
+    "run_id STRING, entity STRING, source_files STRING, validation_stage STRING, " +
+      "validation_status STRING, expected_canonical_columns STRING, actual_source_headers STRING, " +
+      "normalized_source_headers STRING, resolved_mappings STRING, missing_required_columns STRING, " +
+      "missing_optional_columns STRING, unexpected_columns STRING, duplicate_columns STRING, " +
+      "positional_fallback_used BOOLEAN, error_code STRING, error_message STRING, " +
+      "quarantine_path STRING, event_ts TIMESTAMP"
 
   /** CREATE IF NOT EXISTS + append: concurrent first runs race safely at the
     * metastore instead of one saveAsTable(Overwrite) wiping the other. */
@@ -170,6 +200,19 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
     entries.foreach { case (check, expected, actual, passed) =>
       logger.info(s"[Audit] reconciliation check=$check expected=$expected actual=$actual passed=$passed")
     }
+  }
+
+  /** Persists a header validation outcome. Called BEFORE any quarantine file
+    * move so validation information is captured safely first. */
+  def recordHeaderValidation(ctx: com.hcsc.generic.ingest.runtime.RunContext, record: HeaderAuditRecord): Unit = {
+    if (!enabled) {
+      logger.info(s"[Audit] (disabled) header validation status=${record.validation_status} code=${record.error_code}")
+      return
+    }
+    import spark.implicits._
+    append(Seq(record).toDF(), headerTable, headerTableDdl)
+    logger.info(s"[Audit] header validation status=${record.validation_status} code=${record.error_code} " +
+      s"missingRequired=[${record.missing_required_columns}]")
   }
 
   /** Latest recorded status for a stage of a given run, used by --resume.

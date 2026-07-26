@@ -1,6 +1,7 @@
 package com.hcsc.generic.ingest.transform
 
 import com.hcsc.generic.ingest.config.ConfigUtils
+import com.hcsc.generic.ingest.schema.SchemaContract
 import com.typesafe.config.Config
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.expressions.Window
@@ -70,12 +71,34 @@ final class CuratedTransform(spark: SparkSession) {
     }
   }
 
-  def align(df: DataFrame, schema: StructType): DataFrame = {
+  def align(df: DataFrame, schema: StructType): DataFrame =
+    align(df, schema, None)
+
+  /**
+    * Aligns df to the target schema. Missing target columns are handled by
+    * classification, never blindly null-filled when a contract is present:
+    *   - contract-required business columns: refuse to auto-create as null
+    *   - contract-optional columns: configured default (or null)
+    *   - non-contract columns (technical/audit/generated/deprecated
+    *     target-only columns): null-filled as before
+    */
+  def align(df: DataFrame, schema: StructType, contract: Option[SchemaContract]): DataFrame = {
     val lowerToActual = df.columns.map(c => c.toLowerCase -> c).toMap
     val completed = schema.fields.foldLeft(df) { (acc, field) =>
       lowerToActual.get(field.name.toLowerCase) match {
         case Some(_) => acc
-        case None    => acc.withColumn(field.name, lit(null).cast(field.dataType))
+        case None =>
+          contract.flatMap(_.column(field.name)) match {
+            case Some(cc) if cc.required && cc.category.equalsIgnoreCase("business") =>
+              throw new IllegalStateException(
+                s"HDR_001 Required column '${field.name}' is missing from the incoming data; " +
+                  "refusing to auto-create it as null during schema alignment"
+              )
+            case Some(cc) =>
+              acc.withColumn(field.name, lit(cc.default.orNull).cast(field.dataType))
+            case None =>
+              acc.withColumn(field.name, lit(null).cast(field.dataType))
+          }
       }
     }
 

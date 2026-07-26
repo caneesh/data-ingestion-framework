@@ -1,6 +1,6 @@
 package com.hcsc.generic.ingest.transform
 
-import com.typesafe.config.Config
+import com.typesafe.config.{Config, ConfigValueType}
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.functions.expr
 import scala.collection.JavaConverters._
@@ -21,7 +21,7 @@ object Partitioning {
         val derive = p.getConfig("derive")
         derive.root().keySet().asScala.map { key =>
           val expression =
-            if (derive.getValue(key).valueType().name() == "STRING") {
+            if (derive.getValue(key).valueType() == ConfigValueType.STRING) {
               derive.getString(key)
             } else {
               val item = derive.getConfig(key)

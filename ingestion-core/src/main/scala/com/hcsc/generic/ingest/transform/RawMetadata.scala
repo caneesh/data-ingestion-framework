@@ -10,6 +10,8 @@ object RawMetadata {
       else df.withColumn("source_file", input_file_name())
 
     withSource
+      // row_idx is unique within a run but is NOT a stable ordering — values
+      // depend on partition layout and change across re-runs.
       .withColumn("row_idx", monotonically_increasing_id())
       .withColumn("load_timestamp", current_timestamp())
       .withColumn("file_type", lit(rawFlag))

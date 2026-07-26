@@ -1,15 +1,20 @@
 package com.hcsc.generic.ingest.sink
 
-import com.hcsc.generic.ingest.transform.{Partitioning, PartitionSpec}
+import com.hcsc.generic.ingest.config.ConfigUtils
+import com.hcsc.generic.ingest.transform.Partitioning
 import com.typesafe.config.Config
+import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
 import org.apache.spark.sql.functions.col
 
-final class HiveSink(spark: SparkSession, sinkConf: Config) {
+object HiveSink extends Sink {
+  private val logger = Logger.getLogger(getClass.getName)
 
-  def write(df: DataFrame): Unit = {
-    val database = sinkConf.getString("database")
-    val table = sinkConf.getString("table")
+  override def sinkType: String = "hive"
+
+  override def write(spark: SparkSession, df: DataFrame, sinkConf: Config): Unit = {
+    val database = ConfigUtils.sqlIdentifier(sinkConf, "database")
+    val table = ConfigUtils.sqlIdentifier(sinkConf, "table")
     val fullTable = s"$database.$table"
     val path = sinkConf.getString("path")
     val format = if (sinkConf.hasPath("format")) sinkConf.getString("format") else "orc"
@@ -25,6 +30,11 @@ final class HiveSink(spark: SparkSession, sinkConf: Config) {
       val actual = withPartitions.columns.map(_.toLowerCase).toSet
       val missing = targetCols.filterNot(c => actual.contains(c.toLowerCase))
       require(missing.isEmpty, s"DataFrame is missing target columns: ${missing.mkString(",")}")
+
+      val targetSet = targetCols.map(_.toLowerCase).toSet
+      val extra = withPartitions.columns.filterNot(c => targetSet.contains(c.toLowerCase))
+      if (extra.nonEmpty)
+        logger.warn(s"[HiveSink] Source columns not in target $fullTable will be dropped: ${extra.mkString(",")}")
 
       withPartitions.select(targetCols.map(col): _*)
         .write
@@ -42,4 +52,6 @@ final class HiveSink(spark: SparkSession, sinkConf: Config) {
         writer.saveAsTable(fullTable)
     }
   }
+
+  def register(): Unit = SinkRegistry.register(this)
 }

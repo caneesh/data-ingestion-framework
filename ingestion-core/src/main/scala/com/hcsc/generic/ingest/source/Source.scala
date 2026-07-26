@@ -16,23 +16,24 @@ trait Source {
   * Registry for discovering and instantiating sources by type.
   */
 object SourceRegistry {
-  private var sources: Map[String, Source] = Map.empty
+  private val sources = new java.util.concurrent.ConcurrentHashMap[String, Source]()
 
-  def register(source: Source): Unit = {
-    sources = sources + (source.sourceType.toLowerCase -> source)
-  }
+  def register(source: Source): Unit =
+    sources.put(source.sourceType.toLowerCase, source)
 
-  def get(sourceType: String): Option[Source] = {
-    sources.get(sourceType.toLowerCase)
-  }
+  def get(sourceType: String): Option[Source] =
+    Option(sources.get(sourceType.toLowerCase))
 
   def resolve(sourceType: String): Source = {
     get(sourceType).getOrElse(
       throw new IllegalArgumentException(
-        s"Unknown source type: $sourceType. Available types: ${sources.keys.mkString(", ")}"
+        s"Unknown source type: $sourceType. Available types: ${availableTypes.mkString(", ")}"
       )
     )
   }
 
-  def availableTypes: Set[String] = sources.keySet
+  def availableTypes: Set[String] = {
+    import scala.collection.JavaConverters._
+    sources.keySet.asScala.toSet
+  }
 }

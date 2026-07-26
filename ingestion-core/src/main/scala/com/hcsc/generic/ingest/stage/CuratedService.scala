@@ -15,8 +15,8 @@ final class CuratedService(spark: SparkSession, conf: Config) {
   def process(rawDf: DataFrame, runMode: String): Unit = {
     if (!enabled) return
 
-    val database = conf.getString("database")
-    val table = conf.getString("table")
+    val database = ConfigUtils.sqlIdentifier(conf, "database")
+    val table = ConfigUtils.sqlIdentifier(conf, "table")
     val fullTable = s"$database.$table"
     val path = conf.getString("path")
     val format = ConfigUtils.optString(conf, "format").getOrElse("orc")
@@ -70,8 +70,14 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     val unchanged = target.join(broadcast(incomingKeys), keys, "left_anti")
     val merged = unchanged.unionByName(alignedIncoming)
 
-    val stagingTable = s"${conf.getString("database")}.__stg_${conf.getString("table")}_${System.currentTimeMillis()}"
-    merged.write.mode(SaveMode.Overwrite).saveAsTable(stagingTable)
+    val database = ConfigUtils.sqlIdentifier(conf, "database")
+    val table = ConfigUtils.sqlIdentifier(conf, "table")
+    val format = ConfigUtils.optString(conf, "format").getOrElse("orc")
+
+    // Staging table is required because `merged` reads from the target table;
+    // Spark cannot overwrite a table it is also reading from in the same job.
+    val stagingTable = s"$database.__stg_${table}_${System.currentTimeMillis()}"
+    merged.write.format(format).mode(SaveMode.Overwrite).saveAsTable(stagingTable)
     try {
       spark.sql(s"INSERT OVERWRITE TABLE $fullTable SELECT * FROM $stagingTable")
     } finally {

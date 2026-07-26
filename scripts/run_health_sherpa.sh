@@ -2,10 +2,10 @@
 set -euo pipefail
 
 CONF_FILE="${1:?Usage: $0 <application.conf> [jar-path]}"
-JAR_FILE="${2:-generic-ingestion-framework-1.0.0-SNAPSHOT-jar-with-dependencies.jar}"
+JAR_FILE="${2:-ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar}"
 
 spark-submit \
-  --class com.hcsc.generic.ingest.IngestMain \
+  --class com.hcsc.generic.ingest.app.IngestMain \
   --master yarn \
   --deploy-mode cluster \
   --conf spark.sql.caseSensitive=false \

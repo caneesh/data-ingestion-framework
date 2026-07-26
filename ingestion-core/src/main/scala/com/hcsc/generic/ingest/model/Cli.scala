@@ -47,6 +47,11 @@ object CliParser {
     require(cli.entity.nonEmpty, "--entity is required")
     val mode = cli.mode.toUpperCase
     require(mode == "FULL" || mode == "INCR", "--mode must be FULL or INCR")
+    val validStages = Set("all", "raw", "curated", "curated-only", "c")
+    require(
+      validStages.contains(cli.stage.toLowerCase),
+      s"--stage must be one of: ${validStages.mkString(", ")}"
+    )
     cli.copy(mode = mode)
   }
 }

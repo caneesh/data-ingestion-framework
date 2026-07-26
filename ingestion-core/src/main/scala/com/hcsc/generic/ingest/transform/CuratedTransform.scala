@@ -6,6 +6,7 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.StructType
+import scala.collection.JavaConverters._
 
 final class CuratedTransform(spark: SparkSession) {
 
@@ -20,7 +21,6 @@ final class CuratedTransform(spark: SparkSession) {
 
   def applyTransforms(df: DataFrame, conf: Config): DataFrame = {
     if (!conf.hasPath("transform.derive")) return df
-    import scala.collection.JavaConverters._
     conf.getConfigList("transform.derive").asScala.foldLeft(df) { (acc, item) =>
       acc.withColumn(item.getString("name"), expr(item.getString("expr")))
     }
@@ -29,7 +29,7 @@ final class CuratedTransform(spark: SparkSession) {
   def ensureAudit(df: DataFrame): DataFrame = {
     val withCreated =
       if (df.columns.exists(_.equalsIgnoreCase("create_timestamp"))) df
-      else df
+      else df.withColumn("create_timestamp", current_timestamp())
 
     val withModified =
       if (withCreated.columns.exists(_.equalsIgnoreCase("last_modified_ts"))) withCreated
@@ -59,7 +59,7 @@ final class CuratedTransform(spark: SparkSession) {
 
   def deduplicate(df: DataFrame, keys: Seq[String], orderBy: Seq[String]): DataFrame = {
     if (keys.isEmpty) return df
-    val existingOrder = orderBy.filter(df.columns.contains)
+    val existingOrder = orderBy.flatMap(o => df.columns.find(_.equalsIgnoreCase(o)))
     if (existingOrder.isEmpty) df.dropDuplicates(keys)
     else {
       val w = Window.partitionBy(keys.map(col): _*)

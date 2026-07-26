@@ -16,23 +16,24 @@ trait Sink {
   * Registry for discovering and instantiating sinks by type.
   */
 object SinkRegistry {
-  private var sinks: Map[String, Sink] = Map.empty
+  private val sinks = new java.util.concurrent.ConcurrentHashMap[String, Sink]()
 
-  def register(sink: Sink): Unit = {
-    sinks = sinks + (sink.sinkType.toLowerCase -> sink)
-  }
+  def register(sink: Sink): Unit =
+    sinks.put(sink.sinkType.toLowerCase, sink)
 
-  def get(sinkType: String): Option[Sink] = {
-    sinks.get(sinkType.toLowerCase)
-  }
+  def get(sinkType: String): Option[Sink] =
+    Option(sinks.get(sinkType.toLowerCase))
 
   def resolve(sinkType: String): Sink = {
     get(sinkType).getOrElse(
       throw new IllegalArgumentException(
-        s"Unknown sink type: $sinkType. Available types: ${sinks.keys.mkString(", ")}"
+        s"Unknown sink type: $sinkType. Available types: ${availableTypes.mkString(", ")}"
       )
     )
   }
 
-  def availableTypes: Set[String] = sinks.keySet
+  def availableTypes: Set[String] = {
+    import scala.collection.JavaConverters._
+    sinks.keySet.asScala.toSet
+  }
 }

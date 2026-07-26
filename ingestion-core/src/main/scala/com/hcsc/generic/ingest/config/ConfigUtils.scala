@@ -26,10 +26,29 @@ object ConfigUtils {
     if (!c.hasPath(path)) Map.empty
     else {
       val nested = c.getConfig(path)
-      nested.entrySet().asScala.map(e => e.getKey -> nested.getString(e.getKey)).toMap
+      nested.entrySet().asScala.map { e =>
+        try e.getKey -> nested.getString(e.getKey)
+        catch {
+          case ex: com.typesafe.config.ConfigException.WrongType =>
+            throw new IllegalArgumentException(
+              s"Config block '$path' must contain only string values; key '${e.getKey}' is not a string", ex
+            )
+        }
+      }.toMap
     }
   }
 
   def configList(c: Config, path: String): Seq[Config] =
     if (c.hasPath(path)) c.getConfigList(path).asScala.toSeq else Seq.empty
+
+  /** Validates a database/table name is a safe SQL identifier before it is
+    * interpolated into Spark SQL statements. */
+  def sqlIdentifier(c: Config, path: String): String = {
+    val value = c.getString(path)
+    require(
+      value.matches("[a-zA-Z_][a-zA-Z0-9_]*"),
+      s"Config '$path' value '$value' is not a safe SQL identifier (letters, digits, underscore only)"
+    )
+    value
+  }
 }

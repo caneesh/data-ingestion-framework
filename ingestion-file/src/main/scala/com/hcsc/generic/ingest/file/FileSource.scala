@@ -3,11 +3,13 @@ package com.hcsc.generic.ingest.file
 import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.source.{Source, SourceRegistry}
 import com.typesafe.config.Config
+import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions._
 
 object FileSource extends Source {
+  private val logger = Logger.getLogger(getClass.getName)
 
   override def sourceType: String = "file"
 
@@ -87,9 +89,17 @@ object FileSource extends Source {
           .replaceAll("[^a-z0-9]+", "_")
           .replaceAll("^_+|_+$", "")
 
-      if (current == normalized || normalized.isEmpty) acc
-      else if (acc.columns.exists(c => c != current && c.equalsIgnoreCase(normalized))) acc
-      else acc.withColumnRenamed(current, normalized)
+      if (normalized.isEmpty) {
+        throw new IllegalArgumentException(
+          s"Column '$current' normalizes to an empty name; rename it via header_aliases"
+        )
+      } else if (current == normalized) acc
+      else if (acc.columns.exists(c => c != current && c.equalsIgnoreCase(normalized))) {
+        throw new IllegalArgumentException(
+          s"Column '$current' normalizes to '$normalized' which collides with another column; " +
+            "resolve via header_aliases"
+        )
+      } else acc.withColumnRenamed(current, normalized)
     }
   }
 
@@ -118,7 +128,16 @@ object FileSource extends Source {
     if (n <= 0) df else dropRowsPerFile(df, n, descending = false)
   }
 
+  // LIMITATION: monotonically_increasing_id() only preserves physical line
+  // order when each source file is read as a single input split. Files larger
+  // than one HDFS block are split across partitions and row order within a
+  // source_file window is not guaranteed — trailer/skip-row removal may then
+  // drop the wrong rows.
   private def dropRowsPerFile(df: DataFrame, n: Int, descending: Boolean): DataFrame = {
+    logger.warn(
+      "[FileSource] skip_first_n/trailer removal relies on file read order; " +
+        "only reliable for files that fit in a single input split (one HDFS block)"
+    )
     val ordering = if (descending) monotonically_increasing_id().desc else monotonically_increasing_id()
     val w = Window.partitionBy(col("source_file")).orderBy(ordering)
     df.withColumn("_row_to_skip", row_number().over(w))

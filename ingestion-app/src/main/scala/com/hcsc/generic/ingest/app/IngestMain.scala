@@ -4,6 +4,7 @@ import com.hcsc.generic.ingest.file.FileSource
 import com.hcsc.generic.ingest.jdbc.JdbcSource
 import com.hcsc.generic.ingest.kafka.KafkaSource
 import com.hcsc.generic.ingest.model.CliParser
+import com.hcsc.generic.ingest.sink.HiveSink
 import com.hcsc.generic.ingest.stage.{CuratedStageRunner, RawStageRunner}
 import com.typesafe.config.{Config, ConfigFactory}
 import org.apache.log4j.Logger
@@ -16,11 +17,9 @@ object IngestMain {
   private val logger = Logger.getLogger(getClass.getName)
 
   def main(args: Array[String]): Unit = {
-    registerSources()
+    registerConnectors()
 
     val cli = CliParser.parse(args)
-    val spark = SparkSession.builder().enableHiveSupport().getOrCreate()
-    spark.sqlContext.setConf("spark.sql.caseSensitive", "false")
 
     val baseConf: Config = cli.confPath match {
       case Some(path) => ConfigFactory.parseFile(new File(path)).resolve()
@@ -34,7 +33,9 @@ object IngestMain {
     val runId = UUID.randomUUID().toString
     val rawFlag = cli.rawFlag.getOrElse(if (cli.mode == "FULL") "F" else "I")
 
+    val spark = SparkSession.builder().enableHiveSupport().getOrCreate()
     try {
+      spark.sqlContext.setConf("spark.sql.caseSensitive", "false")
       logger.info(s"==== Ingest start entity=${cli.entity} mode=${cli.mode} runId=$runId ====")
 
       val rawDf = new RawStageRunner(
@@ -61,9 +62,10 @@ object IngestMain {
     }
   }
 
-  private def registerSources(): Unit = {
+  private def registerConnectors(): Unit = {
     FileSource.register()
     JdbcSource.register()
     KafkaSource.register()
+    HiveSink.register()
   }
 }

@@ -3,7 +3,7 @@ package com.hcsc.generic.ingest.stage
 import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.publish.{PublishRequest, PublishService}
 import com.hcsc.generic.ingest.runtime.RunContext
-import com.hcsc.generic.ingest.schema.SchemaContract
+import com.hcsc.generic.ingest.schema.{CuratedContractValidator, SchemaContract, SchemaContractViolationException}
 import com.hcsc.generic.ingest.transform.CuratedTransform
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
@@ -49,6 +49,19 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     val prepared1 = transform.applyTransforms(prepared0, conf)
     val prepared2 = transform.ensureAudit(prepared1)
     val prepared = transform.normalizeKeys(prepared2, conf)
+
+    // Second validation gate (HDR_018): the CURATED contract is validated
+    // independently of RAW, immediately before publication.
+    contract.foreach { c =>
+      val mergeKeys =
+        if (runMode.equalsIgnoreCase("INCR")) ConfigUtils.optConfig(conf, "merge")
+          .map(m => ConfigUtils.stringList(m, "keys")).getOrElse(Seq.empty)
+        else Seq.empty
+      val dedupOrder = ConfigUtils.stringList(conf, "dedup.order_by")
+      val violations = CuratedContractValidator.validate(prepared, c, mergeKeys, dedupOrder, logger)
+      if (violations.nonEmpty)
+        throw new SchemaContractViolationException(violations)
+    }
 
     val publishConf = ConfigUtils.optConfig(conf, "publish")
     val request = PublishRequest(

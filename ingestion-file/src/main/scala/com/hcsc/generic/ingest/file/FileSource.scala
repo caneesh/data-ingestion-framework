@@ -39,7 +39,8 @@ object FileSource extends Source {
 
     val mapped = SchemaContract.parse(sourceConf) match {
       case Some(contract) =>
-        applyContract(loaded, contract, sourceConf, header)
+        val cleaned = handleRepeatedHeaders(loaded, contract, header)
+        applyContract(cleaned, contract, sourceConf, header)
       case None =>
         if (sourceConf.hasPath("header_aliases") || sourceConf.hasPath("columns"))
           logger.warn(
@@ -108,7 +109,7 @@ object FileSource extends Source {
       if (contract.positionalFallback.requireContentValidation)
         require(
           contract.contentValidation.enabled,
-          "HDR_006 positional_fallback.require_content_validation=true but content_validation is not enabled"
+          "HDR_008 positional_fallback.require_content_validation=true but content_validation is not enabled"
         )
       logger.warn(
         s"[FileSource] Name/alias matching failed for required columns " +
@@ -122,6 +123,41 @@ object FileSource extends Source {
         case (acc, (from, to)) => acc.withColumnRenamed(from, to)
       }
       addOptionalDefaults(renamed, contract)
+    }
+  }
+
+  /**
+    * Detects data rows that repeat the header record (vendors concatenating
+    * files). A repeated header row has every business column value equal to
+    * that column's original header text.
+    * Policies: FAIL (HDR_016) | REJECT_ROW / DROP_WITH_WARNING (both drop
+    * the rows with a warning; REJECT_ROW rows are excluded before the reject
+    * stage since they are structural artifacts, not business records).
+    */
+  private def handleRepeatedHeaders(df: DataFrame, contract: SchemaContract, header: Boolean): DataFrame = {
+    val policy = contract.repeatedHeaderPolicy.getOrElse(return df)
+    if (!header) return df
+
+    val businessColumns = df.columns.filterNot(_.equalsIgnoreCase("source_file"))
+    if (businessColumns.isEmpty) return df
+    val isHeaderRow = businessColumns
+      .map(c => trim(col(c)) === lit(c.trim))
+      .reduce(_ && _)
+
+    policy match {
+      case "FAIL" =>
+        // Deliberate tradeoff: FAIL requires an eager probe (one extra Spark
+        // action per read, early-terminated by limit(1)) so a concatenated
+        // file is rejected before anything downstream runs. The drop
+        // policies below stay fully lazy.
+        if (df.filter(isHeaderRow).limit(1).count() > 0)
+          throw new com.hcsc.generic.ingest.schema.SchemaContractViolationException(Seq(
+            SchemaViolation(ViolationKind.RepeatedHeader,
+              "Repeated header row(s) detected in data (repeated_header_policy=FAIL)")))
+        df
+      case _ => // REJECT_ROW | DROP_WITH_WARNING
+        logger.warn(s"[FileSource] Dropping repeated header rows per repeated_header_policy=$policy")
+        df.filter(!isHeaderRow)
     }
   }
 
@@ -139,12 +175,12 @@ object FileSource extends Source {
     val ordered = contract.positionalOrder
     require(
       ordered.flatMap(_.position).forall(p => p >= 0 && p < ordered.length),
-      s"HDR_006 Contract positions must be contiguous and in range 0..${ordered.length - 1}: " +
+      s"HDR_008 Contract positions must be contiguous and in range 0..${ordered.length - 1}: " +
         ordered.map(c => s"${c.name}=${c.position.get}").mkString(",")
     )
     require(
       businessColumns.length == ordered.length,
-      s"HDR_005 Positional mapping requires exactly ${ordered.length} source columns, found ${businessColumns.length}. " +
+      s"HDR_007 Positional mapping requires exactly ${ordered.length} source columns, found ${businessColumns.length}. " +
         s"Actual=${businessColumns.mkString(",")} Contract=${ordered.map(_.name).mkString(",")}"
     )
     logger.warn(

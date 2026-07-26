@@ -1,8 +1,9 @@
 package com.hcsc.generic.ingest.files
 
-import com.hcsc.generic.ingest.audit.AuditService
+import com.hcsc.generic.ingest.audit.{AuditService, HeaderAuditRecord}
 import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.runtime.RunContext
+import com.hcsc.generic.ingest.schema.{BatchPolicy, HeaderFingerprint, HeaderResolution, PolicyAction, SchemaContract, SchemaContractViolationException, SchemaValidator, SchemaViolation, ViolationKind}
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{SaveMode, SparkSession}
@@ -15,7 +16,8 @@ final case class StagedFile(
   landingPath: String,
   stagedPath: String,
   checksum: String,
-  sizeBytes: Long
+  sizeBytes: Long,
+  headerFingerprint: Option[String] = None
 )
 
 object FileStatuses {
@@ -65,6 +67,19 @@ final class FileIntakeService(
   private val validator = new FileValidator(ConfigUtils.optConfig(sourceConf, "validation"))
   private val hadoopConf = spark.sparkContext.hadoopConfiguration
 
+  // Per-file header-contract validation (multi-file batch safety)
+  private val contract = SchemaContract.parse(sourceConf)
+  private val headerEnabled = ConfigUtils.optBoolean(sourceConf, "header").getOrElse(false)
+  private val delimiter = ConfigUtils.optString(sourceConf, "delimiter").getOrElse(",").charAt(0)
+  private val quoteChar = ConfigUtils.optString(sourceConf, "quote").getOrElse("\"").charAt(0)
+  private val escapeChar = ConfigUtils.optString(sourceConf, "escape").getOrElse("\\").charAt(0)
+  // Prefer source.encoding (the same level Spark's CSV option lives at) so
+  // the physical header reader can never diverge from the data reader.
+  private val encoding = ConfigUtils.optString(sourceConf, "encoding")
+    .orElse(ConfigUtils.optConfig(sourceConf, "validation")
+      .flatMap(v => ConfigUtils.optString(v, "encoding")))
+    .getOrElse("UTF-8")
+
   private val idempotencyEnabled =
     idempotencyConf.exists(c => ConfigUtils.optBoolean(c, "enabled").getOrElse(true))
 
@@ -108,23 +123,156 @@ final class FileIntakeService(
           logger.warn(s"[FileIntake] Quarantined $name: $reason")
           None
         } else {
-          val checksum = FsUtils.checksum(fs, file)
-          if (idempotencyEnabled && knownChecksums.contains(checksum) && !ctx.forceReprocess) {
-            handleDuplicate(ctx, fs, l, status, checksum)
-          } else {
-            val staged = if (ctx.dryRun) file else FsUtils.moveToDir(fs, file, l.inprogress)
-            // Re-staged leftovers were audited VALIDATED when first staged;
-            // don't write a duplicate audit row on restart.
-            if (fromLanding)
-              audit.recordFile(ctx, name, staged.toString, checksum, status.getLen, FileStatuses.Validated)
-            else
-              logger.info(s"[FileIntake] Re-staged leftover inprogress file $name (restart)")
-            Some(StagedFile(name, file.toString, staged.toString, checksum, status.getLen))
+          // Per-file physical header + contract validation (multi-file
+          // batch safety: an invalid file must never contaminate the batch)
+          headerCheck(ctx, fs, l, status) match {
+            case HeaderCheck.Invalid => None
+            case HeaderCheck.SkipEmpty => None
+            case HeaderCheck.Ok(fingerprint) =>
+              val checksum = FsUtils.checksum(fs, file)
+              if (idempotencyEnabled && knownChecksums.contains(checksum) && !ctx.forceReprocess) {
+                handleDuplicate(ctx, fs, l, status, checksum)
+              } else {
+                val staged = if (ctx.dryRun) file else FsUtils.moveToDir(fs, file, l.inprogress)
+                // Re-staged leftovers were audited VALIDATED when first staged;
+                // don't write a duplicate audit row on restart.
+                if (fromLanding)
+                  audit.recordFile(ctx, name, staged.toString, checksum, status.getLen, FileStatuses.Validated)
+                else
+                  logger.info(s"[FileIntake] Re-staged leftover inprogress file $name (restart)")
+                Some(StagedFile(name, file.toString, staged.toString, checksum, status.getLen, fingerprint))
+              }
           }
         }
       }
     }
   }
+
+  private sealed trait HeaderCheck
+  private object HeaderCheck {
+    case class Ok(fingerprint: Option[String]) extends HeaderCheck
+    case object Invalid extends HeaderCheck
+    case object SkipEmpty extends HeaderCheck
+  }
+
+  /** Validates one physical file's header against the contract BEFORE it can
+    * join a multi-file Spark read. Failing files are audited then quarantined
+    * (FILE_ATOMIC) or fail the whole batch (BATCH_ATOMIC). */
+  private def headerCheck(
+    ctx: RunContext,
+    fs: org.apache.hadoop.fs.FileSystem,
+    l: FolderLayout,
+    status: org.apache.hadoop.fs.FileStatus
+  ): HeaderCheck = {
+    val c = contract.getOrElse(return HeaderCheck.Ok(None))
+    if (!headerEnabled) return HeaderCheck.Ok(None)
+
+    val file = status.getPath
+    val name = file.getName
+    val physical = PhysicalHeaderReader.read(fs, file, delimiter, quoteChar, escapeChar, encoding)
+
+    // Empty / header-only handling
+    if (physical.fields.nonEmpty && !physical.hasDataRows) {
+      if (c.headerOnlyPolicy == "FAIL") {
+        val v = Seq(SchemaViolation(ViolationKind.HeaderOnlyFile, s"File $name contains a header but no data rows"))
+        failFile(ctx, fs, l, status, None, v, v)
+        return HeaderCheck.Invalid
+      } else {
+        logger.warn(s"[FileIntake] $name is header-only; skipping per header_only_policy=WARN_AND_SKIP")
+        // Real checksum keeps the audit trail accurate and idempotency-safe
+        val checksum = FsUtils.checksum(fs, file)
+        val dest = if (ctx.dryRun) file else FsUtils.moveToDir(fs, file, l.processed)
+        audit.recordFile(ctx, name, dest.toString, checksum, status.getLen, "SKIPPED_HEADER_ONLY",
+          "Header-only file skipped per policy")
+        return HeaderCheck.SkipEmpty
+      }
+    }
+
+    // NOTE: FileSource.read re-validates headers on the combined DataFrame.
+    // The intake call validates each PHYSICAL file (multi-file safety); the
+    // FileSource call validates what Spark actually assembled. Both are
+    // needed; the duplicate work per file is intentional and cheap relative
+    // to the read itself.
+    val resolution =
+      if (physical.fields.isEmpty) None
+      else Some(SchemaValidator.validateHeaders(physical.fields.map(_.trim), c, logger))
+
+    val violations = physical.issues ++ resolution.map(_.violations).getOrElse(Seq.empty)
+    val failures = violations.filter(v => v.kind.policyOf(c.policies) == PolicyAction.Fail)
+
+    if (failures.isEmpty) {
+      HeaderCheck.Ok(Some(HeaderFingerprint.of(physical.fields.map(_.trim), c)))
+    } else {
+      failFile(ctx, fs, l, status, resolution, violations, failures)
+      if (c.batchPolicy == BatchPolicy.BatchAtomic)
+        throw new SchemaContractViolationException(failures, resolution)
+      HeaderCheck.Invalid
+    }
+  }
+
+  /** Audit first (validation info captured safely), then quarantine.
+    * WARN-policy violations are logged and included in the audit detail
+    * fields so the quarantined file's full context is preserved; only
+    * FAIL-policy violations drive error_code/error_message. */
+  private def failFile(
+    ctx: RunContext,
+    fs: org.apache.hadoop.fs.FileSystem,
+    l: FolderLayout,
+    status: org.apache.hadoop.fs.FileStatus,
+    resolution: Option[HeaderResolution],
+    violations: Seq[SchemaViolation],
+    failures: Seq[SchemaViolation]
+  ): Unit = {
+    val file = status.getPath
+    val name = file.getName
+    val c = contract.get
+
+    violations.filter(v => v.kind.policyOf(c.policies) == PolicyAction.Warn)
+      .foreach(v => logger.warn(s"[FileIntake] WARN $name: $v"))
+    audit.recordHeaderValidation(ctx, HeaderAuditRecord(
+      run_id = ctx.runId,
+      entity = ctx.entity,
+      source_files = name,
+      validation_stage = "file_header",
+      validation_status = "FAILED",
+      expected_canonical_columns = c.columnNames.mkString(","),
+      actual_source_headers = resolution.map(_.actualHeaders.mkString(",")).getOrElse(""),
+      normalized_source_headers = resolution.map(_.normalizedHeaders.mkString(",")).getOrElse(""),
+      resolved_mappings = resolution
+        .map(_.canonicalToActual.map { case (canonical, actual) => s"$actual->$canonical" }.mkString(","))
+        .getOrElse(""),
+      missing_required_columns = resolution.map(_.missingRequired.mkString(",")).getOrElse(""),
+      missing_optional_columns = resolution.map(_.missingOptional.map(_.name).mkString(",")).getOrElse(""),
+      unexpected_columns = violations.filter(_.kind == ViolationKind.ExtraColumn).map(_.message).mkString("; "),
+      duplicate_columns = violations.filter(v =>
+        v.kind == ViolationKind.DuplicateHeader || v.kind == ViolationKind.DuplicatePhysicalHeader)
+        .map(_.message).mkString("; "),
+      positional_fallback_used = false,
+      error_code = failures.headOption.map(_.kind.code).getOrElse(""),
+      error_message = failures.map(_.toString).mkString("; "),
+      quarantine_path = l.quarantine.toString,
+      event_ts = new Timestamp(System.currentTimeMillis())
+    ))
+    val reason = failures.map(_.toString).mkString("; ")
+    val dest = if (ctx.dryRun) file else FsUtils.moveToDir(fs, file, l.quarantine)
+    audit.recordFile(ctx, name, dest.toString, "", status.getLen, FileStatuses.Quarantined, reason)
+    logger.warn(s"[FileIntake] Quarantined $name (header contract): $reason")
+  }
+
+  /** Read-only inspection of every candidate file's header for
+    * validate-only / explain-mapping: no moves, no audit writes. */
+  def inspectHeaders(): Seq[(String, PhysicalHeader, Option[HeaderResolution])] =
+    layout.toSeq.flatMap { l =>
+      val fs = FsUtils.fileSystem(l.landing, hadoopConf)
+      (FsUtils.listFiles(fs, l.landing) ++ FsUtils.listFiles(fs, l.inprogress))
+        .filterNot(s => isSidecar(s.getPath.getName))
+        .map { status =>
+          val physical = PhysicalHeaderReader.read(fs, status.getPath, delimiter, quoteChar, escapeChar, encoding)
+          val resolution = contract.filter(_ => headerEnabled && physical.fields.nonEmpty)
+            .map(c => SchemaValidator.validateHeaders(physical.fields.map(_.trim), c, logger))
+          (status.getPath.getName, physical, resolution)
+        }
+    }
 
   private def handleDuplicate(
     ctx: RunContext,

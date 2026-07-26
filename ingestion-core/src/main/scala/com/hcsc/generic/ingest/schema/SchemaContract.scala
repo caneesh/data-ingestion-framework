@@ -48,11 +48,16 @@ final case class ColumnValidation(
   minLength: Option[Int],
   maxLength: Option[Int],
   allowedValues: Seq[String],
-  nonblank: Boolean
+  nonblank: Boolean,
+  numericParse: Boolean = false,
+  dateFormats: Seq[String] = Seq.empty,
+  timestampFormats: Seq[String] = Seq.empty,
+  maxNullPercentage: Option[Double] = None
 ) {
   def isDefined: Boolean =
     regex.isDefined || minLength.isDefined || maxLength.isDefined ||
-      allowedValues.nonEmpty || nonblank
+      allowedValues.nonEmpty || nonblank || numericParse ||
+      dateFormats.nonEmpty || timestampFormats.nonEmpty || maxNullPercentage.isDefined
 }
 
 final case class ColumnContract(
@@ -77,8 +82,14 @@ final case class ContentValidationConfig(
   enabled: Boolean,
   sampleMode: Boolean,
   sampleRows: Int,
-  maxFailurePercentage: Double
+  maxFailurePercentage: Double,
+  failOnAllNullRequired: Boolean = false
 )
+
+object BatchPolicy {
+  val FileAtomic = "FILE_ATOMIC"
+  val BatchAtomic = "BATCH_ATOMIC"
+}
 
 final case class SchemaPolicies(
   onMissingColumn: PolicyAction,
@@ -99,7 +110,10 @@ final case class SchemaContract(
   strategy: HeaderStrategy = HeaderStrategy.NameWithAliases,
   positionalFallback: PositionalFallback = PositionalFallback(enabled = false, requireExactColumnCount = true, requireContentValidation = false),
   contentValidation: ContentValidationConfig = ContentValidationConfig(enabled = false, sampleMode = true, sampleRows = 1000, maxFailurePercentage = 0.0),
-  quarantineOnFailure: Boolean = false
+  quarantineOnFailure: Boolean = false,
+  batchPolicy: String = BatchPolicy.FileAtomic,
+  repeatedHeaderPolicy: Option[String] = None,
+  headerOnlyPolicy: String = "WARN_AND_SKIP"
 ) {
   def columnNames: Seq[String] = columns.map(_.name)
 
@@ -127,7 +141,7 @@ final case class SchemaContract(
   def positionalOrder: Seq[ColumnContract] = {
     require(
       columns.forall(_.position.isDefined),
-      "HDR_006 Positional mapping requires every schema column to declare a position"
+      "HDR_008 Positional mapping requires every schema column to declare a position"
     )
     columns.sortBy(_.position.get)
   }
@@ -153,12 +167,18 @@ object SchemaContract {
     val contentValidationConf = block("content_validation")
 
     val columns = s.getConfigList("columns").asScala.map { c =>
+      // Rules may live inline on the column or in a nested `validation` block
+      val v: Config = ConfigUtils.optConfig(c, "validation").getOrElse(c)
       val validation = ColumnValidation(
-        regex = ConfigUtils.optString(c, "regex"),
-        minLength = ConfigUtils.optInt(c, "min_length"),
-        maxLength = ConfigUtils.optInt(c, "max_length"),
-        allowedValues = ConfigUtils.stringList(c, "allowed_values"),
-        nonblank = ConfigUtils.optBoolean(c, "nonblank").getOrElse(false)
+        regex = ConfigUtils.optString(v, "regex"),
+        minLength = ConfigUtils.optInt(v, "min_length"),
+        maxLength = ConfigUtils.optInt(v, "max_length"),
+        allowedValues = ConfigUtils.stringList(v, "allowed_values"),
+        nonblank = ConfigUtils.optBoolean(v, "nonblank").getOrElse(false),
+        numericParse = ConfigUtils.optBoolean(v, "numeric_parse").getOrElse(false),
+        dateFormats = ConfigUtils.stringList(v, "accepted_date_formats"),
+        timestampFormats = ConfigUtils.stringList(v, "accepted_timestamp_formats"),
+        maxNullPercentage = ConfigUtils.optString(v, "max_null_percentage").map(_.toDouble)
       )
       // `default = null` in HOCON is an explicit null default; hasPath is
       // false for null values so hasPathOrNull must be used.
@@ -167,13 +187,14 @@ object SchemaContract {
         else None
       ColumnContract(
         name = c.getString("name"),
-        dataType = ConfigUtils.optString(c, "type").getOrElse("string"),
+        dataType = ConfigUtils.optString(c, "type")
+          .orElse(ConfigUtils.optString(c, "data_type")).getOrElse("string"),
         nullable = ConfigUtils.optBoolean(c, "nullable").getOrElse(true),
-        aliases = ConfigUtils.stringList(c, "aliases"),
+        aliases = parseAliases(c),
         position = ConfigUtils.optInt(c, "position"),
         required = ConfigUtils.optBoolean(c, "required").getOrElse(true),
         default = default,
-        category = ConfigUtils.optString(c, "category").getOrElse("business"),
+        category = ConfigUtils.optString(c, "category").getOrElse("business").toLowerCase,
         validation = if (validation.isDefined) Some(validation) else None
       )
     }.toSeq
@@ -183,7 +204,7 @@ object SchemaContract {
     val duplicateNames = columns.groupBy(c => normalize(c.name)).filter(_._2.size > 1).keys.toSeq
     require(
       duplicateNames.isEmpty,
-      s"schema.columns contains duplicate column names: ${duplicateNames.mkString(",")}"
+      s"HDR_017 schema.columns contains duplicate canonical names after normalization: ${duplicateNames.mkString(",")}"
     )
 
     val aliasOwners = columns.flatMap(c => (c.name +: c.aliases).map(a => normalize(a) -> c.name))
@@ -192,15 +213,36 @@ object SchemaContract {
       .map { case (alias, owners) => s"'$alias' -> ${owners.map(_._2).distinct.mkString("/")}" }
     require(
       conflictingAliases.isEmpty,
-      s"HDR_003 schema.columns aliases map to more than one column: ${conflictingAliases.mkString("; ")}"
+      s"HDR_017 schema.columns aliases/names collide across columns after normalization: ${conflictingAliases.mkString("; ")}"
     )
 
     val declaredPositions = columns.flatMap(_.position)
     val duplicatePositions = declaredPositions.groupBy(identity).filter(_._2.size > 1).keys.toSeq
     require(
       duplicatePositions.isEmpty,
-      s"HDR_006 schema.columns contains duplicate positions: ${duplicatePositions.mkString(",")}"
+      s"HDR_017 schema.columns contains duplicate positions: ${duplicatePositions.mkString(",")}"
     )
+    require(
+      declaredPositions.forall(_ >= 0),
+      s"HDR_017 schema.columns contains negative positions: ${declaredPositions.filter(_ < 0).mkString(",")}"
+    )
+
+    // Eager data-type validation: bad types fail at startup, not mid-run
+    columns.foreach { c =>
+      try org.apache.spark.sql.types.DataType.fromDDL(c.dataType)
+      catch {
+        case e: Exception =>
+          throw new IllegalArgumentException(
+            s"HDR_017 schema.columns['${c.name}'] has invalid data type '${c.dataType}'", e)
+      }
+    }
+
+    val validCategories = Set("business", "optional", "audit", "generated", "deprecated")
+    columns.foreach { c =>
+      require(validCategories.contains(c.category),
+        s"HDR_017 schema.columns['${c.name}'] has unknown category '${c.category}'; " +
+          s"expected one of ${validCategories.mkString(", ")}")
+    }
 
     def policy(path: String, default: PolicyAction): PolicyAction = {
       val fromSchema = ConfigUtils.optString(s, path)
@@ -249,7 +291,8 @@ object SchemaContract {
         enabled = ConfigUtils.optBoolean(cv, "enabled").getOrElse(true),
         sampleMode = ConfigUtils.optString(cv, "mode").forall(_.equalsIgnoreCase("SAMPLE")),
         sampleRows = ConfigUtils.optInt(cv, "sample_rows").getOrElse(1000),
-        maxFailurePercentage = ConfigUtils.optString(cv, "maximum_failure_percentage").map(_.toDouble).getOrElse(0.0)
+        maxFailurePercentage = ConfigUtils.optString(cv, "maximum_failure_percentage").map(_.toDouble).getOrElse(0.0),
+        failOnAllNullRequired = ConfigUtils.optBoolean(cv, "fail_on_all_null_required_column").getOrElse(false)
       )
       case None => ContentValidationConfig(enabled = false, sampleMode = true, sampleRows = 1000, maxFailurePercentage = 0.0)
     }
@@ -257,6 +300,29 @@ object SchemaContract {
     val quarantineOnFailure = headerValidation
       .flatMap(h => ConfigUtils.optBoolean(h, "quarantine_on_failure"))
       .getOrElse(false)
+
+    val batchPolicy = headerValidation
+      .flatMap(h => ConfigUtils.optString(h, "batch_policy")).map(_.toUpperCase)
+      .getOrElse(BatchPolicy.FileAtomic)
+    require(
+      Set(BatchPolicy.FileAtomic, BatchPolicy.BatchAtomic).contains(batchPolicy),
+      s"HDR_017 header_validation.batch_policy '$batchPolicy' must be FILE_ATOMIC or BATCH_ATOMIC"
+    )
+
+    val repeatedHeaderPolicy = headerValidation
+      .flatMap(h => ConfigUtils.optString(h, "repeated_header_policy")).map(_.toUpperCase)
+    repeatedHeaderPolicy.foreach(p => require(
+      Set("FAIL", "REJECT_ROW", "DROP_WITH_WARNING").contains(p),
+      s"HDR_017 header_validation.repeated_header_policy '$p' must be FAIL, REJECT_ROW or DROP_WITH_WARNING"
+    ))
+
+    val headerOnlyPolicy = headerValidation
+      .flatMap(h => ConfigUtils.optString(h, "header_only_policy")).map(_.toUpperCase)
+      .getOrElse("WARN_AND_SKIP")
+    require(
+      Set("FAIL", "WARN_AND_SKIP").contains(headerOnlyPolicy),
+      s"HDR_017 header_validation.header_only_policy '$headerOnlyPolicy' must be FAIL or WARN_AND_SKIP"
+    )
 
     Some(SchemaContract(
       version = s.getString("version"),
@@ -266,7 +332,45 @@ object SchemaContract {
       strategy = strategy,
       positionalFallback = fallback,
       contentValidation = contentValidation,
-      quarantineOnFailure = quarantineOnFailure
+      quarantineOnFailure = quarantineOnFailure,
+      batchPolicy = batchPolicy,
+      repeatedHeaderPolicy = repeatedHeaderPolicy,
+      headerOnlyPolicy = headerOnlyPolicy
     ))
+  }
+
+  /** Aliases may be plain strings or objects with governance metadata:
+    *   { value = "plan_hios_id", effective_from = "2026-07-01",
+    *     valid_until = "2027-01-31", approval_reference = "CHG123456" }
+    * Expired or not-yet-effective aliases are excluded with a warning. */
+  // Alias effective windows are evaluated against a single date captured at
+  // class-load time, so every parse within one JVM run sees the same alias
+  // set (a run straddling midnight cannot flip an alias mid-run).
+  private lazy val aliasEvaluationDate: java.time.LocalDate = java.time.LocalDate.now()
+
+  private def parseAliases(c: Config): Seq[String] = {
+    if (!c.hasPath("aliases")) return Seq.empty
+    import com.typesafe.config.ConfigValueType
+    val today = aliasEvaluationDate
+    c.getList("aliases").asScala.flatMap { v =>
+      v.valueType() match {
+        case ConfigValueType.STRING => Some(v.unwrapped().toString)
+        case ConfigValueType.OBJECT =>
+          val a = v.asInstanceOf[com.typesafe.config.ConfigObject].toConfig
+          val value = a.getString("value")
+          val effectiveOk = ConfigUtils.optString(a, "effective_from")
+            .forall(d => !today.isBefore(java.time.LocalDate.parse(d)))
+          val notExpired = ConfigUtils.optString(a, "valid_until")
+            .forall(d => !today.isAfter(java.time.LocalDate.parse(d)))
+          if (effectiveOk && notExpired) Some(value)
+          else {
+            org.apache.log4j.Logger.getLogger(getClass.getName)
+              .warn(s"[SchemaContract] Alias '$value' is outside its effective window and was excluded")
+            None
+          }
+        case other =>
+          throw new IllegalArgumentException(s"HDR_017 alias entries must be strings or objects, found $other")
+      }
+    }.toList
   }
 }

@@ -147,6 +147,129 @@ Guarantees enforced in code, not convention:
 See `application.conf` for a complete Health Sherpa example where
 `"Plan HIOS ID"` maps to canonical `hios_id`.
 
+### Multi-File Batch Safety
+
+Every physical file in a managed feed is validated **independently before
+any Spark read**: the physical header is extracted with a quote-aware parser
+(so duplicate physical headers are caught before Spark silently renames
+them), normalized, resolved against the contract, and fingerprinted
+(SHA-256 over the canonical column order). Alias-equivalent files share a
+fingerprint and group together; different layouts are read separately and
+unioned by canonical name — a mixed-schema batch can never contaminate one
+DataFrame. Batch behavior is configurable via
+`header_validation.batch_policy`: `FILE_ATOMIC` (default — invalid files
+quarantine individually, valid files continue) or `BATCH_ATOMIC` (one
+invalid file fails the batch). Header-only files follow
+`header_only_policy` (`WARN_AND_SKIP` default / `FAIL`); repeated header
+rows inside data follow `repeated_header_policy`
+(`FAIL` / `REJECT_ROW` / `DROP_WITH_WARNING`).
+
+### Error-Code Catalog
+
+| Code | Meaning |
+|------|---------|
+| HDR_001 | Missing required header |
+| HDR_002 | Duplicate physical header |
+| HDR_003 | Duplicate normalized header |
+| HDR_004 | Ambiguous alias mapping |
+| HDR_005 | Multiple source columns map to one canonical column |
+| HDR_006 | Unexpected header |
+| HDR_007 | Column-count mismatch |
+| HDR_008 | Invalid positional mapping |
+| HDR_009 | Suspected delimiter mismatch |
+| HDR_010 | Blank/empty header |
+| HDR_011 | Malformed quoted header |
+| HDR_012 | Unsupported encoding |
+| HDR_013 | Header-only file |
+| HDR_014 | Schema-version mismatch |
+| HDR_015 | Content validation failure |
+| HDR_016 | Repeated header row detected |
+| HDR_017 | Contract configuration collision (startup) |
+| HDR_018 | Required output column missing before CURATED publish |
+
+### Validate-Only Mode
+
+```bash
+spark-submit ... --entity my_feed --mode FULL --validate-only --explain-mapping
+```
+
+Discovers files, validates physical headers and canonical mappings, and
+prints a human-readable mapping explanation — with **no RAW write, no
+CURATED write and no file moves**. Safe for production support.
+
+### Troubleshooting (production support)
+
+```
+Error: HDR_001 — Required canonical header not found
+Action:
+  1. Run --validate-only --explain-mapping to see the proposed mappings
+  2. Confirm the vendor header change with the source system
+  3. Obtain approval for the new header name
+  4. Add the approved alias to schema.columns[].aliases
+  5. Re-run --validate-only to confirm the mapping resolves
+  6. Move the quarantined file back to landing and re-run
+```
+
+For HDR_002/003 (duplicates) fix the vendor extract; for HDR_009 check the
+configured delimiter; for HDR_015 inspect the failing column values against
+the configured content rules (a swap usually shows 100% failure); HDR_017
+is a configuration bug — the error message names the colliding columns.
+
+```
+Situation: BATCH_ATOMIC run failed on one bad file
+Effect: the bad file is quarantined; files staged earlier in the same run
+        remain in inprogress/ (restart-safe by design)
+Action:
+  1. Fix or remove the cause (usually add an approved alias, or leave the
+     bad file in quarantine)
+  2. Re-run the feed — inprogress leftovers are re-staged automatically
+  3. If the batch must be abandoned, move inprogress/ files back to landing/
+     manually; nothing was written to RAW or CURATED
+```
+
+### Migration Guide (legacy feeds)
+
+Migration is **incremental, not mandatory** — legacy options keep working
+with a deprecation warning. Old:
+
+```hocon
+source {
+  header = true
+  columns = ["subscriber_id", "hios_id"]
+  header_aliases { "plan_hios_id" = "hios_id" }
+}
+```
+
+New (recommended):
+
+```hocon
+schema {
+  version = "2.0"
+  columns = [
+    { name = "subscriber_id", required = true, aliases = ["subscriber id", "subscriberid"] },
+    { name = "hios_id", required = true, aliases = ["plan_hios_id", "plan hios id", "hios id"] }
+  ]
+  header_validation {
+    strategy = "NAME_WITH_ALIASES"
+    on_missing_required = "FAIL"
+    on_extra_columns = "WARN"
+    on_duplicate_columns = "FAIL"
+    quarantine_on_failure = true
+  }
+}
+```
+
+Aliases may also be objects with governance metadata
+(`{ value = "plan_hios_id", effective_from = "2026-07-01", valid_until = "2027-01-31", approval_reference = "CHG123456" }`);
+expired aliases are excluded with a warning.
+
+**Known limitations:** compressed archives (`.gz`/`.zip`) are not validated
+inside the archive; there is no metrics backend (counts are logged);
+`PARTITION_ATOMIC` batch policy and `CAPTURE` extra-column policy are not
+implemented; multi-line quoted header fields are treated as malformed;
+schema version is resolved from feed configuration only (not
+filename/manifest).
+
 ## Operational Reliability Features
 
 All features below are opt-in per feed via config blocks; feeds without them

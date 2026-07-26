@@ -285,19 +285,15 @@ class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   // Header contract: unknown required header -> audit + quarantine, no RAW write
   // ---------------------------------------------------------------------------
 
-  test("unknown renamed required header fails before RAW, audits and quarantines the file") {
+  test("unknown renamed required header is quarantined at intake, before any RAW write") {
     writeLanding("member_hdr.csv", "totally_unknown,plan_hios_id\nS777,H7\n")
 
     val rawBefore = spark.table("p_raw.member").count()
-    val conf = ConfigFactory.parseString(
-      """schema.header_validation.quarantine_on_failure = true""")
-      .withFallback(feedConf())
 
-    intercept[com.hcsc.generic.ingest.schema.SchemaContractViolationException] {
-      run(conf, baseCli.copy(runId = Some("run-hdr-1")))
-    }
+    // FILE_ATOMIC (default): the invalid file is quarantined individually
+    // and the run completes as an audited no-op — no exception, no RAW write.
+    run(feedConf(), baseCli.copy(runId = Some("run-hdr-1")))
 
-    // No RAW write happened and the file is quarantined, not left inprogress
     assert(spark.table("p_raw.member").count() == rawBefore)
     assert(listNames("quarantine").contains("member_hdr.csv"))
     assert(!listNames("inprogress").contains("member_hdr.csv"))
@@ -312,6 +308,29 @@ class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(record.getAs[String]("error_code") == "HDR_001")
     assert(record.getAs[String]("missing_required_columns").contains("subscriber_id"))
     assert(record.getAs[String]("actual_source_headers").contains("totally_unknown"))
+  }
+
+  test("multi-file batch: alias-equivalent files load together, invalid file is isolated (FILE_ATOMIC)") {
+    // Same schema expressed two ways (canonical vs vendor aliases) plus one
+    // structurally invalid file — the invalid file must not contaminate the read.
+    writeLanding("member_g1.csv", "subscriber_id,hios_id\nS801,H81\n")
+    writeLanding("member_g2.csv", "subscriber id,plan_hios_id\nS802,H82\n")
+    writeLanding("member_g3.csv", "hios_id,hios_id\nH83,H83\n") // duplicate physical header
+
+    val rawBefore = spark.table("p_raw.member").count()
+    run(feedConf(), baseCli.copy(runId = Some("run-multi-1")))
+
+    // Both valid files loaded with canonical columns; invalid quarantined
+    import org.apache.spark.sql.functions.col
+    val slice = spark.table("p_raw.member").filter(col("run_id") === "run-multi-1")
+    assert(slice.count() == 2)
+    assert(slice.select("subscriber_id").collect().map(_.getString(0)).toSet == Set("S801", "S802"))
+    assert(spark.table("p_raw.member").count() == rawBefore + 2)
+    assert(listNames("quarantine").contains("member_g3.csv"))
+
+    val hdrAudit = spark.table("p_audit.ingest_header_audit")
+      .filter(col("run_id") === "run-multi-1")
+    assert(hdrAudit.collect().head.getAs[String]("error_code") == "HDR_002")
   }
 
   // ---------------------------------------------------------------------------

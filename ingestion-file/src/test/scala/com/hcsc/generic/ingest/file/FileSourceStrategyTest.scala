@@ -83,7 +83,7 @@ class FileSourceStrategyTest extends AnyFunSuite with SharedSparkSession {
     val ex = intercept[SchemaContractViolationException] {
       FileSource.read(spark, conf(csv, schema))
     }
-    assert(ex.getMessage.contains("HDR_005"))
+    assert(ex.getMessage.contains("HDR_007"))
   }
 
   test("fallback strategy does not engage when aliases resolve the headers") {
@@ -144,6 +144,6 @@ class FileSourceStrategyTest extends AnyFunSuite with SharedSparkSession {
     val ex = intercept[IllegalArgumentException] {
       FileSource.read(spark, conf(csv, schema))
     }
-    assert(ex.getMessage.contains("HDR_006"))
+    assert(ex.getMessage.contains("HDR_008"))
   }
 }

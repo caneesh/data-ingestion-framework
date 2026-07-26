@@ -32,7 +32,9 @@ object IngestMain {
     try {
       spark.sqlContext.setConf("spark.sql.caseSensitive", "false")
 
-      cli.stage.toLowerCase match {
+      if (cli.validateOnly) {
+        new IngestPipeline(spark, feedConf, cli, logger).validateOnly(cli.explainMapping)
+      } else cli.stage.toLowerCase match {
         case "curated" | "curated-only" | "c" =>
           runCuratedOnly(spark, feedConf, cli)
         case _ =>

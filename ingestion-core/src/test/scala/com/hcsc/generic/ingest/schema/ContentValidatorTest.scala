@@ -41,7 +41,7 @@ class ContentValidatorTest extends AnyFunSuite with SharedSparkSession {
     val df = Seq("John Smith", "Mary Jones").toDF("hios_id")
     val violations = ContentValidator.validate(df, c, logger)
     assert(violations.map(_.kind) == Seq(ViolationKind.ContentValidation))
-    assert(violations.head.toString.contains("HDR_007"))
+    assert(violations.head.toString.contains("HDR_015"))
   }
 
   test("failure percentage threshold tolerates configured noise") {

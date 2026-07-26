@@ -60,6 +60,53 @@ final class IngestPipeline(
       cached.clear()
     }
 
+  /**
+    * --validate-only: discovers files, extracts and validates physical
+    * headers, resolves canonical mappings and (optionally) prints a mapping
+    * explanation. Performs NO RAW write, NO CURATED write, NO file moves and
+    * NO audit writes — safe for production support.
+    */
+  def validateOnly(explainMapping: Boolean): Unit = {
+    logger.info(s"==== VALIDATE-ONLY entity=${ctx.entity} runId=${ctx.runId} " +
+      "(no writes, no file moves) ====")
+
+    var sourceWithSchema = feedConf.getConfig("source")
+    if (feedConf.hasPath("schema"))
+      sourceWithSchema = sourceWithSchema.withValue("schema", feedConf.getValue("schema"))
+
+    // A disabled AuditService makes the "no writes" promise structural: even
+    // a future change inside inspectHeaders cannot write audit records here.
+    val noOpAudit = new AuditService(spark, None)
+    val intake = new FileIntakeService(
+      spark, sourceWithSchema, None, noOpAudit, logger)
+
+    if (intake.managed) {
+      val inspections = intake.inspectHeaders()
+      var passed = 0
+      var failed = 0
+      inspections.foreach { case (name, physical, resolution) =>
+        val violations = physical.issues ++ resolution.map(_.violations).getOrElse(Seq.empty)
+        val hardFailures = contract.map(c =>
+          violations.filter(_.kind.policyOf(c.policies) == com.hcsc.generic.ingest.schema.PolicyAction.Fail))
+          .getOrElse(violations)
+        val status = if (hardFailures.isEmpty) { passed += 1; "PASSED" } else { failed += 1; "FAILED" }
+        logger.info(s"[ValidateOnly] file=$name status=$status" +
+          (if (violations.nonEmpty) s" violations=${violations.mkString("; ")}" else ""))
+        if (explainMapping) contract.foreach { c =>
+          logger.info("\n" + com.hcsc.generic.ingest.schema.MappingExplanationRenderer
+            .render(ctx.entity, name, c, physical.fields.map(_.trim), resolution))
+        }
+      }
+      logger.info(s"[ValidateOnly] Summary: discovered=${inspections.size} passed=$passed failed=$failed")
+    } else {
+      // Static-path feeds: a read-only source read exercises the same
+      // contract validation without writing anything.
+      val sourceType = ConfigUtils.optString(sourceWithSchema, "type").getOrElse("file")
+      val df = SourceRegistry.resolve(sourceType).read(spark, sourceWithSchema)
+      logger.info(s"[ValidateOnly] Static-path feed validated; resolved columns: ${df.columns.mkString(",")}")
+    }
+  }
+
   private def runInternal(): Unit = {
     logger.info(s"==== Pipeline start entity=${ctx.entity} mode=${ctx.mode} runId=${ctx.runId} " +
       s"dryRun=${ctx.dryRun} resume=${ctx.resume} ====")
@@ -69,7 +116,11 @@ final class IngestPipeline(
       if (feedConf.hasPath("curated")) Some(feedConf.getConfig("curated")) else None
 
     // ---- Stage: validate (file intake) --------------------------------------
-    val sourceConf = feedConf.getConfig("source")
+    // The schema contract is attached before intake so per-file physical
+    // header validation can run against it.
+    var sourceConf = feedConf.getConfig("source")
+    if (feedConf.hasPath("schema"))
+      sourceConf = sourceConf.withValue("schema", feedConf.getValue("schema"))
     val intake = new FileIntakeService(
       spark, sourceConf, ConfigUtils.optConfig(feedConf, "idempotency"), audit, logger)
 
@@ -149,18 +200,31 @@ final class IngestPipeline(
     rejectService: RejectService,
     intake: FileIntakeService
   ): RawOutcome = {
-    // Point the source at the staged files (managed feeds) and attach the
-    // schema contract for connector-side header resolution.
+    // Attach the schema contract for connector-side header resolution.
     var effectiveSource = sourceConf
-    staged.foreach { files =>
-      effectiveSource = effectiveSource.withValue(
-        "paths", ConfigValueFactory.fromIterable(files.map(_.stagedPath).asJava))
-    }
     if (feedConf.hasPath("schema"))
       effectiveSource = effectiveSource.withValue("schema", feedConf.getValue("schema"))
 
     val sourceType = ConfigUtils.optString(effectiveSource, "type").getOrElse("file")
     val source = SourceRegistry.resolve(sourceType)
+
+    // Multi-file batch safety: staged files were validated per-file at
+    // intake; here alias-equivalent files (same canonical fingerprint) are
+    // grouped and each group is read separately, then unioned by canonical
+    // name so mixed header layouts can never contaminate one Spark read.
+    def readSource(): DataFrame = staged match {
+      case Some(files) if files.nonEmpty =>
+        val groups = files.groupBy(_.headerFingerprint).values.toSeq
+        if (groups.size > 1)
+          logger.info(s"[Pipeline] ${groups.size} header compatibility groups detected; reading separately")
+        groups.map { group =>
+          val conf = effectiveSource.withValue(
+            "paths", ConfigValueFactory.fromIterable(group.map(_.stagedPath).asJava))
+          source.read(spark, conf)
+        }.reduce((a, b) => a.unionByName(b, allowMissingColumns = true))
+      case _ =>
+        source.read(spark, effectiveSource)
+    }
 
     val rawDatabase = ConfigUtils.sqlIdentifier(rawConf, "database")
     val rawTable = ConfigUtils.sqlIdentifier(rawConf, "table")
@@ -171,7 +235,7 @@ final class IngestPipeline(
     // quarantined when configured) before the failure propagates.
     val df0 =
       try {
-        val df = source.read(spark, effectiveSource)
+        val df = readSource()
         contract.foreach { c =>
           // Hard guard: required canonical columns must exist before RAW.
           // Connectors enforce this too; this covers every source type.

@@ -11,33 +11,78 @@ sealed trait ViolationKind {
   def policyOf(p: SchemaPolicies): PolicyAction
 }
 
+/** Stable, documented error-code catalog (HDR_001..HDR_018). */
 object ViolationKind {
   case object MissingColumn extends ViolationKind {
-    val label = "missing_column"; val code = "HDR_001"
+    val label = "missing_required_header"; val code = "HDR_001"
     def policyOf(p: SchemaPolicies): PolicyAction = p.onMissingColumn
   }
+  case object DuplicatePhysicalHeader extends ViolationKind {
+    val label = "duplicate_physical_header"; val code = "HDR_002"
+    def policyOf(p: SchemaPolicies): PolicyAction = p.onDuplicateHeader
+  }
   case object DuplicateHeader extends ViolationKind {
-    val label = "duplicate_header"; val code = "HDR_002"
+    val label = "duplicate_normalized_header"; val code = "HDR_003"
     def policyOf(p: SchemaPolicies): PolicyAction = p.onDuplicateHeader
   }
   case object AmbiguousMapping extends ViolationKind {
-    val label = "ambiguous_mapping"; val code = "HDR_003"
+    val label = "ambiguous_alias_mapping"; val code = "HDR_004"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
+  case object MultipleSourcesOneCanonical extends ViolationKind {
+    val label = "multiple_source_columns_one_canonical"; val code = "HDR_005"
     def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
   }
   case object ExtraColumn extends ViolationKind {
-    val label = "extra_column"; val code = "HDR_004"
+    val label = "unexpected_header"; val code = "HDR_006"
     def policyOf(p: SchemaPolicies): PolicyAction = p.onExtraColumn
   }
   case object CountMismatch extends ViolationKind {
-    val label = "column_count_mismatch"; val code = "HDR_005"
+    val label = "column_count_mismatch"; val code = "HDR_007"
     def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
   }
   case object InvalidPositional extends ViolationKind {
-    val label = "invalid_positional_mapping"; val code = "HDR_006"
+    val label = "invalid_positional_mapping"; val code = "HDR_008"
     def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
   }
+  case object DelimiterMismatch extends ViolationKind {
+    val label = "suspected_delimiter_mismatch"; val code = "HDR_009"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
+  case object BlankHeader extends ViolationKind {
+    val label = "blank_header"; val code = "HDR_010"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
+  case object MalformedQuote extends ViolationKind {
+    val label = "malformed_quoted_header"; val code = "HDR_011"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
+  case object UnsupportedEncoding extends ViolationKind {
+    val label = "unsupported_encoding"; val code = "HDR_012"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
+  case object HeaderOnlyFile extends ViolationKind {
+    val label = "header_only_file"; val code = "HDR_013"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
+  case object VersionMismatch extends ViolationKind {
+    val label = "schema_version_mismatch"; val code = "HDR_014"
+    def policyOf(p: SchemaPolicies): PolicyAction = p.onVersionMismatch
+  }
   case object ContentValidation extends ViolationKind {
-    val label = "content_validation_failure"; val code = "HDR_007"
+    val label = "content_validation_failure"; val code = "HDR_015"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
+  case object RepeatedHeader extends ViolationKind {
+    val label = "repeated_header_row"; val code = "HDR_016"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
+  case object ContractCollision extends ViolationKind {
+    val label = "contract_configuration_collision"; val code = "HDR_017"
+    def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
+  }
+  case object CuratedContract extends ViolationKind {
+    val label = "required_output_column_missing_before_publish"; val code = "HDR_018"
     def policyOf(p: SchemaPolicies): PolicyAction = PolicyAction.Fail
   }
   case object TypeChange extends ViolationKind {
@@ -51,10 +96,6 @@ object ViolationKind {
   case object NullabilityViolation extends ViolationKind {
     val label = "nullability_violation"; val code = "nullability_violation"
     def policyOf(p: SchemaPolicies): PolicyAction = p.onNullabilityViolation
-  }
-  case object VersionMismatch extends ViolationKind {
-    val label = "version_mismatch"; val code = "version_mismatch"
-    def policyOf(p: SchemaPolicies): PolicyAction = p.onVersionMismatch
   }
 }
 
@@ -99,15 +140,26 @@ object SchemaValidator {
 
     val resolved: Seq[(String, Option[String])] = headers.map(h => h -> contract.resolve(h))
 
-    // Duplicate headers: two source headers resolving to the same contract
-    // column, or identical after normalization.
+    // HDR_003: distinct source headers identical after normalization.
+    val byNormalized = headers.groupBy(SchemaContract.normalize).filter(_._2.size > 1)
+    byNormalized.foreach { case (norm, dupes) =>
+      violations += SchemaViolation(
+        ViolationKind.DuplicateHeader,
+        s"Headers ${dupes.mkString(", ")} all normalize to '$norm'"
+      )
+    }
+
+    // HDR_005: different headers (e.g. hios_id AND plan_hios_id) resolving to
+    // the same canonical column via aliases. Never silently prefer one.
     resolved
-      .groupBy { case (h, target) => target.getOrElse(SchemaContract.normalize(h)) }
-      .filter(_._2.size > 1)
-      .foreach { case (name, dupes) =>
+      .collect { case (h, Some(target)) => (h, target) }
+      .groupBy(_._2)
+      .filter { case (_, hs) => hs.map(h => SchemaContract.normalize(h._1)).distinct.size > 1 }
+      .foreach { case (canonical, dupes) =>
         violations += SchemaViolation(
-          ViolationKind.DuplicateHeader,
-          s"Headers ${dupes.map(_._1).mkString(", ")} all map to '$name'"
+          ViolationKind.MultipleSourcesOneCanonical,
+          s"Source columns ${dupes.map(_._1).mkString(", ")} all map to canonical '$canonical' " +
+            "(multiple_source_mapping_policy=FAIL)"
         )
       }
 

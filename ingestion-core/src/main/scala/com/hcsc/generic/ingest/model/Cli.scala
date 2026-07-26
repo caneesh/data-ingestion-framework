@@ -11,7 +11,9 @@ case class Cli(
   resume: Boolean = false,
   fileId: Option[String] = None,
   dryRun: Boolean = false,
-  forceReprocess: Boolean = false
+  forceReprocess: Boolean = false,
+  validateOnly: Boolean = false,
+  explainMapping: Boolean = false
 )
 
 object CliParser {
@@ -58,6 +60,12 @@ object CliParser {
           index += 1
         case "--force-reprocess" =>
           cli = cli.copy(forceReprocess = true)
+          index += 1
+        case "--validate-only" =>
+          cli = cli.copy(validateOnly = true)
+          index += 1
+        case "--explain-mapping" =>
+          cli = cli.copy(explainMapping = true)
           index += 1
         case unknown =>
           throw new IllegalArgumentException(s"Unknown argument: $unknown")

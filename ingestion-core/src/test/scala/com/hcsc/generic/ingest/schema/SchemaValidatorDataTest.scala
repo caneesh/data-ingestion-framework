@@ -54,14 +54,13 @@ class SchemaValidatorDataTest extends AnyFunSuite with SharedSparkSession {
     assert(SchemaValidator.validateData(df, c).isEmpty)
   }
 
-  test("validateData throws a clear error for an invalid contract type") {
-    val c = contract(
-      """schema { version = "1.0", columns = [{ name = "id", type = "not_a_type" }] }"""
-    )
-    val df = Seq("a").toDF("id")
+  test("invalid contract types are rejected eagerly at parse time (HDR_017)") {
     val ex = intercept[IllegalArgumentException] {
-      SchemaValidator.validateData(df, c)
+      contract(
+        """schema { version = "1.0", columns = [{ name = "id", type = "not_a_type" }] }"""
+      )
     }
     assert(ex.getMessage.contains("not_a_type"))
+    assert(ex.getMessage.contains("HDR_017"))
   }
 }

@@ -29,4 +29,12 @@ class HeaderNormalizerTest extends AnyFunSuite {
   test("already-normalized names pass through unchanged") {
     assert(HeaderNormalizer.normalize("subscriber_id") == "subscriber_id")
   }
+
+  test("invisible unicode characters are normalized away") {
+    assert(HeaderNormalizer.normalize("\uFEFFSubscriber ID") == "subscriber_id") // BOM
+    assert(HeaderNormalizer.normalize("Subscriber\u200BID") == "subscriber_id") // zero-width space
+    assert(HeaderNormalizer.normalize("HIOS\u00A0ID") == "hios_id")             // non-breaking space
+    assert(HeaderNormalizer.normalize("HIOS ID\r") == "hios_id")                // carriage return
+    assert(HeaderNormalizer.normalize("HIOS ID\r\n") == "hios_id")
+  }
 }

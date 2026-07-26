@@ -59,18 +59,21 @@ object SecretProviders {
 
   def register(p: SecretProvider): Unit = providers.put(p.name.toLowerCase, p)
 
-  Seq(InlineSecretProvider, EnvSecretProvider, SysPropSecretProvider, FileSecretProvider)
-    .foreach(register)
+  Seq(InlineSecretProvider, EnvSecretProvider, SysPropSecretProvider, FileSecretProvider,
+    CyberArkSecretProvider).foreach(register)
 
   /** Resolves a secret reference at `path` in conf: object form with a
-    * `provider` field, or a bare string treated as inline. */
-  def resolveAt(conf: Config, path: String): Option[String] = {
+    * `provider` field, or a bare string treated as inline. `warnInline`
+    * controls the plaintext warning — user ids are provider-resolvable but
+    * not secret, so their bare form should not warn. */
+  def resolveAt(conf: Config, path: String, warnInline: Boolean = true): Option[String] = {
     if (!conf.hasPath(path)) return None
     conf.getValue(path).valueType() match {
       case com.typesafe.config.ConfigValueType.STRING =>
-        org.apache.log4j.Logger.getLogger(getClass.getName).warn(
-          s"[SecretProviders] '$path' is an inline plaintext secret; prefer a provider reference " +
-            "(env/file/sysprop) so credentials stay out of config files")
+        if (warnInline)
+          org.apache.log4j.Logger.getLogger(getClass.getName).warn(
+            s"[SecretProviders] '$path' is an inline plaintext secret; prefer a provider reference " +
+              "(env/file/sysprop/cyberark) so credentials stay out of config files")
         Some(conf.getString(path))
       case com.typesafe.config.ConfigValueType.OBJECT =>
         val ref = conf.getConfig(path)

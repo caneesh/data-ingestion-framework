@@ -135,7 +135,10 @@ object JdbcSourceConfig {
       columns = ConfigUtils.stringList(source, "columns"),
       where = ConfigUtils.optString(source, "where"),
       sql = sql,
-      user = ConfigUtils.optConfig(source, "auth").flatMap(a => ConfigUtils.optString(a, "user"))
+      // The user id resolves through the same provider chain as the password
+      // (CyberArk serves both from one vault object via `attribute`); a bare
+      // string stays a plain value and does not warn.
+      user = ConfigUtils.optConfig(source, "auth").flatMap(a => SecretProviders.resolveAt(a, "user", warnInline = false))
         .orElse(ConfigUtils.optString(source, "user")),
       password = ConfigUtils.optConfig(source, "auth").flatMap(a => SecretProviders.resolveAt(a, "password"))
         .orElse(SecretProviders.resolveAt(source, "password")),

@@ -214,6 +214,20 @@ class JdbcSourceConfigTest extends AnyFunSuite {
     assert(cfg.password.contains("s3cret"))
   }
 
+  test("auth.user resolves through secret providers too (vault-served user ids)") {
+    System.setProperty("jdbc.test.user", "svc_from_vault")
+    System.setProperty("jdbc.test.pwd2", "p2")
+    val cfg = parse(sqlServerBase +
+      """
+        |auth {
+        |  user = { provider = "sysprop", key = "jdbc.test.user" }
+        |  password = { provider = "sysprop", key = "jdbc.test.pwd2" }
+        |}
+      """.stripMargin)
+    assert(cfg.user.contains("svc_from_vault"))
+    assert(cfg.password.contains("p2"))
+  }
+
   test("explicit connection_properties override dialect defaults") {
     val cfg = parse(sqlServerBase +
       """connection_properties { encrypt = "false", applicationName = "ingest" }""")

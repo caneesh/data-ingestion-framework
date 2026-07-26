@@ -196,8 +196,15 @@ default. Four read modes: `FULL_TABLE`, `SELECT_QUERY` (projection + WHERE
 pushed into the database), `CUSTOM_SQL`, and `INCREMENTAL`.
 
 **Credentials** come from the secret-provider abstraction
-(`env` / `file` / `sysprop` / `inline`); plaintext inline secrets log a
-warning. URLs are masked in every log line.
+(`env` / `file` / `sysprop` / `inline` / `cyberark`); plaintext inline
+secrets log a warning. URLs are masked in every log line. The `cyberark`
+provider retrieves accounts from a CyberArk Central Credential Provider
+(CCP) — one vault object serves both the user id (`attribute = "UserName"`)
+and the password (`Content`, the default) from a single cached CCP call.
+Client-certificate authentication to CCP uses the standard JVM TLS keystore
+settings (`spark.driver.extraJavaOptions -Djavax.net.ssl.keyStore=...`);
+TLS verification is never disabled. `auth.user` accepts the same provider
+references as `auth.password`.
 
 **Incremental loading (bounded windows)**: `TIMESTAMP`, `NUMERIC`, or
 `COMPOSITE` (lexicographic multi-column) watermarks. Every incremental read

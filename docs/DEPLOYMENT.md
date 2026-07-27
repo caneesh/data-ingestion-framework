@@ -242,3 +242,43 @@ Metrics counters accumulate in-process via `JdbcMetrics`
 `jdbc_watermark_commit_total`, `jdbc_watermark_conflict_total`,
 `jdbc_schema_drift_total`, …). There is no built-in metrics backend — wire
 `JdbcMetrics.snapshot` into your metrics agent at the deployment boundary.
+
+## Production Acceptance Checklist
+
+- [ ] All Spark and Scala artifacts use the `_2.12` binary suffix; Java 11 build and runtime verified
+- [ ] Microsoft JDBC driver present on driver AND executors; missing driver fails fast (JDBC_001)
+- [ ] Partial partition configuration fails during startup (all-four-or-none, bounds, `max_partitions`)
+- [ ] Permanent SQL errors (auth, syntax, missing objects, unknown) are never retried
+- [ ] Transient Azure SQL errors use bounded exponential backoff with jitter
+- [ ] Documentation does not claim `DataFrameReader.load()` retries executor reads (three-layer model)
+- [ ] Incremental queries use a captured, stable upper watermark
+- [ ] Timestamp ties resolved deterministically (composite tie-breaker or overlap + curated dedup)
+- [ ] Concurrent runs cannot independently advance the same watermark (JDBC_005 optimistic versioning)
+- [ ] Watermark commit occurs only after complete successful publication and reconciliation
+- [ ] Failed runs are restartable and idempotent (RAW run_id guard, unchanged watermark)
+- [ ] Full SQL and credential-bearing URLs are not logged (query hash by default; `diagnostics.log_sql` audited)
+- [ ] Azure SQL TLS certificate verification enabled (`encrypt=true`, `trustServerCertificate=false`)
+- [ ] Managed Identity / approved secret storage in use; no plaintext credentials in HOCON or logs
+- [ ] Executor-to-Azure-SQL firewall requirements documented and validated (executor probe if needed)
+- [ ] Custom SQL restricted (single SELECT, no semicolons/DDL/DML) and audited via query hash
+- [ ] Source and target counts reconcile (`ingest_reconciliation`)
+- [ ] SQL Server Testcontainers integration tests pass where Docker is available
+- [ ] Operations runbook reviewed by the production support team
+
+## Source Consistency Assumptions
+
+The framework provides a *bounded, reproducible* extraction window — not a
+transactionally consistent snapshot. During a long parallel read, different
+partitions may observe the source at slightly different instants within the
+window. If stronger guarantees are required, provide them at the database:
+
+| Mechanism | What it gives you |
+|-----------|-------------------|
+| Bounded watermark window (built in) | No rows silently enter/leave the window mid-extraction |
+| `READ_COMMITTED_SNAPSHOT` on the database | Readers never block/dirty-read writers |
+| `SNAPSHOT` isolation + snapshot view | Point-in-time consistency across partitions |
+| Source-generated batch id column | Extraction keyed to producer-defined batches |
+| Source snapshot table | Full control of what a "batch" contains |
+
+Do not claim transactional consistency for a feed unless one of the
+database-side mechanisms is actually in place.

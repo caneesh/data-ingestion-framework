@@ -31,7 +31,11 @@ object JdbcSource extends Source with WatermarkAdvancing {
 
   /** Extraction window observed at read time, keyed by entity, consumed by
     * advanceWatermark after a successful publish in the same driver JVM. */
-  private final case class ReadWindow(lower: WatermarkValue, capturedUpper: Option[WatermarkValue], version: Long)
+  private final case class ReadWindow(
+    lower: WatermarkValue,
+    capturedUpper: Option[WatermarkValue],
+    version: Long,
+    queryHash: Option[String] = None)
   private val readWindows = new java.util.concurrent.ConcurrentHashMap[String, ReadWindow]()
 
   override def sourceType: String = "jdbc"
@@ -50,6 +54,9 @@ object JdbcSource extends Source with WatermarkAdvancing {
       JdbcHealthCheck.executorProbe(spark, cfg, n)
     }
 
+    var contextLower: Option[String] = None
+    var contextUpper: Option[String] = None
+
     val watermarkPredicate = cfg.watermark.map { wm =>
       val entity = entityKey(sourceConf, cfg)
       val store = WatermarkStores.from(wm, spark)
@@ -60,6 +67,8 @@ object JdbcSource extends Source with WatermarkAdvancing {
       // Bounded window: capture the source's upper watermark BEFORE the read
       val upper = captureUpper(cfg, wm)
       readWindows.put(entity, ReadWindow(lower, upper, version))
+      contextLower = Some(lower.serialized)
+      contextUpper = upper.map(_.serialized)
 
       val predicate = upper match {
         case Some(u) => Watermarks.boundedPredicate(wm, cfg.dialect, lower, u)
@@ -70,8 +79,25 @@ object JdbcSource extends Source with WatermarkAdvancing {
       predicate
     }
 
-    val dbtable = QueryBuilder.dbtable(cfg, watermarkPredicate)
-    logQuery(cfg, dbtable)
+    // Dynamic parameter sources resolve against the read-time context (the
+    // pipeline injects run_id; watermark values exist only for incremental)
+    val parameterContext = com.hcsc.generic.ingest.jdbc.query.ParameterContext(
+      runId = ConfigUtils.optString(sourceConf, "run_id"),
+      processingDate = Some(java.time.LocalDate.now.toString),
+      lastWatermark = contextLower,
+      upperWatermark = contextUpper,
+      pipelineParameters = cfg.pipelineParameters
+    )
+    val resolvedParameters = cfg.parameters.map(_.resolve(parameterContext))
+
+    val dbtable = QueryBuilder.dbtable(cfg, watermarkPredicate, resolvedParameters)
+    val queryHash = logQuery(cfg, dbtable)
+    // Attach the executed-query hash to the window so the watermark commit
+    // can persist it (full run reconstruction from the history table)
+    cfg.watermark.foreach { _ =>
+      readWindows.computeIfPresent(entityKey(sourceConf, cfg),
+        (_, w) => w.copy(queryHash = Some(queryHash)))
+    }
 
     // Retry layering: this wrapper protects DRIVER-side plan construction and
     // schema retrieval only. Executor partition reads are retried by Spark
@@ -207,7 +233,7 @@ object JdbcSource extends Source with WatermarkAdvancing {
   /** Sanitized by default: query hash + structure, never literals (watermark
     * values and business predicates can carry PII). Full SQL only under
     * diagnostics.log_sql = true. */
-  private def logQuery(cfg: JdbcSourceConfig, dbtable: String): Unit = {
+  private def logQuery(cfg: JdbcSourceConfig, dbtable: String): String = {
     val hash = java.security.MessageDigest.getInstance("SHA-256")
       .digest(dbtable.getBytes("UTF-8")).map("%02x".format(_)).mkString.take(12)
     logger.info(s"[JdbcSource] dialect=${cfg.dialect.name} mode=${cfg.mode} " +
@@ -216,6 +242,7 @@ object JdbcSource extends Source with WatermarkAdvancing {
       s"partitions=${cfg.partitioning.numPartitions.getOrElse(1)}")
     if (cfg.logSql)
       logger.info(s"[JdbcSource] DIAGNOSTIC (diagnostics.log_sql=true) dbtable=$dbtable")
+    hash
   }
 
   /** JDBC schema drift handling via the shared contract system: canonical
@@ -277,8 +304,11 @@ object JdbcSource extends Source with WatermarkAdvancing {
         case None =>
           logger.info(s"[JdbcSource] entity=$entity nothing beyond current watermark; not advanced")
         case Some(next) =>
+          val detail = com.hcsc.generic.ingest.jdbc.watermark.WatermarkCommitDetail(
+            lower = Some(lower.serialized),
+            queryHash = window.flatMap(_.queryHash))
           try {
-            store.recordIfVersion(entity, next, runId, version)
+            store.recordIfVersion(entity, next, runId, version, detail)
             JdbcMetrics.increment("jdbc_watermark_commit_total")
           } catch {
             case e: com.hcsc.generic.ingest.jdbc.watermark.WatermarkConflictException =>

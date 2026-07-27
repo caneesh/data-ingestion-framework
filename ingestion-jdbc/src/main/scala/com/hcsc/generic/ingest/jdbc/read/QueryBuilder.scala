@@ -1,7 +1,7 @@
 package com.hcsc.generic.ingest.jdbc.read
 
 import com.hcsc.generic.ingest.jdbc.{JdbcMode, JdbcSourceConfig}
-import com.hcsc.generic.ingest.jdbc.query.{QueryTemplate, SqlStatementValidator}
+import com.hcsc.generic.ingest.jdbc.query.{QueryParameter, QueryTemplate, SqlStatementValidator}
 
 /**
   * Builds the Spark `dbtable` expression for each read mode from the
@@ -18,8 +18,22 @@ object QueryBuilder {
 
   private val TablePattern = "[A-Za-z0-9_.$#]+"
 
-  def dbtable(cfg: JdbcSourceConfig, watermarkPredicate: Option[String]): String = {
+  def dbtable(
+    cfg: JdbcSourceConfig,
+    watermarkPredicate: Option[String],
+    resolvedParameters: Seq[QueryParameter] = Seq.empty
+  ): String = {
     cfg.table.foreach(validateTableName)
+
+    // Callers resolve dynamic parameter sources (RUN_ID, watermarks, ...)
+    // and pass them in; direct/standalone use resolves static sources only.
+    def parameters: Seq[QueryParameter] =
+      if (resolvedParameters.nonEmpty) resolvedParameters
+      else cfg.parameters.map(_.resolveStatic())
+
+    def renderTemplated(sql: String): String =
+      if (cfg.parameters.isEmpty) sql
+      else QueryTemplate.render(sql, parameters, cfg.dialect)
 
     cfg.mode match {
       case JdbcMode.FullTable =>
@@ -32,13 +46,16 @@ object QueryBuilder {
         s"(${SqlStatementValidator.validate(cfg.sql.get)}) src"
 
       case JdbcMode.SqlTemplate =>
-        val rendered = QueryTemplate.render(cfg.sql.get, cfg.parameters, cfg.dialect)
+        val rendered = QueryTemplate.render(cfg.sql.get, parameters, cfg.dialect)
         s"(${SqlStatementValidator.validate(rendered)}) src"
 
       case JdbcMode.Incremental =>
         val base = (cfg.table, cfg.sql) match {
           case (Some(t), _)    => s"SELECT ${projection(cfg)} FROM $t"
-          case (None, Some(s)) => s"SELECT * FROM (${SqlStatementValidator.validate(s)}) base"
+          case (None, Some(s)) =>
+            // Incremental custom bases support :name parameters too (incl.
+            // LAST_WATERMARK / UPPER_WATERMARK from the read context)
+            s"SELECT * FROM (${SqlStatementValidator.validate(renderTemplated(s))}) base"
           case _ =>
             throw new IllegalArgumentException("JDBC_003 INCREMENTAL requires table or sql")
         }

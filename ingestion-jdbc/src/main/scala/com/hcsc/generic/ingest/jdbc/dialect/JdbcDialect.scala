@@ -55,9 +55,23 @@ trait JdbcDialect {
         case "false" => booleanFalseLiteral
         case other   => throw new IllegalArgumentException(s"JDBC_003 literal '$other' is not a valid BOOLEAN")
       }
+    case "DATETIMEOFFSET" =>
+      try {
+        val v = value.trim
+        val odt =
+          try java.time.OffsetDateTime.parse(v)
+          catch { case _: java.time.format.DateTimeParseException =>
+            java.time.OffsetDateTime.parse(v,
+              java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss[.SSS] XXX")) }
+        "'" + odt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS XXX")) + "'"
+      } catch { case _: java.time.format.DateTimeParseException =>
+        throw new IllegalArgumentException(
+          s"JDBC_003 literal '$value' is not a valid DATETIMEOFFSET (ISO-8601 or 'yyyy-MM-dd HH:mm:ss[.SSS] +HH:MM')") }
+    case "NULL" => "NULL"
     case other =>
       throw new IllegalArgumentException(
-        s"JDBC_003 Unknown parameter type '$other'; expected STRING, NUMBER, TIMESTAMP, DATE or BOOLEAN")
+        s"JDBC_003 Unknown parameter type '$other'; expected STRING, NUMBER, TIMESTAMP, DATE, " +
+          "DATETIMEOFFSET, BOOLEAN or NULL")
   }
 
   protected def booleanTrueLiteral: String = "TRUE"

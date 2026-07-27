@@ -131,7 +131,7 @@ class QueryModelTest extends AnyFunSuite {
         |  { name = "inline_p", type = "STRING", value = "v1" },
         |  { name = "secret_p", type = "STRING", from = { provider = "sysprop", key = "query.param.test" } }
         |]""".stripMargin))
-    assert(params.map(_.value) == Seq("v1", "resolved-secret"))
+    assert(params.map(_.resolveStatic().value) == Seq("v1", "resolved-secret"))
 
     intercept[IllegalArgumentException] {
       QueryParameter.parseAll(ConfigFactory.parseString(

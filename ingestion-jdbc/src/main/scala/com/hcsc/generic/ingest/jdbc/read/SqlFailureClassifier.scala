@@ -16,7 +16,10 @@ object SqlFailureClassifier {
   case object TransientService extends Category { val retryable = true }
   case object Throttling extends Category { val retryable = true }
   case object Deadlock extends Category { val retryable = true }
-  case object Timeout extends Category { val retryable = true }
+  case object Timeout extends Category { val retryable = true } // query timeout
+  /** Lock wait timeout (SQL Server 1222): retry only where explicitly
+    * approved — blind retries can pile onto a blocked resource. */
+  case object LockTimeout extends Category { val retryable = false }
   case object Authentication extends Category { val retryable = false }
   case object Authorization extends Category { val retryable = false }
   case object SqlSyntax extends Category { val retryable = false }
@@ -29,6 +32,7 @@ object SqlFailureClassifier {
   private val SqlServerThrottling = Set(40501, 10928, 10929, 49918, 49919, 49920)
   private val SqlServerTransient = Set(4060, 40197, 40613, 40143, 233, 64)
   private val SqlServerDeadlock = Set(1205)
+  private val SqlServerLockTimeout = Set(1222)
   private val SqlServerTimeout = Set(-2)
   private val SqlServerAuthFailed = Set(18456, 18452)
   private val SqlServerObjectMissing = Set(208, 2812)
@@ -56,6 +60,7 @@ object SqlFailureClassifier {
     // Vendor codes first: most specific signal
     if (SqlServerThrottling.contains(vendor)) Throttling
     else if (SqlServerDeadlock.contains(vendor)) Deadlock
+    else if (SqlServerLockTimeout.contains(vendor)) LockTimeout
     else if (SqlServerTimeout.contains(vendor)) Timeout
     else if (SqlServerAuthFailed.contains(vendor)) Authentication
     else if (SqlServerObjectMissing.contains(vendor)) ObjectNotFound

@@ -126,6 +126,9 @@ object Watermarks {
         case WatermarkType.RowVersion =>
           val reduced = parseRowVersion(value) - BigInt(amount.toBigInt.bigInteger)
           "%016X".format(if (reduced < 0) BigInt(0) else reduced)
+        case WatermarkType.StringType =>
+          throw new IllegalArgumentException(
+            "JDBC_004 overlap is not supported for STRING watermarks (no arithmetic ordering)")
         case _ =>
           val ts = parseTimestamp(value)
           new java.sql.Timestamp(ts.getTime - (amount * 1000).toLong).toString
@@ -139,6 +142,7 @@ object Watermarks {
     case WatermarkType.Date           => s"'${parseDate(value).toString}'"
     case WatermarkType.DatetimeOffset => s"'${formatOffset(parseOffset(value))}'"
     case WatermarkType.RowVersion     => "0x%016X".format(parseRowVersion(value))
+    case WatermarkType.StringType     => "'" + value.replace("'", "''") + "'"
     case _                            => s"'${parseTimestamp(value).toString}'"
   }
 
@@ -147,6 +151,7 @@ object Watermarks {
     case WatermarkType.Date           => parseDate(a).compareTo(parseDate(b))
     case WatermarkType.DatetimeOffset => parseOffset(a).compareTo(parseOffset(b))
     case WatermarkType.RowVersion     => parseRowVersion(a).compare(parseRowVersion(b))
+    case WatermarkType.StringType     => a.compareTo(b) // lexicographic; approval-gated
     case _                            => parseTimestamp(a).compareTo(parseTimestamp(b))
   }
 

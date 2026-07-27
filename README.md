@@ -287,9 +287,13 @@ string `columns` render exactly as before.
 
 ### Azure Authentication
 
-`auth.type`: `SQL_PASSWORD` (default), `AZURE_MANAGED_IDENTITY`
-(+`client_id`), `AZURE_SERVICE_PRINCIPAL` (`client_id` + secret-backed
-`client_secret`), `ENTRA_ID_PASSWORD`, `ACCESS_TOKEN` (secret-backed).
+`auth.type` (pluggable via `JdbcAuthenticationProviders.register`):
+`SQL_PASSWORD` (default), `MANAGED_IDENTITY` (+`client_id`),
+`ENTRA_SERVICE_PRINCIPAL` (`client_id` + secret-backed `client_secret`),
+`ENTRA_PASSWORD`, `ENTRA_DEFAULT` (DefaultAzureCredential chain),
+`ENTRA_INTEGRATED` (Kerberos/Windows), `ACCESS_TOKEN` (secret-backed) —
+legacy alias names remain accepted. Incompatible fields are rejected and
+provider-resolved secrets must be non-blank.
 Azure modes map onto Microsoft JDBC driver properties
 (`authentication=ActiveDirectoryMSI` etc. — the driver performs the token
 flows; no Azure SDK required) and are sqlserver-only. Prefer MSI/service

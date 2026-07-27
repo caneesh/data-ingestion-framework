@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS ingest_audit.ingest_watermarks (
   run_id            STRING,
   watermark_version BIGINT,   -- optimistic concurrency: commits verify the
                               -- version observed at read (JDBC_005 conflicts)
+  lower_value       STRING,   -- window lower bound at read time
+  query_hash        STRING,   -- hash of the executed extraction query
   updated_ts        TIMESTAMP
 ) STORED AS ORC;
 

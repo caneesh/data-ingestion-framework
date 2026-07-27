@@ -21,8 +21,9 @@ object WatermarkType {
   val Date = "DATE"
   val DatetimeOffset = "DATETIMEOFFSET"
   val RowVersion = "ROWVERSION"
+  val StringType = "STRING" // approval-gated: lexicographic ordering only
   val Composite = "COMPOSITE"
-  val scalar = Seq(Timestamp, Numeric, Date, DatetimeOffset, RowVersion)
+  val scalar = Seq(Timestamp, Numeric, Date, DatetimeOffset, RowVersion, StringType)
   val all = scalar :+ Composite
 }
 
@@ -87,7 +88,8 @@ final case class JdbcSourceConfig(
   projections: Seq[com.hcsc.generic.ingest.jdbc.query.QueryProjection] = Seq.empty,
   structuredColumns: Boolean = false,
   filters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryFilter] = Seq.empty,
-  parameters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameter] = Seq.empty,
+  parameters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameterDef] = Seq.empty,
+  pipelineParameters: Map[String, String] = Map.empty,
   executorProbePartitions: Option[Int] = None
 )
 
@@ -230,6 +232,8 @@ object JdbcSourceConfig {
       structuredColumns = structuredColumns,
       filters = filters,
       parameters = parameters,
+      pipelineParameters = ConfigUtils.optConfig(source, "pipeline_parameters")
+        .map(c => ConfigUtils.stringMap(c.atKey("p"), "p")).getOrElse(Map.empty),
       executorProbePartitions = ConfigUtils.optConfig(source, "health_check")
         .filter(h => ConfigUtils.optBoolean(h, "executor_probe").getOrElse(false))
         .map(h => ConfigUtils.optInt(h, "probe_partitions").getOrElse(2))
@@ -237,72 +241,23 @@ object JdbcSourceConfig {
   }
 
   /**
-    * Azure-native authentication for SQL Server / Azure SQL, mapped onto
-    * Microsoft JDBC driver properties (no Azure SDK required; the driver
-    * performs the token flows):
-    *   SQL_PASSWORD             user + password (any dialect)
-    *   AZURE_MANAGED_IDENTITY   authentication=ActiveDirectoryMSI (+ msiClientId)
-    *   AZURE_SERVICE_PRINCIPAL  authentication=ActiveDirectoryServicePrincipal
-    *   ENTRA_ID_PASSWORD        authentication=ActiveDirectoryPassword
-    *   ACCESS_TOKEN             accessToken property (secret-backed)
-    * Token lifecycle note: executor connections re-authenticate through the
-    * driver; a pre-fetched ACCESS_TOKEN can expire during long jobs — prefer
-    * MSI/service principal for long extractions.
+    * Authentication resolves through the pluggable provider registry
+    * (auth.JdbcAuthenticationProviders): SQL_PASSWORD, MANAGED_IDENTITY,
+    * ENTRA_SERVICE_PRINCIPAL, ENTRA_PASSWORD, ENTRA_DEFAULT,
+    * ENTRA_INTEGRATED, ACCESS_TOKEN (plus legacy aliases). Azure/Entra modes
+    * map onto Microsoft JDBC driver properties; the driver performs the
+    * token flows on driver AND executors.
     */
   private def resolveAuth(source: Config, dialect: JdbcDialect): (String, Option[String], Option[String], Map[String, String]) = {
     val auth = ConfigUtils.optConfig(source, "auth")
-    val authType = auth.flatMap(a => ConfigUtils.optString(a, "type"))
-      .getOrElse(AuthType.SqlPassword).toUpperCase
-    if (!AuthType.all.contains(authType))
-      fail(s"auth.type '$authType' must be one of ${AuthType.all.mkString(", ")}")
+    val requested = auth.flatMap(a => ConfigUtils.optString(a, "type")).getOrElse(AuthType.SqlPassword)
+    val provider = com.hcsc.generic.ingest.jdbc.auth.JdbcAuthenticationProviders.resolve(requested)
 
-    def requireSqlServer(): Unit =
-      if (dialect.name != "sqlserver")
-        fail(s"auth.type $authType is only supported for the sqlserver dialect")
+    if (provider.requiresSqlServerDialect && dialect.name != "sqlserver")
+      fail(s"auth.type ${provider.authenticationType} is only supported for the sqlserver dialect")
 
-    authType match {
-      case AuthType.SqlPassword =>
-        // The user id resolves through the same provider chain as the
-        // password (CyberArk serves both from one vault object via
-        // `attribute`); a bare string stays a plain value and does not warn.
-        val user = auth.flatMap(a => SecretProviders.resolveAt(a, "user", warnInline = false))
-          .orElse(ConfigUtils.optString(source, "user"))
-        val password = auth.flatMap(a => SecretProviders.resolveAt(a, "password"))
-          .orElse(SecretProviders.resolveAt(source, "password"))
-        (authType, user, password, Map.empty)
-
-      case AuthType.AzureManagedIdentity =>
-        requireSqlServer()
-        val props = Map("authentication" -> "ActiveDirectoryMSI") ++
-          auth.flatMap(a => ConfigUtils.optString(a, "client_id")).map("msiClientId" -> _)
-        (authType, None, None, props)
-
-      case AuthType.AzureServicePrincipal =>
-        requireSqlServer()
-        val a = auth.getOrElse(fail("auth block required for AZURE_SERVICE_PRINCIPAL"))
-        val clientId = ConfigUtils.optString(a, "client_id")
-          .orElse(SecretProviders.resolveAt(a, "client_id_secret"))
-          .getOrElse(fail("auth.client_id (or client_id_secret) is required for AZURE_SERVICE_PRINCIPAL"))
-        val clientSecret = SecretProviders.resolveAt(a, "client_secret")
-          .getOrElse(fail("auth.client_secret is required for AZURE_SERVICE_PRINCIPAL"))
-        (authType, Some(clientId), Some(clientSecret),
-          Map("authentication" -> "ActiveDirectoryServicePrincipal"))
-
-      case AuthType.EntraIdPassword =>
-        requireSqlServer()
-        val a = auth.getOrElse(fail("auth block required for ENTRA_ID_PASSWORD"))
-        val user = ConfigUtils.optString(a, "user").getOrElse(fail("auth.user is required for ENTRA_ID_PASSWORD"))
-        val password = SecretProviders.resolveAt(a, "password")
-          .getOrElse(fail("auth.password is required for ENTRA_ID_PASSWORD"))
-        (authType, Some(user), Some(password), Map("authentication" -> "ActiveDirectoryPassword"))
-
-      case AuthType.AccessToken =>
-        requireSqlServer()
-        val a = auth.getOrElse(fail("auth block required for ACCESS_TOKEN"))
-        val token = SecretProviders.resolveAt(a, "token")
-          .getOrElse(fail("auth.token secret reference is required for ACCESS_TOKEN"))
-        (authType, None, None, Map("accessToken" -> token))
-    }
+    val resolved = provider.resolve(auth, source)
+    (provider.authenticationType, resolved.user, resolved.password, resolved.properties)
   }
 
   private def parseWatermark(source: Config): WatermarkConfig = {
@@ -331,6 +286,13 @@ object JdbcSourceConfig {
         types
       case t => Seq(t)
     }
+
+    // STRING watermarks (lexicographic ordering only) are easy to misuse —
+    // approve explicitly per feed.
+    if (columnTypes.contains(WatermarkType.StringType) &&
+        !ConfigUtils.optBoolean(inc, "allow_string_watermark").getOrElse(false))
+      fail("STRING watermarks compare lexicographically and are only safe for zero-padded / " +
+        "fixed-format keys; set incremental.allow_string_watermark = true to approve")
 
     // A timestamp-only watermark with no overlap can miss rows sharing the
     // boundary timestamp (equal-timestamp inserts after commit). Require a

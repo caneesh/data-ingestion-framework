@@ -14,6 +14,12 @@ final class WatermarkConflictException(entity: String, expected: Long, actual: L
 /** A committed watermark with its optimistic-concurrency version. */
 final case class VersionedWatermark(value: WatermarkValue, version: Long)
 
+/** Extraction-window metadata persisted with each commit so every run can be
+  * reconstructed: the lower bound the window started from and the hash of
+  * the executed query. */
+final case class WatermarkCommitDetail(lower: Option[String], queryHash: Option[String])
+object WatermarkCommitDetail { val empty = WatermarkCommitDetail(None, None) }
+
 /**
   * Persistence for watermark history. Append-only (full advancement history
   * stays auditable) with an optimistic version: commits verify the version
@@ -27,7 +33,13 @@ trait WatermarkStore {
   /** Compare-and-set append: expectedVersion must equal the current stored
     * version (0 = nothing stored yet) or WatermarkConflictException is
     * thrown. */
-  def recordIfVersion(entity: String, value: WatermarkValue, runId: String, expectedVersion: Long): Unit
+  def recordIfVersion(
+    entity: String,
+    value: WatermarkValue,
+    runId: String,
+    expectedVersion: Long,
+    detail: WatermarkCommitDetail = WatermarkCommitDetail.empty
+  ): Unit
 
   /** Unconditional append (tests / manual repair). */
   def record(entity: String, value: WatermarkValue, runId: String): Unit =
@@ -63,46 +75,66 @@ final class HiveWatermarkStore(spark: SparkSession, database: String, table: Str
       .map(r => VersionedWatermark(WatermarkValue.deserialize(r.getString(0)), r.getLong(1)))
   }
 
-  override def recordIfVersion(entity: String, value: WatermarkValue, runId: String, expectedVersion: Long): Unit = {
+  override def recordIfVersion(
+    entity: String,
+    value: WatermarkValue,
+    runId: String,
+    expectedVersion: Long,
+    detail: WatermarkCommitDetail = WatermarkCommitDetail.empty
+  ): Unit = {
     import spark.implicits._
     spark.sql(s"CREATE DATABASE IF NOT EXISTS $database")
     spark.sql(
       s"""CREATE TABLE IF NOT EXISTS $fullTable (
          |  entity STRING, watermark_value STRING, run_id STRING,
-         |  watermark_version BIGINT, updated_ts TIMESTAMP
+         |  watermark_version BIGINT, lower_value STRING, query_hash STRING,
+         |  updated_ts TIMESTAMP
          |) USING ORC""".stripMargin)
 
     val current = latestVersioned(entity).map(_.version).getOrElse(0L)
     if (current != expectedVersion)
       throw new WatermarkConflictException(entity, expectedVersion, current)
 
-    Seq((entity, value.serialized, runId, expectedVersion + 1, new Timestamp(System.currentTimeMillis())))
-      .toDF("entity", "watermark_value", "run_id", "watermark_version", "updated_ts")
+    Seq((entity, value.serialized, runId, expectedVersion + 1,
+        detail.lower.orNull, detail.queryHash.orNull,
+        new Timestamp(System.currentTimeMillis())))
+      .toDF("entity", "watermark_value", "run_id", "watermark_version",
+        "lower_value", "query_hash", "updated_ts")
       .write.mode(SaveMode.Append).insertInto(fullTable)
   }
 }
 
 /** In-memory store for tests and local runs; genuinely atomic CAS. */
 object InMemoryWatermarkStore extends WatermarkStore {
-  private val history = new java.util.concurrent.ConcurrentHashMap[String, List[(VersionedWatermark, String)]]()
+  private val history =
+    new java.util.concurrent.ConcurrentHashMap[String, List[(VersionedWatermark, String, WatermarkCommitDetail)]]()
 
   override def latestVersioned(entity: String): Option[VersionedWatermark] =
     Option(history.get(entity)).flatMap(_.headOption).map(_._1)
 
-  override def recordIfVersion(entity: String, value: WatermarkValue, runId: String, expectedVersion: Long): Unit = {
+  override def recordIfVersion(
+    entity: String,
+    value: WatermarkValue,
+    runId: String,
+    expectedVersion: Long,
+    detail: WatermarkCommitDetail = WatermarkCommitDetail.empty
+  ): Unit = {
     var applied = false
     var observed = 0L
     history.compute(entity, (_, existing) => {
       val entries = Option(existing).getOrElse(Nil)
       observed = entries.headOption.map(_._1.version).getOrElse(0L)
       if (observed != expectedVersion) entries
-      else { applied = true; (VersionedWatermark(value, expectedVersion + 1), runId) :: entries }
+      else { applied = true; (VersionedWatermark(value, expectedVersion + 1), runId, detail) :: entries }
     })
     if (!applied) throw new WatermarkConflictException(entity, expectedVersion, observed)
   }
 
   def entries(entity: String): List[(WatermarkValue, String)] =
-    Option(history.get(entity)).getOrElse(Nil).map { case (vw, run) => (vw.value, run) }
+    Option(history.get(entity)).getOrElse(Nil).map { case (vw, run, _) => (vw.value, run) }
+
+  def latestDetail(entity: String): Option[WatermarkCommitDetail] =
+    Option(history.get(entity)).flatMap(_.headOption).map(_._3)
 
   def clear(): Unit = history.clear()
 }

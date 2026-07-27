@@ -216,10 +216,12 @@ final class IngestPipeline(
     rejectService: RejectService,
     intake: FileIntakeService
   ): RawOutcome = {
-    // Attach the schema contract for connector-side header resolution, and
-    // the entity name so stateful sources (JDBC watermarks) key their state.
+    // Attach the schema contract for connector-side header resolution, plus
+    // the entity name and run id so stateful sources (JDBC watermarks,
+    // RUN_ID query parameters) see the pipeline's execution context.
     var effectiveSource = sourceConf
       .withValue("entity", ConfigValueFactory.fromAnyRef(ctx.entity))
+      .withValue("run_id", ConfigValueFactory.fromAnyRef(ctx.runId))
     if (feedConf.hasPath("schema"))
       effectiveSource = effectiveSource.withValue("schema", feedConf.getValue("schema"))
 

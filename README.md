@@ -8,6 +8,7 @@ A configuration-driven, multi-source data ingestion framework built with Scala 2
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — build/assembly, spark-submit examples, JDBC driver and secret-provider deployment, Azure SQL notes.
 - [docs/OPERATIONS_RUNBOOK.md](docs/OPERATIONS_RUNBOOK.md) — production support: HDR/JDBC error catalog, watermark and quarantine recovery, restart/resume, stale-state cleanup.
 - [docs/CONFIG_GENERATOR.md](docs/CONFIG_GENERATOR.md) — interactive wizard that generates and dry-run-validates feed configurations (HOCON/JSON/YAML) for JDBC, file and Kafka sources.
+- [docs/RUNNING_CONFIG_GENERATOR.md](docs/RUNNING_CONFIG_GENERATOR.md) — step-by-step guide to running the generator: build, interactive/draft/non-interactive modes, using the output with spark-submit, git hygiene, troubleshooting.
 
 ## Architecture
 

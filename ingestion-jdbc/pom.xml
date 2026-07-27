@@ -38,6 +38,23 @@
       <artifactId>scalatest_${scala.binary.version}</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- Docker-gated SQL Server integration tests. Both test-scope: the
+         production mssql-jdbc driver is supplied at deploy time, and
+         Testcontainers spins up a real SQL Server only when Docker is
+         available (the suite CANCELS otherwise). Appended at the end of the
+         dependency list to minimize merge conflicts. -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>mssqlserver</artifactId>
+      <version>1.19.7</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.microsoft.sqlserver</groupId>
+      <artifactId>mssql-jdbc</artifactId>
+      <version>12.6.1.jre11</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>

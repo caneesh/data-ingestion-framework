@@ -1,6 +1,6 @@
 # SQL Server Authentication Audit
 
-Audit date: 2026-07-27 · Repo state: commit `17e159f` · Scope: complete
+Audit date: 2026-07-27 (line numbers refreshed after the hardening commit) · Repo state: commit `75e91bb` · Scope: complete
 codebase and all deployment configuration present in this repository.
 
 This document answers: **how does the application authenticate to SQL
@@ -56,12 +56,12 @@ methods and line numbers. Line numbers are accurate as of the commit above.
 
 | # | Finding | File | Class/Method | Configuration key or code | Explanation |
 |---|---------|------|--------------|---------------------------|-------------|
-| 1 | Spark read connection (driver + executors) | `ingestion-jdbc/.../JdbcSource.scala:117-137` | `JdbcSource.buildReader` | `.format("jdbc")`, `.option("user"/"password", ...)` (136-137); `Properties` path for PREDICATES (121-124) | The main extraction connections. Credentials come exclusively from `cfg.user`/`cfg.password` on the parsed config. |
+| 1 | Spark read connection (driver + executors) | `ingestion-jdbc/.../JdbcSource.scala:116-137` | `JdbcSource.buildReader` | `.format("jdbc")`, `.option("user"/"password", ...)` (136-137); `Properties` path for PREDICATES (120-123) | The main extraction connections. Credentials come exclusively from `cfg.user`/`cfg.password` on the parsed config. |
 | 2 | Driver-side health-check connection | `JdbcHealthCheck.scala:22` | `JdbcHealthCheck.check` | `DriverManager.getConnection(cfg.url, props)` | Pre-read probe; same `cfg.user`/`cfg.password` (lines 18-19). Enabled by default (`health_check.enabled`, `JdbcSourceConfig.scala:226-227`). |
 | 3 | Driver-side watermark/bounds queries | `DriverQueries.scala:25` | `DriverQueries.firstRow` | `DriverManager.getConnection(cfg.url, props)` | Upper-watermark capture and MIN/MAX bound discovery; same credential source (lines 22-23). |
 | 4 | Optional executor probe | `JdbcHealthCheck.scala:59-71` | `JdbcHealthCheck.executorProbe` | `java.sql.DriverManager.getConnection(url, p)` (65) | Only when `health_check.executor_probe = true`. Captures user/password in the Spark closure (lines 54-56). |
 | 5 | JDBC URL and driver | `JdbcSourceConfig.scala:99,109`; `JdbcDialect.scala:91-99` | `JdbcSourceConfig.parse`; `SqlServerDialect` | `source.url` (required); `source.driver` else `defaultDriver = "com.microsoft.sqlserver.jdbc.SQLServerDriver"` | Driver jar is **not** bundled — test-scope only in `ingestion-jdbc/pom.xml` ("Production JDBC drivers supplied at deploy time"). |
-| 6 | Auth mechanism selection | `JdbcSourceConfig.scala:251-260` | `resolveAuth` | `auth.type`, default `AuthType.SqlPassword` (253) | Delegates to `JdbcAuthenticationProviders.resolve`; result becomes `cfg.user`/`cfg.password`/`connectionProperties`. |
+| 6 | Auth mechanism selection | `JdbcSourceConfig.scala:283-292` | `resolveAuth` | `auth.type`, default `AuthType.SqlPassword` (285) | Delegates to `JdbcAuthenticationProviders.resolve`; result becomes `cfg.user`/`cfg.password`/`connectionProperties`. |
 | 7 | SQL username/password resolution | `JdbcAuthenticationProvider.scala:51-63` | `SqlPasswordAuth.resolve` | `auth.user` (58, provider-resolvable), `auth.password` (60), legacy `source.password` (61) | Both credentials go through `SecretProviders.resolveAt`. |
 | 8 | Azure AD modes | `JdbcAuthenticationProvider.scala:66-136` | `ManagedIdentityAuth` … `AccessTokenAuth` | driver props `authentication=ActiveDirectoryMSI/...ServicePrincipal/...Password/...Default/...Integrated`, `accessToken` | Token flows performed by the Microsoft driver on driver *and* executors; no Azure SDK involved. |
 | 9 | Secret provider registry (the fork point) | `SecretProvider.scala:57-109` | `SecretProviders.resolveRef/resolveAt` | `{ provider = "env"\|"file"\|"sysprop"\|"inline"\|"cyberark"\|"conjur"\|"azure_keyvault", ... }` | Registered at lines 66-80 (defensive). Bare strings = inline with warning (99-102). |
@@ -70,9 +70,9 @@ methods and line numbers. Line numbers are accurate as of the commit above.
 | 12 | **No active JDBC feed in shipped config** | `ingestion-app/src/main/resources/application.conf:201-289` | — | `# claims_data { ... type = "jdbc" ... cyberark ... }` | The entire JDBC + CyberArk example is commented. Stripping comments and grepping for `type = "jdbc"`, `cyberark` or `conjur` returns nothing. The active feed `health_sherpa_member` is `type = "file"` (lines 89-90). |
 | 13 | Config loading & precedence | `IngestMain.scala:24-29` | `IngestMain.main` | `--conf-path` else `ConfigFactory.load()`; feed = `feeds.<entity>` | `--conf-path` (explicit file) beats `-Dconfig.file` beats classpath `application.conf` (Typesafe Config standard). |
 | 14 | Deployment script | `scripts/run_health_sherpa.sh` | — | `--files "$CONF_FILE"`, `-Dconfig.file=...` on driver and executors, `--entity health_sherpa_member` | The only deployment artifact in the repo; runs the **file** feed. No credentials on the command line. |
-| 15 | TLS posture | `JdbcDialect.scala:94-98` | `SqlServerDialect.defaultConnectionProperties` | `encrypt=true`, `trustServerCertificate=false`, `loginTimeout=30` | Never disabled in code. ⚠️ Overridable: `connectionProperties = dialect defaults ++ authProps ++ source.connection_properties` (`JdbcSourceConfig.scala:220-222`) — a feed config *could* set `trustServerCertificate=true`. |
-| 16 | Secret logging | `JdbcSource.scala:236-245`; `JdbcHealthCheck.scala:75-76`; `CyberArkSecretProvider.scala:108`; `ConjurSecretProvider.scala:66` | `logQuery`, `sanitized` | SHA-256 query hash; `password=***` URL masking; vault logs name object/variable only | No plaintext credential logging found anywhere in main code. |
-| 17 | ⚠️ Secret-into-SQL diagnostic edge | `QueryModel.scala:72-73`; `JdbcSource.scala:243-244` | `QueryParameterDef.resolve` (`SECRET_PROVIDER` source); `logQuery` | `diagnostics.log_sql = true` | A query parameter sourced from `SECRET_PROVIDER` is rendered into the SQL text; the opt-in `log_sql` diagnostic would print it. |
+| 15 | TLS posture | `JdbcDialect.scala:94-98`; `JdbcSourceConfig.scala:220-221,250-272` | `SqlServerDialect.defaultConnectionProperties`; `userConnectionProperties` | `encrypt=true`, `trustServerCertificate=false`, `loginTimeout=30`; opt-in `allow_insecure_tls` | Never disabled in code. Downgrades via `connection_properties` (`trustServerCertificate` truthy / `encrypt` falsy) are **rejected with JDBC_003** unless `source.allow_insecure_tls = true`; approved downgrades log a loud warning (guard added in `75e91bb`). |
+| 16 | Secret logging | `JdbcSource.scala:236-252`; `JdbcHealthCheck.scala:75-76`; `CyberArkSecretProvider.scala:108`; `ConjurSecretProvider.scala:66` | `logQuery`, `sanitized` | SHA-256 query hash; `password=***` URL masking; vault logs name object/variable only | No plaintext credential logging found anywhere in main code. |
+| 17 | Secret-into-SQL diagnostic edge — guarded | `QueryModel.scala:72-73`; `JdbcSource.scala:243-257` | `QueryParameterDef.resolve` (`SECRET_PROVIDER` source); `logQuery`/`sqlDiagnosticsSafe` | `diagnostics.log_sql = true` | A `SECRET_PROVIDER` parameter is rendered into the SQL text, so `log_sql` is now **suppressed with a warning** whenever such a parameter exists (`sqlDiagnosticsSafe`, lines 255-257, added in `75e91bb`); the config generator's SQL preview masks these parameters as `'********'`. |
 | 18 | No hardcoded credentials | sweep of `ingestion-*/src/main` | — | regex `password\s*=\s*"..."` | Only constant *names* (`"SQL_PASSWORD"`). Inline values exist only in tests and the `inline` provider (flagged dev-only by a warning). |
 
 Ruled out from code alone: WebSphere/JNDI DataSources (no usage anywhere in
@@ -95,7 +95,7 @@ the repo).
    `entity`/`run_id` into the source config, resolves `source.type`
    (`"jdbc"`) from `SourceRegistry`, calls `JdbcSource.read`.
 4. **Parse + auth resolution** (`JdbcSource.scala:44` →
-   `JdbcSourceConfig.parse:98` → `resolveAuth:251`): `auth.type` (default
+   `JdbcSourceConfig.parse:98` → `resolveAuth:283`): `auth.type` (default
    `SQL_PASSWORD`) selects the provider; `SqlPasswordAuth.resolve`
    (`JdbcAuthenticationProvider.scala:54-63`) resolves `auth.user` and
    `auth.password` via `SecretProviders.resolveAt`.
@@ -173,7 +173,7 @@ Then check the driver logs for these value-free markers:
 Presence/absence of the vault lines is the definitive answer.
 
 Safe temporary debug (logs mechanism and provider *names* only), inserted in
-`JdbcSourceConfig.resolveAuth` after line 259:
+`JdbcSourceConfig.resolveAuth` after line 291:
 
 ```scala
 logger.info(s"[JdbcAuth] entity auth resolved: type=${provider.authenticationType} " +
@@ -188,14 +188,16 @@ logger.info(s"[JdbcAuth] entity auth resolved: type=${provider.authenticationTyp
 Both candidates from evidence rows 15 and 17 are now implemented (see
 `ConnectionHardeningTest` and `SecretPreviewMaskingTest`):
 
-1. **TLS-downgrade guard** (`JdbcSourceConfig.userConnectionProperties`):
+1. **TLS-downgrade guard** (`JdbcSourceConfig.userConnectionProperties`,
+   `JdbcSourceConfig.scala:250-272`):
    `connection_properties` entries that weaken TLS — `trustServerCertificate`
    set truthy or `encrypt` set falsy, matched case-insensitively — are
    rejected with `JDBC_003` unless the feed sets the explicit opt-in
    `source.allow_insecure_tls = true`, and even approved downgrades log a
    loud warning. Benign overrides and restating the secure values pass
    unchanged.
-2. **`log_sql` secret suppression** (`JdbcSource.sqlDiagnosticsSafe`): when
+2. **`log_sql` secret suppression** (`JdbcSource.sqlDiagnosticsSafe`,
+   `JdbcSource.scala:243-257`): when
    any query parameter uses the `SECRET_PROVIDER` source, the opt-in
    `diagnostics.log_sql = true` full-SQL diagnostic is suppressed with an
    explicit warning instead of printing SQL containing the secret literal.

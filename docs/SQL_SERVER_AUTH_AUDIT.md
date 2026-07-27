@@ -108,7 +108,7 @@ the repo).
    secrets are rejected (`JDBC_002`).
 6. **Connections:** health check (`JdbcHealthCheck.check:22`) → driver
    queries for watermark/bounds (`DriverQueries.firstRow:25`) → Spark reader
-   (`JdbcSource.buildReader:117-137`), where user/password become JDBC
+   (`JdbcSource.buildReader:116-137`), where user/password become JDBC
    options serialized to executors, which open the actual extraction
    connections. Optional executor probe (`JdbcHealthCheck.executorProbe:59-71`).
 7. **As shipped**, step 3 never reaches `JdbcSource`: the only active feed is

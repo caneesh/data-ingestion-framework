@@ -59,8 +59,25 @@ object SecretProviders {
 
   def register(p: SecretProvider): Unit = providers.put(p.name.toLowerCase, p)
 
-  Seq(InlineSecretProvider, EnvSecretProvider, SysPropSecretProvider, FileSecretProvider,
-    CyberArkSecretProvider, AzureKeyVaultSecretProvider).foreach(register)
+  // Defensive registration: a provider whose class cannot link (e.g. an
+  // optional SDK missing from the classpath) must not take down the whole
+  // registry — it is simply unavailable, and resolving it reports the
+  // standard unknown-provider error listing what IS available.
+  Seq[() => SecretProvider](
+    () => InlineSecretProvider,
+    () => EnvSecretProvider,
+    () => SysPropSecretProvider,
+    () => FileSecretProvider,
+    () => CyberArkSecretProvider,
+    () => AzureKeyVaultSecretProvider
+  ).foreach { p =>
+    try register(p())
+    catch {
+      case e: NoClassDefFoundError =>
+        org.apache.log4j.Logger.getLogger(getClass.getName).warn(
+          s"[SecretProviders] Skipping a provider whose dependencies are not on the classpath: ${e.getMessage}")
+    }
+  }
 
   /** Resolves an object-form secret reference ({ provider = ..., key/path/value }). */
   def resolveRef(ref: Config): String = {

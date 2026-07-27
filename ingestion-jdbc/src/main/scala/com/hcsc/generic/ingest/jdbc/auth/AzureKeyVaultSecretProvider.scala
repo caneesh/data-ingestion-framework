@@ -125,31 +125,53 @@ object AzureKeyVaultSecretProvider extends SecretProvider {
       s"[AzureKeyVault] Retrieving secret '${spec.secretName}'" +
         spec.secretVersion.map(v => s"@$v").getOrElse("") + s" from ${spec.vaultUrl}")
     try {
-      import com.azure.identity.DefaultAzureCredentialBuilder
-      import com.azure.security.keyvault.secrets.SecretClientBuilder
+      // Reflection, deliberately: direct SDK calls put Azure types into this
+      // class's bytecode signatures, and the JVM verifier then links them at
+      // CLASS LOAD (registry initialization) — breaking every consumer that
+      // does not bundle the optional Azure jars. Reflective calls keep the
+      // SDK truly load-on-first-use.
+      val credentialBuilderCls = Class.forName("com.azure.identity.DefaultAzureCredentialBuilder")
+      val credential = credentialBuilderCls.getMethod("build")
+        .invoke(credentialBuilderCls.getDeclaredConstructor().newInstance())
 
-      val client = new SecretClientBuilder()
-        .vaultUrl(spec.vaultUrl)
-        .credential(new DefaultAzureCredentialBuilder().build())
-        .buildClient()
+      val builderCls = Class.forName("com.azure.security.keyvault.secrets.SecretClientBuilder")
+      val tokenCredentialCls = Class.forName("com.azure.core.credential.TokenCredential")
+      var builder = builderCls.getDeclaredConstructor().newInstance()
+      builder = builderCls.getMethod("vaultUrl", classOf[String]).invoke(builder, spec.vaultUrl)
+      builder = builderCls.getMethod("credential", tokenCredentialCls).invoke(builder, credential)
+      val client = builderCls.getMethod("buildClient").invoke(builder)
 
       val secret = spec.secretVersion match {
-        case Some(version) => client.getSecret(spec.secretName, version)
-        case None          => client.getSecret(spec.secretName)
+        case Some(version) =>
+          client.getClass.getMethod("getSecret", classOf[String], classOf[String])
+            .invoke(client, spec.secretName, version)
+        case None =>
+          client.getClass.getMethod("getSecret", classOf[String])
+            .invoke(client, spec.secretName)
       }
 
-      val value = secret.getValue
+      val value = secret.getClass.getMethod("getValue").invoke(secret).asInstanceOf[String]
       if (value == null)
         throw new IllegalArgumentException(
           s"JDBC_002 azure_keyvault secret '${spec.secretName}' in ${spec.vaultUrl} has no value")
       value
     } catch {
       case e: IllegalArgumentException => throw e
-      case e: NoClassDefFoundError =>
+      case e @ (_: ClassNotFoundException | _: NoClassDefFoundError) =>
         throw new IllegalArgumentException(
           "JDBC_002 azure_keyvault provider requires the Azure SDK, but it is not on the classpath; " +
             "bundle azure-security-keyvault-secrets and azure-identity with the deployment. " +
             s"(missing class: ${e.getMessage})")
+      case e: java.lang.reflect.InvocationTargetException =>
+        val cause = Option(e.getCause).getOrElse(e)
+        cause match {
+          case iae: IllegalArgumentException if iae.getMessage != null && iae.getMessage.startsWith("JDBC_") =>
+            throw iae
+          case _ =>
+            throw new IllegalArgumentException(
+              s"JDBC_002 azure_keyvault failed to retrieve secret '${spec.secretName}' from " +
+                s"${spec.vaultUrl}: ${sanitize(cause)}", cause)
+        }
       case e: Throwable =>
         // Never surface the raw exception message verbatim to guarantee no
         // token/credential material leaks; report class + secret identity only.

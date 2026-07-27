@@ -2,6 +2,12 @@
 
 A configuration-driven, multi-source data ingestion framework built with Scala 2.11 and Spark 2.3.
 
+## Documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — module map, data flow, extension points, and enforced invariants.
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — build/assembly, spark-submit examples, JDBC driver and secret-provider deployment, Azure SQL notes.
+- [docs/OPERATIONS_RUNBOOK.md](docs/OPERATIONS_RUNBOOK.md) — production support: HDR/JDBC error catalog, watermark and quarantine recovery, restart/resume, stale-state cleanup.
+
 ## Architecture
 
 This is a multi-module Maven project designed for extensibility:

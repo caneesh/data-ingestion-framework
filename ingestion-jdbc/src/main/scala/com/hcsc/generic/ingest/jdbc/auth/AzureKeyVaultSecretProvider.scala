@@ -30,10 +30,13 @@ import org.apache.log4j.Logger
   * JDBC_002 error explaining what to bundle rather than a raw
   * NoClassDefFoundError.
   *
-  * Retrieved secrets are memoized per JVM keyed by
+  * Retrieved secrets are cached per JVM keyed by
   * (vault_url, secret_name, secret_version) so repeated resolutions within a run
   * (e.g. driver plus multiple executor tasks in the same JVM) do not repeatedly
-  * hit the vault. `clearCache()` resets the cache for tests.
+  * hit the vault. The cache is TTL-bounded (`cache_ttl_ms`, default 300000;
+  * 0 disables caching) so long-lived JVMs pick up rotated secrets — the same
+  * caching contract as the CyberArk and Conjur providers. `clearCache()`
+  * resets the cache for tests.
   */
 object AzureKeyVaultSecretProvider extends SecretProvider {
   private val logger = Logger.getLogger(getClass.getName)
@@ -56,19 +59,40 @@ object AzureKeyVaultSecretProvider extends SecretProvider {
   )
 
   private final case class CacheKey(vaultUrl: String, secretName: String, secretVersion: Option[String])
-  private val cache = new java.util.concurrent.ConcurrentHashMap[CacheKey, String]()
+  private final case class CachedSecret(fetchedAt: Long, value: String)
+  private val cache = new java.util.concurrent.ConcurrentHashMap[CacheKey, CachedSecret]()
 
   /** Test hook: drop all memoized secrets. */
   private[auth] def clearCache(): Unit = cache.clear()
 
+  /** Test hook: inject a cache entry so TTL behavior is testable without the
+    * Azure SDK on the classpath (a live fetch is impossible in CI). */
+  private[auth] def seedCache(
+    vaultUrl: String,
+    secretName: String,
+    secretVersion: Option[String],
+    value: String,
+    fetchedAt: Long
+  ): Unit =
+    cache.put(CacheKey(vaultUrl.stripSuffix("/"), secretName, secretVersion),
+      CachedSecret(fetchedAt, value))
+
   override def resolve(conf: Config): String = {
     val spec = validate(conf)
     val key = CacheKey(spec.vaultUrl, spec.secretName, spec.secretVersion)
+    // TTL-bounded like the CyberArk/Conjur caches, so a rotated vault secret
+    // is picked up by long-lived JVMs; 0 disables caching entirely.
+    val ttlMs = ConfigUtils.optLong(conf, "cache_ttl_ms").getOrElse(300000L)
 
-    // True computeIfAbsent: concurrent threads in one JVM share a single
-    // fetch (per-key lock; the mapping function never returns null because
-    // fetch throws on every failure path).
-    cache.computeIfAbsent(key, _ => fetch(spec))
+    // Atomic TTL cache: compute holds the per-key lock so concurrent
+    // resolvers share one vault round-trip instead of racing check-then-put
+    // (the mapping function never returns null because fetch throws on every
+    // failure path).
+    if (ttlMs <= 0) fetch(spec)
+    else cache.compute(key, (_, existing) =>
+      if (existing != null && System.currentTimeMillis() - existing.fetchedAt < ttlMs) existing
+      else CachedSecret(System.currentTimeMillis(), fetch(spec))
+    ).value
   }
 
   private final case class SecretSpec(vaultUrl: String, secretName: String, secretVersion: Option[String])

@@ -57,6 +57,8 @@ class CyberArkSecretProviderTest extends AnyFunSuite with BeforeAndAfterAll {
     super.afterAll()
   }
 
+  // The stub AIM service is plain http, so every reference opts in via
+  // allow_insecure_http — mirroring how isolated dev setups would.
   private def reference(objectName: String, extra: String = ""): String =
     s"""
        |password = {
@@ -65,6 +67,7 @@ class CyberArkSecretProviderTest extends AnyFunSuite with BeforeAndAfterAll {
        |  app_id = "APP_Test"
        |  safe = "AAM_DB_Safe"
        |  object = "$objectName"
+       |  allow_insecure_http = true
        |  $extra
        |}
     """.stripMargin
@@ -108,11 +111,51 @@ class CyberArkSecretProviderTest extends AnyFunSuite with BeforeAndAfterAll {
 
   test("missing required reference fields fail with JDBC_003") {
     val ex = intercept[IllegalArgumentException] {
-      resolve(s"""password = {{ provider = "cyberark", url = "$baseUrl", safe = "s", object = "o" }}"""
-        .replace("{{", "{").replace("}}", "}"))
+      resolve((s"""password = {{ provider = "cyberark", url = "$baseUrl", safe = "s", object = "o", """ +
+        """allow_insecure_http = true }}""").replace("{{", "{").replace("}}", "}"))
     }
     assert(ex.getMessage.contains("JDBC_003"))
     assert(ex.getMessage.contains("app_id"))
+  }
+
+  test("plain http url is rejected without allow_insecure_http") {
+    val ex = intercept[IllegalArgumentException] {
+      resolve(
+        s"""password = {{ provider = "cyberark", url = "$baseUrl",
+           |  app_id = "APP_Test", safe = "AAM_DB_Safe", object = "db-cred" }}""".stripMargin
+          .replace("{{", "{").replace("}}", "}"))
+    }
+    assert(ex.getMessage.contains("JDBC_003"))
+    assert(ex.getMessage.contains("allow_insecure_http"))
+  }
+
+  test("plain http rejection happens before any credential request is sent") {
+    val before = Option(hitsByObject.get("gate-check")).map(_.toInt).getOrElse(0)
+    intercept[IllegalArgumentException] {
+      resolve(
+        s"""password = {{ provider = "cyberark", url = "$baseUrl",
+           |  app_id = "APP_Test", safe = "AAM_DB_Safe", object = "gate-check" }}""".stripMargin
+          .replace("{{", "{").replace("}}", "}"))
+    }
+    assert(Option(hitsByObject.get("gate-check")).map(_.toInt).getOrElse(0) == before,
+      "no HTTP request may reach CCP when the insecure-http gate rejects the reference")
+  }
+
+  test("allow_insecure_http = false behaves like the default (rejected)") {
+    val ex = intercept[IllegalArgumentException] {
+      resolve(reference("db-cred").replace("allow_insecure_http = true", "allow_insecure_http = false"))
+    }
+    assert(ex.getMessage.contains("JDBC_003"))
+    assert(ex.getMessage.contains("plain http"))
+  }
+
+  test("non-http(s) url is rejected with JDBC_003") {
+    val ex = intercept[IllegalArgumentException] {
+      resolve("""password = { provider = "cyberark", url = "ftp://ccp.example.com",
+        |  app_id = "a", safe = "s", object = "o" }""".stripMargin)
+    }
+    assert(ex.getMessage.contains("JDBC_003"))
+    assert(ex.getMessage.contains("http(s)"))
   }
 
   test("unreachable CCP fails with JDBC_002, not a raw connection exception") {

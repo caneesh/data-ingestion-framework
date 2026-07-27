@@ -36,7 +36,9 @@ import scala.collection.JavaConverters._
   * Optional fields: `folder` (CCP Folder), `params { ... }` (extra query
   * parameters such as Query/QueryFormat), `connect_timeout_ms` (default
   * 5000), `read_timeout_ms` (default 10000), `cache_ttl_ms` (default 300000;
-  * 0 disables caching).
+  * 0 disables caching). Plain-http urls are rejected unless
+  * `allow_insecure_http = true` (isolated dev only) — CCP responses carry
+  * the retrieved credential and must not transit unencrypted.
   *
   * Responses are cached per request URL for the TTL, so resolving user and
   * password from the same object costs a single CCP call per run.
@@ -83,10 +85,20 @@ object CyberArkSecretProvider extends SecretProvider {
       throw new IllegalArgumentException(s"JDBC_003 cyberark secret reference requires '$key'"))
 
     val base = required("url").stripSuffix("/")
-    if (base.startsWith("http://"))
-      logger.warn("[CyberArk] CCP url uses plain http; credentials will transit unencrypted — use https in production")
-    else if (!base.startsWith("https://"))
+    if (!base.startsWith("https://") && !base.startsWith("http://"))
       throw new IllegalArgumentException(s"JDBC_003 cyberark url '$base' must be an http(s) URL")
+    // CCP responses carry the retrieved credential: plain http ships it in
+    // cleartext. Rejected unless explicitly approved for isolated development
+    // setups (same gate as the Conjur provider).
+    if (base.startsWith("http://")) {
+      if (!ConfigUtils.optBoolean(conf, "allow_insecure_http").getOrElse(false))
+        throw new IllegalArgumentException(
+          s"JDBC_003 cyberark url '$base' uses plain http, which transmits retrieved credentials " +
+            "in cleartext; use https, or set allow_insecure_http = true only for isolated " +
+            "non-production environments")
+      logger.warn("[CyberArk] CCP url uses plain http (allow_insecure_http=true); " +
+        "credentials transit unencrypted — never use this outside isolated development")
+    }
 
     val params =
       Seq("AppID" -> required("app_id"), "Safe" -> required("safe"), "Object" -> required("object")) ++

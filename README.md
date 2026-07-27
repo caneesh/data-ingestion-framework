@@ -7,6 +7,7 @@ A configuration-driven, multi-source data ingestion framework built with Scala 2
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — module map, data flow, extension points, and enforced invariants.
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — build/assembly, spark-submit examples, JDBC driver and secret-provider deployment, Azure SQL notes.
 - [docs/OPERATIONS_RUNBOOK.md](docs/OPERATIONS_RUNBOOK.md) — production support: HDR/JDBC error catalog, watermark and quarantine recovery, restart/resume, stale-state cleanup.
+- [docs/CONFIG_GENERATOR.md](docs/CONFIG_GENERATOR.md) — interactive wizard that generates and dry-run-validates feed configurations (HOCON/JSON/YAML) for JDBC, file and Kafka sources.
 
 ## Architecture
 
@@ -17,6 +18,7 @@ data-ingestion-framework/
 ├── ingestion-core/      # Core abstractions, utilities, and shared components
 ├── ingestion-file/      # File-based source connector (CSV, JSON, Parquet, etc.)
 ├── ingestion-jdbc/      # JDBC source connector (SQL Server, DB2, Oracle, etc.)
+├── ingestion-config-gen/  # Interactive feed configuration generator (CLI wizard)
 ├── ingestion-kafka/     # Kafka streaming source connector
 └── ingestion-app/       # Main application entry point
 ```

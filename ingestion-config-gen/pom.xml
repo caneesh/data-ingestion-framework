@@ -9,42 +9,32 @@
     <version>1.0.0-SNAPSHOT</version>
   </parent>
 
-  <artifactId>ingestion-app</artifactId>
-  <name>Ingestion Application</name>
-  <description>Main application entry point that bundles all connectors</description>
+  <artifactId>ingestion-config-gen</artifactId>
+  <name>Ingestion Configuration Generator</name>
+  <description>Interactive CLI wizard that generates and validates feed configurations
+    (HOCON/JSON/YAML) by reusing the framework's own config parsers</description>
 
   <dependencies>
     <dependency>
       <groupId>com.hcsc.generic</groupId>
       <artifactId>ingestion-core</artifactId>
     </dependency>
-    <dependency>
-      <groupId>com.hcsc.generic</groupId>
-      <artifactId>ingestion-file</artifactId>
-    </dependency>
+    <!-- Reused for dry-run validation, SQL preview and connectivity tests.
+         The JDBC classes touched (JdbcSourceConfig, QueryBuilder,
+         JdbcHealthCheck) never load Spark classes, so the wizard runs on a
+         plain JVM; schema-contract validation needs Spark types and degrades
+         to a warning when they are absent (see DryRunValidator). -->
     <dependency>
       <groupId>com.hcsc.generic</groupId>
       <artifactId>ingestion-jdbc</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>com.hcsc.generic</groupId>
-      <artifactId>ingestion-kafka</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>com.hcsc.generic</groupId>
-      <artifactId>ingestion-config-gen</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.scala-lang</groupId>
-      <artifactId>scala-library</artifactId>
     </dependency>
     <dependency>
       <groupId>org.apache.spark</groupId>
       <artifactId>spark-sql_${scala.binary.version}</artifactId>
     </dependency>
     <dependency>
-      <groupId>org.apache.spark</groupId>
-      <artifactId>spark-hive_${scala.binary.version}</artifactId>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
     </dependency>
     <dependency>
       <groupId>com.typesafe</groupId>
@@ -76,27 +66,6 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-assembly-plugin</artifactId>
-        <configuration>
-          <descriptorRefs>
-            <descriptorRef>jar-with-dependencies</descriptorRef>
-          </descriptorRefs>
-          <archive>
-            <manifest>
-              <mainClass>com.hcsc.generic.ingest.app.IngestMain</mainClass>
-            </manifest>
-          </archive>
-        </configuration>
-        <executions>
-          <execution>
-            <id>make-assembly</id>
-            <phase>package</phase>
-            <goals><goal>single</goal></goals>
-          </execution>
-        </executions>
       </plugin>
     </plugins>
   </build>

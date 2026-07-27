@@ -16,6 +16,7 @@
     <module>ingestion-file</module>
     <module>ingestion-jdbc</module>
     <module>ingestion-kafka</module>
+    <module>ingestion-config-gen</module>
     <module>ingestion-app</module>
   </modules>
 
@@ -73,6 +74,11 @@
       <dependency>
         <groupId>com.hcsc.generic</groupId>
         <artifactId>ingestion-kafka</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.hcsc.generic</groupId>
+        <artifactId>ingestion-config-gen</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>

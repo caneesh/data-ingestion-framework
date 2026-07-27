@@ -1,6 +1,6 @@
 # Data Ingestion Framework
 
-A configuration-driven, multi-source data ingestion framework built with Scala 2.11 and Spark 2.3.
+A configuration-driven, multi-source data ingestion framework built with Scala 2.12, Spark 3.5 and Java 11.
 
 ## Documentation
 

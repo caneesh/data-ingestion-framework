@@ -30,16 +30,16 @@ class WatermarkCodecsTest extends AnyFunSuite {
   test("DATETIMEOFFSET: offset-aware parsing, literal and overlap in seconds") {
     val v = WatermarkValue(Seq("2026-03-15 10:00:00.000 +05:00"))
     val p = Watermarks.predicate(cfg(WatermarkType.DatetimeOffset), SqlServerDialect, v)
-    assert(p == "[wm] > '2026-03-15 10:00:00.000 +05:00'")
+    assert(p == "[wm] > '2026-03-15 10:00:00.0000000 +05:00'")
 
     // ISO-8601 input is accepted too
     val iso = Watermarks.predicate(cfg(WatermarkType.DatetimeOffset), SqlServerDialect,
       WatermarkValue(Seq("2026-03-15T10:00:00+05:00")))
-    assert(iso == "[wm] > '2026-03-15 10:00:00.000 +05:00'")
+    assert(iso == "[wm] > '2026-03-15 10:00:00.0000000 +05:00'")
 
     val overlapped = Watermarks.predicate(cfg(WatermarkType.DatetimeOffset, Some(BigDecimal(3600))),
       SqlServerDialect, v)
-    assert(overlapped == "[wm] > '2026-03-15 09:00:00.000 +05:00'")
+    assert(overlapped == "[wm] > '2026-03-15 09:00:00.0000000 +05:00'")
 
     // Offset participates in ordering: 10:00+05:00 == 05:00Z < 06:00Z
     assert(Watermarks.compare(cfg(WatermarkType.DatetimeOffset),

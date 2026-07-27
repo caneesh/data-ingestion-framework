@@ -68,6 +68,16 @@ object QueryBuilder {
     else if (cfg.columns.nonEmpty) cfg.columns.mkString(", ")
     else "*"
 
+  /**
+    * WHERE clause from every configured filter (structured filters plus the
+    * legacy `where`, which parses into an expression filter) — EXACTLY as the
+    * extraction query applies them. Driver-side companion queries (upper
+    * watermark capture, MIN/MAX bound discovery) must use this so they scope
+    * to the same row set the read extracts; scoping only to `cfg.where`
+    * captures bounds across rows that are never extracted.
+    */
+  def filterWhereClause(cfg: JdbcSourceConfig): String = whereClause(cfg, None)
+
   /** SELECT_QUERY keeps the historical plain rendering for a lone legacy
     * where; anything structured (or multiple predicates) renders each
     * predicate parenthesized and AND-combined. */

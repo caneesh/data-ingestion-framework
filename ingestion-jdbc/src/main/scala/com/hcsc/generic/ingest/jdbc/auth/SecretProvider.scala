@@ -86,7 +86,15 @@ object SecretProviders {
     val provider = Option(providers.get(providerName.toLowerCase)).getOrElse(
       throw new IllegalArgumentException(
         s"JDBC_002 Unknown secret provider '$providerName'. Available: ${availableNames.mkString(", ")}"))
-    provider.resolve(ref)
+    val value = provider.resolve(ref)
+    // A store returning blank is a misconfiguration (empty vault attribute,
+    // env var set to whitespace) that would otherwise flow silently into a
+    // credential or SQL literal. Only an explicit inline value may be blank
+    // (e.g. a local database with no password).
+    if (!providerName.equalsIgnoreCase("inline") && value.trim.isEmpty)
+      throw new IllegalArgumentException(
+        s"JDBC_002 Secret provider '$providerName' resolved to an empty value")
+    value
   }
 
   /** Resolves a secret reference at `path` in conf: object form with a

@@ -72,9 +72,9 @@ class DynamicParametersTest extends AnyFunSuite {
 
   test("DATETIMEOFFSET and NULL literal types render correctly") {
     assert(GenericDialect.renderLiteral("DATETIMEOFFSET", "2026-03-15T10:00:00+05:00") ==
-      "'2026-03-15 10:00:00.000 +05:00'")
+      "'2026-03-15 10:00:00.0000000 +05:00'")
     assert(SqlServerDialect.renderLiteral("DATETIMEOFFSET", "2026-03-15 10:00:00.000 +05:00") ==
-      "'2026-03-15 10:00:00.000 +05:00'")
+      "'2026-03-15 10:00:00.0000000 +05:00'")
     assert(GenericDialect.renderLiteral("NULL", "anything") == "NULL")
     intercept[IllegalArgumentException] {
       GenericDialect.renderLiteral("DATETIMEOFFSET", "2026-03-15 10:00:00") // no offset

@@ -66,13 +66,25 @@ final class HiveWatermarkStore(spark: SparkSession, database: String, table: Str
   override def latestVersioned(entity: String): Option[VersionedWatermark] = {
     if (!spark.catalog.tableExists(fullTable)) return None
     import org.apache.spark.sql.functions._
-    spark.table(fullTable)
+    val top = spark.table(fullTable)
       .filter(col("entity") === entity)
-      .orderBy(col("watermark_version").desc)
+      .orderBy(col("watermark_version").desc, col("updated_ts").desc)
       .select("watermark_value", "watermark_version")
+      .limit(2)
       .collect()
-      .headOption
-      .map(r => VersionedWatermark(WatermarkValue.deserialize(r.getString(0)), r.getLong(1)))
+    top.headOption.map { row =>
+      // Hive's version check is best-effort (non-transactional): two racing
+      // commits can both land at the same version. Detect it, pick the most
+      // recent commit deterministically, and alarm — the losing run's window
+      // may need replay.
+      if (top.length > 1 && top(1).getLong(1) == row.getLong(1))
+        org.apache.log4j.Logger.getLogger(classOf[HiveWatermarkStore].getName).warn(
+          s"[HiveWatermarkStore] entity=$entity has MULTIPLE commits at watermark_version=" +
+            s"${row.getLong(1)}: concurrent runs raced past the best-effort version check. " +
+            "Using the most recent updated_ts; audit both run windows and serialize " +
+            "executions per entity (or use a transactional store).")
+      VersionedWatermark(WatermarkValue.deserialize(row.getString(0)), row.getLong(1))
+    }
   }
 
   override def recordIfVersion(

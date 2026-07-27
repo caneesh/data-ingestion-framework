@@ -61,12 +61,13 @@ trait JdbcDialect {
         val odt =
           try java.time.OffsetDateTime.parse(v)
           catch { case _: java.time.format.DateTimeParseException =>
-            java.time.OffsetDateTime.parse(v,
-              java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss[.SSS] XXX")) }
-        "'" + odt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS XXX")) + "'"
+            java.time.OffsetDateTime.parse(v, JdbcDialect.OffsetLiteralParse) }
+        // Rendered at DATETIMEOFFSET(7) precision so predicates never
+        // truncate a boundary value (input accepts 0-9 fractional digits).
+        "'" + odt.format(JdbcDialect.OffsetLiteralFormat) + "'"
       } catch { case _: java.time.format.DateTimeParseException =>
         throw new IllegalArgumentException(
-          s"JDBC_003 literal '$value' is not a valid DATETIMEOFFSET (ISO-8601 or 'yyyy-MM-dd HH:mm:ss[.SSS] +HH:MM')") }
+          s"JDBC_003 literal '$value' is not a valid DATETIMEOFFSET (ISO-8601 or 'yyyy-MM-dd HH:mm:ss[.fffffff] +HH:MM')") }
     case "NULL" => "NULL"
     case other =>
       throw new IllegalArgumentException(
@@ -85,6 +86,21 @@ trait JdbcDialect {
     * watermark capture. */
   def selectTopOne(projection: String, from: String, orderBy: String): String =
     s"SELECT $projection FROM $from ORDER BY $orderBy FETCH FIRST 1 ROWS ONLY"
+}
+
+object JdbcDialect {
+  /** DATETIMEOFFSET literal formats: emit all 7 fractional digits (SQL
+    * Server DATETIMEOFFSET(7)), accept any input precision up to 9. */
+  private[dialect] val OffsetLiteralFormat = new java.time.format.DateTimeFormatterBuilder()
+    .appendPattern("yyyy-MM-dd HH:mm:ss")
+    .appendFraction(java.time.temporal.ChronoField.NANO_OF_SECOND, 7, 7, true)
+    .appendPattern(" xxx") // always +00:00, never 'Z' (SQL Server literal safety)
+    .toFormatter
+  private[dialect] val OffsetLiteralParse = new java.time.format.DateTimeFormatterBuilder()
+    .appendPattern("yyyy-MM-dd HH:mm:ss")
+    .appendFraction(java.time.temporal.ChronoField.NANO_OF_SECOND, 0, 9, true)
+    .appendPattern(" XXX")
+    .toFormatter
 }
 
 object SqlServerDialect extends JdbcDialect {

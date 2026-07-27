@@ -171,8 +171,21 @@ object Watermarks {
     catch { case _: java.time.format.DateTimeParseException =>
       throw new IllegalArgumentException(s"JDBC_004 Watermark value '$value' is not a date (expected yyyy-MM-dd)") }
 
-  private val OffsetFormat = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS XXX")
-  private val OffsetParse = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss[.SSS] XXX")
+  // SQL Server DATETIMEOFFSET(7) carries 100ns precision: format with all 7
+  // fractional digits (truncating to milliseconds excluded the true max row
+  // from every bounded window, deferring it to the next run); parse accepts
+  // any precision from 0 to 9 digits so previously stored 3-digit values
+  // keep round-tripping.
+  private[jdbc] val OffsetFormat = new java.time.format.DateTimeFormatterBuilder()
+    .appendPattern("yyyy-MM-dd HH:mm:ss")
+    .appendFraction(java.time.temporal.ChronoField.NANO_OF_SECOND, 7, 7, true)
+    .appendPattern(" xxx") // always +00:00, never 'Z' (SQL Server literal safety)
+    .toFormatter
+  private val OffsetParse = new java.time.format.DateTimeFormatterBuilder()
+    .appendPattern("yyyy-MM-dd HH:mm:ss")
+    .appendFraction(java.time.temporal.ChronoField.NANO_OF_SECOND, 0, 9, true)
+    .appendPattern(" XXX")
+    .toFormatter
 
   private def parseOffset(value: String): java.time.OffsetDateTime = {
     val v = value.trim
@@ -182,11 +195,13 @@ object Watermarks {
       catch { case _: java.time.format.DateTimeParseException =>
         throw new IllegalArgumentException(
           s"JDBC_004 Watermark value '$value' is not a datetimeoffset " +
-            "(expected ISO-8601 or 'yyyy-MM-dd HH:mm:ss[.SSS] +HH:MM')") }
+            "(expected ISO-8601 or 'yyyy-MM-dd HH:mm:ss[.fffffff] +HH:MM')") }
     }
   }
 
-  private def formatOffset(value: java.time.OffsetDateTime): String = value.format(OffsetFormat)
+  /** Shared with DriverQueries.stringify so captured uppers keep the full
+    * DATETIMEOFFSET(7) precision. */
+  private[jdbc] def formatOffset(value: java.time.OffsetDateTime): String = value.format(OffsetFormat)
 
   /** SQL Server rowversion: 8-byte binary, stored as hex (0x prefix optional),
     * compared as an unsigned big integer. */

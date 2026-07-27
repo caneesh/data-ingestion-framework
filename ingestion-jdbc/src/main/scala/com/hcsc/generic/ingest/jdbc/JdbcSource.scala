@@ -29,8 +29,10 @@ import org.apache.spark.sql.functions.lit
 object JdbcSource extends Source with WatermarkAdvancing {
   private val logger = Logger.getLogger(getClass.getName)
 
-  /** Extraction window observed at read time, keyed by entity, consumed by
-    * advanceWatermark after a successful publish in the same driver JVM. */
+  /** Extraction window observed at read time, keyed by (entity, run id) via
+    * windowKey so concurrent runs of one entity cannot overwrite each other;
+    * consumed by advanceWatermark after a successful publish in the same
+    * driver JVM. */
   private final case class ReadWindow(
     lower: WatermarkValue,
     capturedUpper: Option[WatermarkValue],
@@ -57,6 +59,8 @@ object JdbcSource extends Source with WatermarkAdvancing {
     var contextLower: Option[String] = None
     var contextUpper: Option[String] = None
 
+    val runId = ConfigUtils.optString(sourceConf, "run_id")
+
     val watermarkPredicate = cfg.watermark.map { wm =>
       val entity = entityKey(sourceConf, cfg)
       val store = WatermarkStores.from(wm, spark)
@@ -66,7 +70,7 @@ object JdbcSource extends Source with WatermarkAdvancing {
 
       // Bounded window: capture the source's upper watermark BEFORE the read
       val upper = captureUpper(cfg, wm)
-      readWindows.put(entity, ReadWindow(lower, upper, version))
+      readWindows.put(windowKey(entity, runId), ReadWindow(lower, upper, version))
       contextLower = Some(lower.serialized)
       contextUpper = upper.map(_.serialized)
 
@@ -82,7 +86,7 @@ object JdbcSource extends Source with WatermarkAdvancing {
     // Dynamic parameter sources resolve against the read-time context (the
     // pipeline injects run_id; watermark values exist only for incremental)
     val parameterContext = com.hcsc.generic.ingest.jdbc.query.ParameterContext(
-      runId = ConfigUtils.optString(sourceConf, "run_id"),
+      runId = runId,
       processingDate = Some(java.time.LocalDate.now.toString),
       lastWatermark = contextLower,
       upperWatermark = contextUpper,
@@ -95,7 +99,7 @@ object JdbcSource extends Source with WatermarkAdvancing {
     // Attach the executed-query hash to the window so the watermark commit
     // can persist it (full run reconstruction from the history table)
     cfg.watermark.foreach { _ =>
-      readWindows.computeIfPresent(entityKey(sourceConf, cfg),
+      readWindows.computeIfPresent(windowKey(entityKey(sourceConf, cfg), runId),
         (_, w) => w.copy(queryHash = Some(queryHash)))
     }
 
@@ -166,7 +170,9 @@ object JdbcSource extends Source with WatermarkAdvancing {
       case (None, Some(s)) => s"($s) base"
       case _ => return None
     }
-    val whereClause = cfg.where.map(w => s" WHERE $w").getOrElse("")
+    // Same filter scope as the extraction query, so discovered strides track
+    // the rows that will actually be read (not the whole table).
+    val whereClause = QueryBuilder.filterWhereClause(cfg)
     val quoted = cfg.dialect.quoteQualified(column)
     val sql = s"SELECT MIN($quoted), MAX($quoted) FROM $baseFrom$whereClause"
 
@@ -212,7 +218,10 @@ object JdbcSource extends Source with WatermarkAdvancing {
       case (None, Some(s)) => s"($s) base"
       case _ => throw new IllegalArgumentException("JDBC_003 INCREMENTAL requires table or sql")
     }
-    val whereClause = cfg.where.map(w => s" WHERE $w").getOrElse("")
+    // Must match the extraction query's filters (structured + legacy where):
+    // capturing MAX over unfiltered rows advances the watermark past rows the
+    // filtered read never extracts — permanent silent data loss.
+    val whereClause = QueryBuilder.filterWhereClause(cfg)
 
     val sql =
       if (wm.columns.size == 1)
@@ -297,7 +306,12 @@ object JdbcSource extends Source with WatermarkAdvancing {
     val cfg = JdbcSourceConfig.parse(sourceConf)
     cfg.watermark.foreach { wm =>
       val store = WatermarkStores.from(wm, spark)
-      val window = Option(readWindows.remove(entity))
+      // Windows are keyed per (entity, run) so concurrent runs of the same
+      // entity in one JVM cannot commit each other's captured upper. The
+      // bare-entity fallback covers standalone reads whose config carried no
+      // run_id (the pipeline always injects one).
+      val window = Option(readWindows.remove(windowKey(entity, Some(runId))))
+        .orElse(Option(readWindows.remove(windowKey(entity, None))))
 
       val (lower, version) = window match {
         case Some(w) => (w.lower, w.version)
@@ -336,6 +350,10 @@ object JdbcSource extends Source with WatermarkAdvancing {
 
   /** Watermark identity: the pipeline injects the feed entity; direct users
     * may set incremental.watermark_name; last resort is the table name. */
+  /** readWindows key: entity + run id (empty for standalone reads). */
+  private def windowKey(entity: String, runId: Option[String]): String =
+    s"$entity|${runId.getOrElse("")}"
+
   private def entityKey(sourceConf: Config, cfg: JdbcSourceConfig): String =
     ConfigUtils.optString(sourceConf, "entity")
       .orElse(ConfigUtils.optConfig(sourceConf, "incremental")

@@ -63,22 +63,20 @@ object CyberArkSecretProvider extends SecretProvider {
     val connectMs = ConfigUtils.optInt(conf, "connect_timeout_ms").getOrElse(5000)
     val readMs = ConfigUtils.optInt(conf, "read_timeout_ms").getOrElse(10000)
 
-    val fields = cached(requestUrl, ttlMs).getOrElse {
-      val fetched = fetch(requestUrl, connectMs, readMs)
-      if (ttlMs > 0) cache.put(requestUrl, CachedResponse(System.currentTimeMillis(), fetched))
-      fetched
-    }
+    // Atomic TTL cache: compute holds the per-key lock so concurrent
+    // resolvers share one CCP round-trip instead of racing check-then-put.
+    val fields =
+      if (ttlMs <= 0) fetch(requestUrl, connectMs, readMs)
+      else cache.compute(requestUrl, (_, existing) =>
+        if (existing != null && System.currentTimeMillis() - existing.fetchedAt < ttlMs) existing
+        else CachedResponse(System.currentTimeMillis(), fetch(requestUrl, connectMs, readMs))
+      ).fields
 
     fields.getOrElse(attribute,
       throw new IllegalArgumentException(
         s"JDBC_002 CyberArk response has no attribute '$attribute'; " +
           s"available attributes: ${fields.keys.toSeq.sorted.mkString(", ")}"))
   }
-
-  private def cached(requestUrl: String, ttlMs: Long): Option[Map[String, String]] =
-    Option(cache.get(requestUrl))
-      .filter(c => ttlMs > 0 && System.currentTimeMillis() - c.fetchedAt < ttlMs)
-      .map(_.fields)
 
   private def buildRequestUrl(conf: Config): String = {
     def required(key: String): String = ConfigUtils.optString(conf, key).getOrElse(

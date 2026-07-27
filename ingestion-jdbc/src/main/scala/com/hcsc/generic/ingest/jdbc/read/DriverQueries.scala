@@ -44,7 +44,9 @@ object DriverQueries {
     case t: java.sql.Timestamp => t.toString
     case d: java.sql.Date => d.toString
     case odt: java.time.OffsetDateTime =>
-      odt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS XXX"))
+      // Full DATETIMEOFFSET(7) precision — millisecond truncation here
+      // excluded the captured-max row from its own bounded window.
+      com.hcsc.generic.ingest.jdbc.watermark.Watermarks.formatOffset(odt)
     case bytes: Array[Byte] => bytes.map("%02X".format(_)).mkString
     case other => String.valueOf(other)
   }

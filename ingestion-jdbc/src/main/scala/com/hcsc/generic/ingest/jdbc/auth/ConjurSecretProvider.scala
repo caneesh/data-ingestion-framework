@@ -50,8 +50,7 @@ object ConjurSecretProvider extends SecretProvider {
     val variable = required("variable")
     val ttlMs = ConfigUtils.optLong(conf, "cache_ttl_ms").getOrElse(300000L)
 
-    val cacheKey = s"$baseUrl|$account|$variable"
-    cached(cacheKey, ttlMs).getOrElse {
+    def fetchValue(): String = {
       val client = new ConjurClient(ConjurConfig(
         baseUrl = baseUrl,
         account = account,
@@ -63,15 +62,22 @@ object ConjurSecretProvider extends SecretProvider {
 
       logger.info(s"[Conjur] Fetching variable '$variable' (account=$account, $baseUrl)")
       client.getSecret(variable) match {
-        case Right(value) =>
-          if (ttlMs > 0) cache.put(cacheKey, CachedSecret(System.currentTimeMillis(), value))
-          value
+        case Right(value) => value
         case Left(error) =>
           throw new IllegalArgumentException(
             s"JDBC_002 Conjur variable '$variable' could not be retrieved: ${error.message}",
             error.cause.orNull)
       }
     }
+
+    // Atomic TTL cache: compute holds the per-key lock so concurrent
+    // resolvers share one Conjur round-trip instead of racing check-then-put.
+    val cacheKey = s"$baseUrl|$account|$variable"
+    if (ttlMs <= 0) fetchValue()
+    else cache.compute(cacheKey, (_, existing) =>
+      if (existing != null && System.currentTimeMillis() - existing.fetchedAt < ttlMs) existing
+      else CachedSecret(System.currentTimeMillis(), fetchValue())
+    ).value
   }
 
   /** The host API key is itself a secret: object form resolves through the
@@ -91,8 +97,4 @@ object ConjurSecretProvider extends SecretProvider {
     }
   }
 
-  private def cached(key: String, ttlMs: Long): Option[String] =
-    Option(cache.get(key))
-      .filter(c => ttlMs > 0 && System.currentTimeMillis() - c.fetchedAt < ttlMs)
-      .map(_.value)
 }

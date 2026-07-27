@@ -65,13 +65,10 @@ object AzureKeyVaultSecretProvider extends SecretProvider {
     val spec = validate(conf)
     val key = CacheKey(spec.vaultUrl, spec.secretName, spec.secretVersion)
 
-    // computeIfAbsent so concurrent executor threads in one JVM share a single
-    // fetch. null return from the mapping function is avoided by throwing.
-    Option(cache.get(key)).getOrElse {
-      val value = fetch(spec)
-      cache.put(key, value)
-      value
-    }
+    // True computeIfAbsent: concurrent threads in one JVM share a single
+    // fetch (per-key lock; the mapping function never returns null because
+    // fetch throws on every failure path).
+    cache.computeIfAbsent(key, _ => fetch(spec))
   }
 
   private final case class SecretSpec(vaultUrl: String, secretName: String, secretVersion: Option[String])

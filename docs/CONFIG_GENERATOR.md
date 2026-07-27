@@ -65,8 +65,9 @@ plain CSV names become minimal `string` columns you can refine later.
 
 Credentials are captured as **references**, never values (unless you
 explicitly choose `inline`, which is flagged as testing-only): `env`,
-`sysprop`, `file`, `cyberark` (CCP url/app-id/safe/object) and
-`azure_keyvault` (vault url/secret name). Dry-run validation substitutes
+`sysprop`, `file`, `cyberark` (CCP url/app-id/safe/object), `conjur`
+(base url/account/host id/variable, with the host API key referenced from an
+environment variable) and `azure_keyvault` (vault url/secret name). Dry-run validation substitutes
 placeholders for secret references so a config generated on a workstation
 validates without production credentials; whether the reference resolves in
 *this* environment is reported as a warning, and `--connect-test` performs the

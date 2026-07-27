@@ -69,6 +69,7 @@ object SecretProviders {
     () => SysPropSecretProvider,
     () => FileSecretProvider,
     () => CyberArkSecretProvider,
+    () => ConjurSecretProvider,
     () => AzureKeyVaultSecretProvider
   ).foreach { p =>
     try register(p())

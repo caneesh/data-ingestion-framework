@@ -142,7 +142,7 @@ writing any data.
 Generated configs are meant to be version-controlled. Two rules:
 
 1. **Never commit inline secrets.** Choose `env`, `sysprop`, `file`,
-   `cyberark` or `azure_keyvault` as the secret provider; the config then
+   `cyberark`, `conjur` or `azure_keyvault` as the secret provider; the config then
    contains only references. The `inline` provider is for local testing and
    is flagged as such by the wizard.
 2. Review the printed masked summary, then:

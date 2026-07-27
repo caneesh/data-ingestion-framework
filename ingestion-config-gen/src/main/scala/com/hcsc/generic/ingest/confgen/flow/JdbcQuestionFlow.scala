@@ -18,7 +18,7 @@ object JdbcQuestionFlow extends SourceQuestionFlow {
   private val Modes = Seq("FULL_TABLE", "SELECT_QUERY", "CUSTOM_SQL", "SQL_TEMPLATE", "INCREMENTAL")
   private val Dialects = Seq("", "sqlserver", "postgresql", "oracle", "db2", "mysql", "generic")
   private val WatermarkTypes = Seq("TIMESTAMP", "NUMERIC", "DATE", "DATETIMEOFFSET", "ROWVERSION", "STRING", "COMPOSITE")
-  private val SecretProviders = Seq("env", "sysprop", "file", "inline", "cyberark", "azure_keyvault")
+  private val SecretProviders = Seq("env", "sysprop", "file", "inline", "cyberark", "azure_keyvault", "conjur")
 
   private def authTypes: Seq[String] =
     com.hcsc.generic.ingest.jdbc.auth.JdbcAuthenticationProviders.availableNames.sorted
@@ -104,7 +104,24 @@ object JdbcQuestionFlow extends SourceQuestionFlow {
       help = "e.g. https://myvault.vault.azure.net",
       validate = V.nonEmpty, appliesWhen = a => secretProviderIs(a, "azure_keyvault")),
     Question("_auth.secret.secret_name", G.Authentication, "Key Vault secret name",
-      validate = V.nonEmpty, appliesWhen = a => secretProviderIs(a, "azure_keyvault"))
+      validate = V.nonEmpty, appliesWhen = a => secretProviderIs(a, "azure_keyvault")),
+    Question("_auth.secret.conjur_url", G.Authentication, "Conjur base URL",
+      help = "e.g. https://conjur.example.com",
+      validate = v => if (v.startsWith("https://") || v.startsWith("http://")) Right(v)
+        else Left(s"'$v' must be an http(s) URL"),
+      appliesWhen = a => secretProviderIs(a, "conjur")),
+    Question("_auth.secret.account", G.Authentication, "Conjur account",
+      validate = V.nonEmpty, appliesWhen = a => secretProviderIs(a, "conjur")),
+    Question("_auth.secret.host_id", G.Authentication, "Conjur host identity",
+      help = "e.g. data/ingestion/spark ('host/' prefix optional)",
+      validate = V.nonEmpty, appliesWhen = a => secretProviderIs(a, "conjur")),
+    Question("_auth.secret.api_key_env", G.Authentication,
+      "Environment variable holding the Conjur host API key",
+      help = "The API key is referenced, never stored in the config.",
+      validate = V.nonEmpty, appliesWhen = a => secretProviderIs(a, "conjur")),
+    Question("_auth.secret.variable", G.Authentication, "Conjur variable id",
+      help = "e.g. applications/ingestion/database/password",
+      validate = V.nonEmpty, appliesWhen = a => secretProviderIs(a, "conjur"))
   )
 
   private def extraction = Seq(

@@ -121,6 +121,16 @@ object ConfigAssembler {
           copy("url", "url"); copy("app_id", "app_id"); copy("safe", "safe"); copy("object", "object")
         case "azure_keyvault" =>
           copy("vault_url", "vault_url"); copy("secret_name", "secret_name")
+        case "conjur" =>
+          copy("conjur_url", "url"); copy("account", "account")
+          copy("host_id", "host_id"); copy("variable", "variable")
+          // The host API key is itself a secret: reference it, never store it.
+          answers.scalar("_auth.secret.api_key_env").foreach { envKey =>
+            val apiKeyRef = new java.util.LinkedHashMap[String, Object]()
+            apiKeyRef.put("provider", "env")
+            apiKeyRef.put("key", envKey)
+            ref.put("api_key", apiKeyRef)
+          }
         case _ =>
       }
       config = config.withValue(s"source.auth.$field", ConfigValueFactory.fromMap(ref))

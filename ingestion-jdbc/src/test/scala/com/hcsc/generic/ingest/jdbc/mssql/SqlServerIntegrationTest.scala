@@ -293,6 +293,7 @@ class SqlServerIntegrationTest
          |  user = "${container.getUsername}"
          |  password = { provider = "inline", value = "wrong-password-000" }
          |}
+         |allow_insecure_tls = true  # throwaway local container
          |connection_properties { encrypt = "false" }
          |table = "sys.tables"
          |mode = "SELECT_QUERY"

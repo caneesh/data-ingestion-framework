@@ -71,14 +71,21 @@ object DryRunValidator {
   }
 
   /** The extraction SQL exactly as QueryBuilder will emit it, with the first
-    * incremental window rendered from the configured initial value. */
+    * incremental window rendered from the configured initial value.
+    * Parameters sourced from a secret provider are masked — a preview is
+    * display output and must never fetch or render the actual secret. */
   private def sqlPreview(cfg: JdbcSourceConfig): String =
     Try {
       val predicate = cfg.watermark.map { wm =>
         Watermarks.predicate(wm, cfg.dialect,
           WatermarkValue(wm.initialValue.split("\\|").toSeq))
       }
-      QueryBuilder.dbtable(cfg, predicate)
+      val parameters = cfg.parameters.map { p =>
+        if (p.source == com.hcsc.generic.ingest.jdbc.query.ParameterSource.SecretProvider)
+          com.hcsc.generic.ingest.jdbc.query.QueryParameter(p.name, p.paramType, "********")
+        else p.resolveStatic()
+      }
+      QueryBuilder.dbtable(cfg, predicate, parameters)
     } match {
       case Success(dbtable) =>
         val body = stripAlias(dbtable)

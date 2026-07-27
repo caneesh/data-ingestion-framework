@@ -218,7 +218,7 @@ object JdbcSourceConfig {
       user = user,
       password = password,
       connectionProperties = dialect.defaultConnectionProperties ++ authProps ++
-        ConfigUtils.optConfig(source, "connection_properties").map(c => ConfigUtils.stringMap(c.atKey("p"), "p")).getOrElse(Map.empty),
+        userConnectionProperties(source),
       fetchSize = ConfigUtils.optInt(source, "fetchsize").getOrElse(1000),
       partitioning = partitioning,
       retry = retry,
@@ -238,6 +238,38 @@ object JdbcSourceConfig {
         .filter(h => ConfigUtils.optBoolean(h, "executor_probe").getOrElse(false))
         .map(h => ConfigUtils.optInt(h, "probe_partitions").getOrElse(2))
     )
+  }
+
+  /**
+    * connection_properties overlay the dialect defaults (rightmost wins), so
+    * a feed could silently disable the TLS protections the sqlserver dialect
+    * ships with (encrypt=true, trustServerCertificate=false). Downgrades are
+    * rejected unless the feed explicitly opts in with
+    * `allow_insecure_tls = true` — and even then they are logged loudly.
+    */
+  private def userConnectionProperties(source: Config): Map[String, String] = {
+    val props = ConfigUtils.optConfig(source, "connection_properties")
+      .map(c => ConfigUtils.stringMap(c.atKey("p"), "p")).getOrElse(Map.empty)
+
+    def truthy(v: String) = {
+      val t = v.trim.toLowerCase
+      t == "true" || t == "yes" || t == "1"
+    }
+    val insecure = props.collect {
+      case (k, v) if k.equalsIgnoreCase("trustServerCertificate") && truthy(v) => s"$k=$v"
+      case (k, v) if k.equalsIgnoreCase("encrypt") && !truthy(v) => s"$k=$v"
+    }.toSeq.sorted
+
+    if (insecure.nonEmpty) {
+      if (!ConfigUtils.optBoolean(source, "allow_insecure_tls").getOrElse(false))
+        fail(s"connection_properties weaken TLS (${insecure.mkString(", ")}); encryption and " +
+          "certificate validation protect credentials in transit. Set " +
+          "source.allow_insecure_tls = true only for isolated non-production databases")
+      org.apache.log4j.Logger.getLogger(getClass.getName).warn(
+        s"[JdbcSourceConfig] INSECURE TLS override approved (allow_insecure_tls=true): " +
+          s"${insecure.mkString(", ")} — never use this against production data")
+    }
+    props
   }
 
   /**

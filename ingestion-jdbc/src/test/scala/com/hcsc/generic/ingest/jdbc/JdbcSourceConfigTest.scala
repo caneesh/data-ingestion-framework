@@ -229,7 +229,9 @@ class JdbcSourceConfigTest extends AnyFunSuite {
   }
 
   test("explicit connection_properties override dialect defaults") {
-    val cfg = parse(sqlServerBase +
+    // encrypt=false is a TLS downgrade and now requires the explicit opt-in
+    // (ConnectionHardeningTest covers the rejection path).
+    val cfg = parse(sqlServerBase + "allow_insecure_tls = true\n" +
       """connection_properties { encrypt = "false", applicationName = "ingest" }""")
     assert(cfg.connectionProperties("encrypt") == "false")
     assert(cfg.connectionProperties("applicationName") == "ingest")

@@ -72,6 +72,7 @@ trait SqlServerContainerSupport
        |  user = "${container.getUsername}"
        |  password = { provider = "inline", value = "${container.getPassword}" }
        |}
+       |allow_insecure_tls = true  # throwaway local container
        |connection_properties { encrypt = "false" }
        |health_check { enabled = false }
        |$extra

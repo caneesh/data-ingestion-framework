@@ -183,14 +183,22 @@ logger.info(s"[JdbcAuth] entity auth resolved: type=${provider.authenticationTyp
 
 ---
 
-## Follow-up hardening candidates
+## Follow-up hardening candidates — IMPLEMENTED
 
-From evidence rows 15 and 17 (not yet implemented):
+Both candidates from evidence rows 15 and 17 are now implemented (see
+`ConnectionHardeningTest` and `SecretPreviewMaskingTest`):
 
-1. Reject `trustServerCertificate=true` in `source.connection_properties`
-   for the sqlserver dialect unless explicitly approved by a dedicated
-   opt-in flag, so feed configuration cannot silently weaken the dialect's
-   TLS defaults.
-2. Suppress (or refuse) `diagnostics.log_sql = true` when any query
-   parameter uses the `SECRET_PROVIDER` source, so a secret rendered into
-   the SQL text can never reach the logs.
+1. **TLS-downgrade guard** (`JdbcSourceConfig.userConnectionProperties`):
+   `connection_properties` entries that weaken TLS — `trustServerCertificate`
+   set truthy or `encrypt` set falsy, matched case-insensitively — are
+   rejected with `JDBC_003` unless the feed sets the explicit opt-in
+   `source.allow_insecure_tls = true`, and even approved downgrades log a
+   loud warning. Benign overrides and restating the secure values pass
+   unchanged.
+2. **`log_sql` secret suppression** (`JdbcSource.sqlDiagnosticsSafe`): when
+   any query parameter uses the `SECRET_PROVIDER` source, the opt-in
+   `diagnostics.log_sql = true` full-SQL diagnostic is suppressed with an
+   explicit warning instead of printing SQL containing the secret literal.
+   The configuration generator's SQL preview masks secret-sourced
+   parameters as `'********'` for the same reason (it previously resolved
+   them via `resolveStatic`).

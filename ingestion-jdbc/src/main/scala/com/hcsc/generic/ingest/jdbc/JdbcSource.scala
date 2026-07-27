@@ -240,10 +240,21 @@ object JdbcSource extends Source with WatermarkAdvancing {
       s"url=${JdbcHealthCheck.sanitized(cfg.url)} table=${cfg.table.getOrElse("<sql>")} " +
       s"queryHash=$hash fetchsize=${cfg.fetchSize} " +
       s"partitions=${cfg.partitioning.numPartitions.getOrElse(1)}")
-    if (cfg.logSql)
-      logger.info(s"[JdbcSource] DIAGNOSTIC (diagnostics.log_sql=true) dbtable=$dbtable")
+    if (cfg.logSql) {
+      if (sqlDiagnosticsSafe(cfg))
+        logger.info(s"[JdbcSource] DIAGNOSTIC (diagnostics.log_sql=true) dbtable=$dbtable")
+      else
+        logger.warn("[JdbcSource] diagnostics.log_sql=true SUPPRESSED: query parameters " +
+          "include a SECRET_PROVIDER source and the rendered SQL would leak the secret")
+    }
     hash
   }
+
+  /** log_sql prints the full rendered SQL, parameter literals included —
+    * refuse whenever any parameter resolves from a secret provider. */
+  private[jdbc] def sqlDiagnosticsSafe(cfg: JdbcSourceConfig): Boolean =
+    !cfg.parameters.exists(_.source ==
+      com.hcsc.generic.ingest.jdbc.query.ParameterSource.SecretProvider)
 
   /** JDBC schema drift handling via the shared contract system: canonical
     * name/alias resolution, policy-driven missing/extra handling, optional

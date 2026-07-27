@@ -60,7 +60,7 @@ object SecretProviders {
   def register(p: SecretProvider): Unit = providers.put(p.name.toLowerCase, p)
 
   Seq(InlineSecretProvider, EnvSecretProvider, SysPropSecretProvider, FileSecretProvider,
-    CyberArkSecretProvider).foreach(register)
+    CyberArkSecretProvider, AzureKeyVaultSecretProvider).foreach(register)
 
   /** Resolves an object-form secret reference ({ provider = ..., key/path/value }). */
   def resolveRef(ref: Config): String = {

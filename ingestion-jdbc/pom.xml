@@ -38,6 +38,24 @@
       <artifactId>scalatest_${scala.binary.version}</artifactId>
       <scope>test</scope>
     </dependency>
+    <!--
+      Azure Key Vault secret provider dependencies. Marked optional so they are
+      available at compile time but NOT forced transitively onto consumers who
+      never use the "azure_keyvault" provider. Deployments that reference it must
+      bundle these two artifacts (see AzureKeyVaultSecretProvider scaladoc).
+    -->
+    <dependency>
+      <groupId>com.azure</groupId>
+      <artifactId>azure-security-keyvault-secrets</artifactId>
+      <version>4.8.2</version>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>com.azure</groupId>
+      <artifactId>azure-identity</artifactId>
+      <version>1.12.1</version>
+      <optional>true</optional>
+    </dependency>
   </dependencies>
 
   <build>

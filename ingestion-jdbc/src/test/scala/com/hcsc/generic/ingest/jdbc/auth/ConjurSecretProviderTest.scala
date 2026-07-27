@@ -45,6 +45,7 @@ class ConjurSecretProviderTest extends AnyFunSuite with BeforeAndAfterAll {
     ConfigFactory.parseString(
       s"""provider = "conjur"
          |url = "http://localhost:$port"
+         |allow_insecure_http = true
          |account = "myorg"
          |host_id = "data/ingestion"
          |variable = "app/db/password"

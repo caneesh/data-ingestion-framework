@@ -8,7 +8,7 @@ import com.hcsc.generic.ingest.transform.CuratedTransform
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.apache.spark.sql.functions.{broadcast, col}
+import org.apache.spark.sql.functions.col
 
 import java.util.UUID
 
@@ -100,6 +100,32 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     CuratedResult(published.publishedCount, insertCount = published.publishedCount, updateCount = 0L, deleteCount = 0L)
   }
 
+  /**
+    * Preserves update-vs-insert audit semantics on the merge path: incoming
+    * rows whose key exists in the target inherit the target's
+    * create_timestamp and are marked last_modified_op = 'U'
+    * (last_modified_ts stays this run's timestamp from ensureAudit). Feeds
+    * without the audit columns pass through unchanged.
+    */
+  private[stage] def applyUpdateAudit(incoming: DataFrame, target: DataFrame, keys: Seq[String]): DataFrame = {
+    import org.apache.spark.sql.functions.{coalesce, lit, when}
+    def actual(df: DataFrame, name: String): Option[String] =
+      df.columns.find(_.equalsIgnoreCase(name))
+
+    (actual(incoming, "create_timestamp"), actual(target, "create_timestamp"),
+      actual(incoming, "last_modified_op")) match {
+      case (Some(incCreate), Some(tgtCreate), Some(incOp)) =>
+        val original = target
+          .select((keys.map(col) :+ col(tgtCreate).cast("timestamp").as("_orig_create_ts")): _*)
+          .dropDuplicates(keys)
+        incoming.join(original, keys, "left")
+          .withColumn(incCreate, coalesce(col("_orig_create_ts"), col(incCreate)))
+          .withColumn(incOp, when(col("_orig_create_ts").isNotNull, lit("U")).otherwise(col(incOp)))
+          .drop("_orig_create_ts")
+      case _ => incoming
+    }
+  }
+
   private def publishIncremental(
     incoming: DataFrame,
     fullTable: String,
@@ -124,7 +150,11 @@ final class CuratedService(spark: SparkSession, conf: Config) {
 
     val cleaned = transform.filterNullKeys(incoming, keys, dropNull, blanksAsNull)
     val deduped = transform.deduplicate(cleaned, keys, orderBy)
-    val alignedIncoming = transform.align(deduped, target.schema, contract).persist()
+    val alignedIncoming0 = transform.align(deduped, target.schema, contract)
+    // Update audit semantics: rows replacing an existing key keep the
+    // ORIGINAL create_timestamp and are stamped operation 'U'; only truly
+    // new keys carry 'I' and their fresh creation time.
+    val alignedIncoming = applyUpdateAudit(alignedIncoming0, target, keys).persist()
     val incomingKeys = alignedIncoming.select(keys.map(col): _*).distinct().persist()
     try {
       val targetKeys = target.select(keys.map(col): _*).distinct()
@@ -133,7 +163,9 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       val updateCount = incomingKeys.join(targetKeys, keys, "inner").count()
       val insertCount = totalIncoming - updateCount
 
-      val unchanged = target.join(broadcast(incomingKeys), keys, "left_anti")
+      // No forced broadcast: incoming key sets can be large; the optimizer
+      // still broadcasts automatically when under the threshold.
+      val unchanged = target.join(incomingKeys, keys, "left_anti")
       val merged = unchanged.unionByName(alignedIncoming)
 
       val published = publisher.publish(merged, request, ctx)

@@ -167,9 +167,14 @@ final class IngestPipeline(
         (result, counts)
       }.getOrElse(None)
 
-    // ---- Completion: file lifecycle, registry, reconciliation ---------------
-    staged.foreach(files => intake.complete(ctx, files))
+    // ---- Completion: reconcile FIRST, then file lifecycle -------------------
+    // Reconciliation runs before any irreversible file movement so a count
+    // mismatch fails the run while the staged files are still in inprogress
+    // (normal retry remains possible). complete() itself registers before
+    // moving, so every partial-failure state is resolved idempotently by the
+    // next run's duplicate policy.
     reconcile(rawOutcome, curatedResult)
+    staged.foreach(files => intake.complete(ctx, files))
 
     // Watermarks advance ONLY here, after everything above succeeded — a
     // failed run never moves the incremental position.
@@ -286,10 +291,19 @@ final class IngestPipeline(
       }
 
     val withMeta0 = RawMetadata.add(df0, ctx.rawFlag, ctx.runId)
-    val withMeta = ctx.fileIdFilter match {
+    val withMeta1 = ctx.fileIdFilter match {
       case Some(fileId) if staged.isEmpty => withMeta0.filter(col("file_id") === lit(fileId))
       case _ => withMeta0
     }
+
+    // Cross-run file idempotency (managed feeds): a crash after the RAW
+    // append but before completion leaves the file in inprogress, and the
+    // NEXT run (new run_id) re-reads it — the run_id guard below cannot see
+    // that. Excluding already-loaded file_ids up front keeps every count,
+    // reject and reconciliation consistent with what is actually written.
+    val withMeta =
+      if (ctx.dryRun || ctx.forceReprocess || !staged.exists(_.nonEmpty)) withMeta1
+      else RawIdempotency.excludeLoadedFiles(spark, rawFullTable, withMeta1, logger)
 
     val sourceCount = track(withMeta.persist(StorageLevel.MEMORY_AND_DISK)).count()
 

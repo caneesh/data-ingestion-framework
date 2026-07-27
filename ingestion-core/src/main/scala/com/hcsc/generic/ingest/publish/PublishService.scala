@@ -40,7 +40,10 @@ final class PublishService(spark: SparkSession, logger: Logger) {
     require(req.table.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"table '${req.table}' is not a safe SQL identifier")
 
     val fullTable = s"${req.database}.${req.table}"
-    val stagingTable = s"${req.database}.${stagingPrefix(req.table)}${ctx.runId.replace("-", "_")}"
+    // Defense in depth: the CLI validates --run-id, but the run id also
+    // arrives from other entry points — never embed it raw in an identifier.
+    val safeRunId = ctx.runId.replaceAll("[^A-Za-z0-9_]", "_").take(96)
+    val stagingTable = s"${req.database}.${stagingPrefix(req.table)}$safeRunId"
 
     cleanupStaleStaging(req.database, req.table, stagingTable)
 

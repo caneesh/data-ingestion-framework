@@ -18,7 +18,9 @@ import org.apache.log4j.Logger
   *
   * `api_key` is itself a secret reference resolved through the registry
   * (env/file/sysprop/...); a bare string is accepted for dev use with the
-  * standard inline warning. Optional fields: `connect_timeout_ms` (5000),
+  * standard inline warning. Plain-http urls are rejected unless
+  * `allow_insecure_http = true` (isolated dev only). Optional fields:
+  * `connect_timeout_ms` (5000),
   * `read_timeout_ms` (10000), `max_attempts` (3), `cache_ttl_ms` (300000;
   * 0 disables the resolved-secret cache — the short-lived auth token is
   * cached separately inside ConjurClient).
@@ -44,6 +46,15 @@ object ConjurSecretProvider extends SecretProvider {
     val baseUrl = required("url").stripSuffix("/")
     if (!baseUrl.startsWith("https://") && !baseUrl.startsWith("http://"))
       throw new IllegalArgumentException(s"JDBC_003 conjur url '$baseUrl' must be an http(s) URL")
+    // Authentication POSTs the host API key in the request body: plain http
+    // ships it in cleartext. Rejected unless explicitly approved for
+    // isolated development setups (mirrors the JDBC allow_insecure_tls gate).
+    if (baseUrl.startsWith("http://") &&
+        !ConfigUtils.optBoolean(conf, "allow_insecure_http").getOrElse(false))
+      throw new IllegalArgumentException(
+        s"JDBC_003 conjur url '$baseUrl' uses plain http, which transmits the host API key " +
+          "and secrets in cleartext; use https, or set allow_insecure_http = true only for " +
+          "isolated non-production environments")
 
     val account = required("account")
     val hostId = required("host_id")
@@ -72,7 +83,10 @@ object ConjurSecretProvider extends SecretProvider {
 
     // Atomic TTL cache: compute holds the per-key lock so concurrent
     // resolvers share one Conjur round-trip instead of racing check-then-put.
-    val cacheKey = s"$baseUrl|$account|$variable"
+    // The HOST IDENTITY is part of the key: two identities reading the same
+    // variable in one JVM must each pass their own authorization — a shared
+    // entry would hand identity B a value it may not be permitted to read.
+    val cacheKey = s"$baseUrl|$account|$hostId|$variable"
     if (ttlMs <= 0) fetchValue()
     else cache.compute(cacheKey, (_, existing) =>
       if (existing != null && System.currentTimeMillis() - existing.fetchedAt < ttlMs) existing

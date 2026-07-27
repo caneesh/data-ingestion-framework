@@ -108,6 +108,9 @@ final class FileIntakeService(
     logger.info(s"[FileIntake] Found ${candidates.size} candidate file(s) in landing/inprogress")
 
     val knownChecksums = if (idempotencyEnabled) processedChecksums(ctx.entity) else Set.empty[String]
+    // Checksums accepted in THIS batch: two identical files arriving together
+    // must not both stage (the registry only records completed runs).
+    val stagedChecksums = scala.collection.mutable.Set.empty[String]
 
     candidates.flatMap { case (status, fromLanding) =>
       val file = status.getPath
@@ -130,9 +133,12 @@ final class FileIntakeService(
             case HeaderCheck.SkipEmpty => None
             case HeaderCheck.Ok(fingerprint) =>
               val checksum = FsUtils.checksum(fs, file)
-              if (idempotencyEnabled && knownChecksums.contains(checksum) && !ctx.forceReprocess) {
+              val duplicate = idempotencyEnabled && !ctx.forceReprocess &&
+                (knownChecksums.contains(checksum) || stagedChecksums.contains(checksum))
+              if (duplicate) {
                 handleDuplicate(ctx, fs, l, status, checksum)
               } else {
+                if (idempotencyEnabled) stagedChecksums += checksum
                 val staged = if (ctx.dryRun) file else FsUtils.moveToDir(fs, file, l.inprogress)
                 // Re-staged leftovers were audited VALIDATED when first staged;
                 // don't write a duplicate audit row on restart.
@@ -329,6 +335,12 @@ final class FileIntakeService(
     * Only called after the whole pipeline succeeded — restart-safe. */
   def complete(ctx: RunContext, files: Seq[StagedFile]): Unit = layout.foreach { l =>
     if (ctx.dryRun || files.isEmpty) return
+    // Registry FIRST, moves second: a crash in between leaves the file in
+    // inprogress with its checksum registered — the next run's duplicate
+    // policy resolves it idempotently (skip/reject). The old order (move
+    // first) could leave a processed-but-unregistered file whose content
+    // would be re-ingested if delivered again.
+    if (idempotencyEnabled) registerProcessed(ctx, files)
     val fs = FsUtils.fileSystem(l.processed, hadoopConf)
     files.foreach { f =>
       val staged = new org.apache.hadoop.fs.Path(f.stagedPath)
@@ -336,7 +348,6 @@ final class FileIntakeService(
       val dest = FsUtils.moveToDir(fs, staged, l.processed)
       audit.recordFile(ctx, f.name, dest.toString, f.checksum, f.sizeBytes, FileStatuses.Processed)
     }
-    if (idempotencyEnabled) registerProcessed(ctx, files)
   }
 
   private def isSidecar(name: String): Boolean = {

@@ -84,6 +84,14 @@ object CliParser {
       !cli.resume || cli.runId.isDefined,
       "--resume requires --run-id of the run to resume"
     )
+    // run ids reach staging-table identifiers and audit records: constrain
+    // them at the boundary instead of trusting every downstream consumer.
+    cli.runId.foreach { r =>
+      require(
+        r.matches("[A-Za-z0-9_-]{1,128}"),
+        "--run-id may contain only letters, digits, underscore and hyphen (max 128 chars)"
+      )
+    }
     cli.copy(mode = mode)
   }
 }

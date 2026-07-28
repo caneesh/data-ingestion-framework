@@ -16,8 +16,14 @@ final class JdbcBoundaryProbe(
   url: String,
   connectionProperties: Map[String, String],
   dialect: JdbcDialect,
-  queryTimeoutSeconds: Int = 30
+  queryTimeoutSeconds: Int = 30,
+  driver: Option[String] = None
 ) extends SourceBoundaryProbe {
+
+  // DriverManager's ServiceLoader discovery does not see drivers delivered
+  // via spark-submit --jars (MutableURLClassLoader); load explicitly when
+  // the caller names the class, exactly as Spark's own JDBC source does.
+  driver.foreach(Class.forName)
 
   override def max(
     columns: Seq[BoundaryColumn],
@@ -50,11 +56,14 @@ final class JdbcBoundaryProbe(
     }
   }
 
-  /** Boundary probes must ignore NULL boundary rows (they cannot advance a
-    * window), so the driving column is additionally filtered NOT NULL. */
+  /** Boundary probes must ignore rows with a NULL in ANY boundary column: a
+    * composite position with a NULL part cannot be represented in a
+    * checkpoint, and (NULLS-first engines like Postgres/Oracle on DESC) a
+    * NULL tie-break at the top would otherwise make the probe report "empty
+    * source", stalling watermark advancement forever. */
   private def from(relation: Relation, filters: Seq[String], columns: Seq[BoundaryColumn]): String = {
     val table = relation match { case Relation.Table(name) => name }
-    val notNull = columns.headOption.map(c => s"${dialect.quoteQualified(c.name)} IS NOT NULL").toSeq
+    val notNull = columns.map(c => s"${dialect.quoteQualified(c.name)} IS NOT NULL")
     val predicates = filters.map(f => s"($f)") ++ notNull
     if (predicates.isEmpty) table
     else s"(SELECT * FROM $table WHERE ${predicates.mkString(" AND ")}) probe_src"

@@ -21,11 +21,17 @@ import scala.util.control.NonFatal
 final class JdbcCheckpointStore(
   url: String,
   connectionProperties: Map[String, String],
-  table: String = "ingest_checkpoints"
+  table: String = "ingest_checkpoints",
+  driver: Option[String] = None
 ) extends CheckpointStore {
 
   require(table.matches("[A-Za-z_][A-Za-z0-9_]*"),
     s"EXT_001 checkpoint table '$table' is not a safe identifier")
+
+  // See JdbcBoundaryProbe: --jars-delivered drivers need explicit loading.
+  driver.foreach(Class.forName)
+
+  @volatile private var tableEnsured = false
 
   override def latest(entity: String): Option[Checkpoint] = withConnection { connection =>
     ensureTable(connection)
@@ -99,14 +105,33 @@ final class JdbcCheckpointStore(
   private def isDuplicateKey(e: java.sql.SQLException): Boolean =
     Option(e.getSQLState).exists(_.startsWith("23")) // integrity constraint violation class
 
+  /** Portable ensure: `CREATE TABLE IF NOT EXISTS` is a syntax error on SQL
+    * Server, Oracle (pre-23c) and DB2, so existence is checked through
+    * DatabaseMetaData (case-folded per engine) and the plain CREATE's lost
+    * race is resolved by re-checking existence. */
   private def ensureTable(connection: Connection): Unit = {
-    val statement = connection.createStatement()
-    try statement.execute(
-      s"CREATE TABLE IF NOT EXISTS $table (" +
-        "entity VARCHAR(256) PRIMARY KEY, strategy_kind VARCHAR(64), " +
-        "checkpoint_value VARCHAR(1024), version BIGINT, " +
-        "run_id VARCHAR(128), committed_ts TIMESTAMP)")
-    finally statement.close()
+    if (tableEnsured) return
+    if (!tableExists(connection)) {
+      val statement = connection.createStatement()
+      try statement.execute(
+        s"CREATE TABLE $table (" +
+          "entity VARCHAR(256) PRIMARY KEY, strategy_kind VARCHAR(64), " +
+          "checkpoint_value VARCHAR(1024), version BIGINT, " +
+          "run_id VARCHAR(128), committed_ts TIMESTAMP)")
+      catch {
+        case e: java.sql.SQLException =>
+          if (!tableExists(connection)) throw e // real failure, not a lost create race
+      } finally statement.close()
+    }
+    tableEnsured = true
+  }
+
+  private def tableExists(connection: Connection): Boolean = {
+    val metadata = connection.getMetaData
+    Seq(table, table.toUpperCase, table.toLowerCase).distinct.exists { candidate =>
+      val rs = metadata.getTables(null, null, candidate, Array("TABLE"))
+      try rs.next() finally rs.close()
+    }
   }
 
   private def withConnection[A](body: Connection => A): A = {
@@ -133,8 +158,30 @@ final class RetryingCheckpointStore(
   override def latest(entity: String): Option[Checkpoint] =
     withRetries(s"checkpoint read '$entity'")(delegate.latest(entity))
 
-  override def commit(checkpoint: Checkpoint, expectedVersion: Long): Unit =
-    withRetries(s"checkpoint commit '${checkpoint.entity}'")(delegate.commit(checkpoint, expectedVersion))
+  /** Commit is NOT idempotent, so an ambiguous failure (the statement may
+    * have applied before the connection died) is resolved by reading back:
+    * if the store already holds exactly our checkpoint (entity, version,
+    * run id), the earlier attempt succeeded — return instead of retrying
+    * into a false EXT_005 conflict against ourselves. */
+  override def commit(checkpoint: Checkpoint, expectedVersion: Long): Unit = {
+    def committedByThisRun: Boolean =
+      try delegate.latest(checkpoint.entity)
+        .exists(c => c.version == checkpoint.version && c.runId == checkpoint.runId)
+      catch { case NonFatal(_) => false }
+
+    var attempt = 1
+    while (true) {
+      try { delegate.commit(checkpoint, expectedVersion); return }
+      catch {
+        case e: CheckpointConflictException =>
+          if (committedByThisRun) return else throw e
+        case NonFatal(e) if attempt < maxAttempts =>
+          if (committedByThisRun) return
+          sleepBetween(s"checkpoint commit '${checkpoint.entity}'", attempt, e)
+          attempt += 1
+      }
+    }
+  }
 
   private def withRetries[A](operation: String)(body: => A): A = {
     var attempt = 1
@@ -143,13 +190,22 @@ final class RetryingCheckpointStore(
       catch {
         case e: CheckpointConflictException => throw e // terminal: never retry a lost CAS
         case NonFatal(e) if attempt < maxAttempts =>
-          val delay = backoffMs * attempt
-          logger.warn(s"[CheckpointStore] $operation attempt $attempt/$maxAttempts failed " +
-            s"(${e.getClass.getSimpleName}: ${e.getMessage}); retrying in ${delay}ms")
-          Thread.sleep(delay)
+          sleepBetween(operation, attempt, e)
           attempt += 1
       }
     }
     throw new IllegalStateException("unreachable")
+  }
+
+  private def sleepBetween(operation: String, attempt: Int, cause: Throwable): Unit = {
+    val delay = backoffMs * attempt
+    logger.warn(s"[CheckpointStore] $operation attempt $attempt/$maxAttempts failed " +
+      s"(${cause.getClass.getSimpleName}: ${cause.getMessage}); retrying in ${delay}ms")
+    try Thread.sleep(delay)
+    catch {
+      case ie: InterruptedException =>
+        Thread.currentThread().interrupt() // restore the flag, then abort the retry loop
+        throw ie
+    }
   }
 }

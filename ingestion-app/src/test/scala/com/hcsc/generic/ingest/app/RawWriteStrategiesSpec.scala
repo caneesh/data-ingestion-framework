@@ -75,7 +75,7 @@ class RawWriteStrategiesSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(r1.rowsWritten == 2 && r2.rowsWritten == 1)
     val table = spark.table("r_raw.member_append")
     assert(table.count() == 3)
-    assert(RawMetadataStamper.Reserved.forall(table.columns.contains), "all metadata columns persisted")
+    assert(RawMetadataStamper.StampedColumns.forall(table.columns.contains), "all metadata columns persisted")
     assert(spark.sql("SHOW PARTITIONS r_raw.member_append").count() == 2, "one dynamic partition per day")
     assert(spark.sql("DESCRIBE FORMATTED r_raw.member_append").collect()
       .exists(r => String.valueOf(r.get(1)).toLowerCase.contains("orc")), "stored as ORC")

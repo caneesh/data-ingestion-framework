@@ -65,8 +65,10 @@ final class CuratedTransform(spark: SparkSession) {
     else {
       // Rows tied on every order_by column previously produced an arbitrary
       // winner (partition-layout dependent). row_idx — when present from RAW
-      // metadata — is a stable final tie-break: the later-read row wins,
-      // making replays and retries pick the same record every time.
+      // metadata — is a defined final tie-break, so one computed frame always
+      // yields one winner. Honest scope: row_idx itself is not stable across
+      // re-reads (see RawMetadata), so determinism holds within a run / over
+      // a persisted RAW slice, not across independent source re-extractions.
       val tieBreak = df.columns.find(_.equalsIgnoreCase("row_idx"))
         .map(c => col(c).desc_nulls_last).toSeq
       val w = Window.partitionBy(keys.map(col): _*)

@@ -149,6 +149,16 @@ object MySqlDialect extends JdbcDialect {
     "`" + identifier.replace("`", "``") + "`"
   override def selectTopOne(projection: String, from: String, orderBy: String): String =
     s"SELECT $projection FROM $from ORDER BY $orderBy LIMIT 1"
+
+  /** MySQL treats backslash as an escape character by default (unlike the
+    * SQL standard), so quote-doubling alone is insufficient: a value ending
+    * in '\' would swallow the closing quote and a crafted value could break
+    * out of the literal. Escape backslashes first, then quotes. */
+  override def renderLiteral(paramType: String, value: String): String =
+    paramType.toUpperCase match {
+      case "STRING" => "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
+      case other    => super.renderLiteral(other, value)
+    }
 }
 
 /** Fallback for engines without a dedicated dialect (H2 in tests, etc.).

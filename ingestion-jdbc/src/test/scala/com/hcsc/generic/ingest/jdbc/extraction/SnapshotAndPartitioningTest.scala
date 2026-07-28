@@ -25,18 +25,20 @@ class SnapshotAndPartitioningTest extends AnyFunSuite {
       partition = PartitionSpec(Some("claim_id"), Some(1L), Some(100L), Some(4), Seq.empty)))).isEmpty)
   }
 
-  test("splitter law: slices are disjoint, complete over [lo, hi], and carry NULLs exactly once") {
+  test("splitter law: slices are disjoint, contiguous, unbounded at the ends, NULLs exactly once") {
     val splitter = new PartitionSplitter(new StubProbe())
     val slices = splitter.split(
       PartitionSpec(Some("claim_id"), Some(1L), Some(10L), Some(3), Seq.empty),
       Relation.Table("t"), Seq.empty).collect { case r: RangeSlice => r }
 
     assert(slices.size == 3)
-    // Complete and contiguous: each slice starts where the previous ended
-    slices.sliding(2).foreach { case Seq(a, b) => assert(a.upperBound == b.lowerInclusive) }
-    assert(slices.head.lowerInclusive == 1L)
-    assert(slices.last.upperBound == 10L && slices.last.upperInclusive)
-    assert(slices.init.forall(!_.upperInclusive))
+    // Contiguous: each slice starts exactly where the previous ended
+    slices.sliding(2).foreach { case Seq(a, b) => assert(a.upperExclusive == b.lowerInclusive) }
+    // Ends are UNBOUNDED — bounds size the strides, they never filter, so
+    // rows outside [lo, hi] (stale bounds, post-probe arrivals) are still read
+    assert(slices.head.lowerInclusive.isEmpty)
+    assert(slices.last.upperExclusive.isEmpty)
+    assert(slices.init.forall(_.upperExclusive.isDefined))
     // NULLs live in exactly one slice
     assert(slices.count(_.includeNulls) == 1)
     assert(slices.head.includeNulls)
@@ -49,7 +51,20 @@ class SnapshotAndPartitioningTest extends AnyFunSuite {
       PartitionSpec(Some("claim_id"), None, None, Some(2), Seq.empty),
       Relation.Table("t"), Seq.empty).collect { case r: RangeSlice => r }
     assert(probe.minMaxCalls == List("claim_id"))
-    assert(slices.head.lowerInclusive == 100L && slices.last.upperBound == 200L)
+    // Interior cut derived from the probed range; ends stay unbounded
+    assert(slices.size == 2)
+    assert(slices.head.lowerInclusive.isEmpty && slices.last.upperExclusive.isEmpty)
+    assert(slices.head.upperExclusive.contains(151L)) // 100 + ceil(101/2)
+  }
+
+  test("splitter stride math is safe at Long extremes") {
+    val splitter = new PartitionSplitter(new StubProbe())
+    val slices = splitter.split(
+      PartitionSpec(Some("claim_id"), Some(Long.MaxValue - 9), Some(Long.MaxValue), Some(2), Seq.empty),
+      Relation.Table("t"), Seq.empty).collect { case r: RangeSlice => r }
+    assert(slices.size == 2)
+    val cut = slices.head.upperExclusive.get
+    assert(cut > Long.MaxValue - 9 && cut <= Long.MaxValue, "no overflowed negative cut point")
   }
 
   test("splitter: empty source (no MIN/MAX) degrades to a single full read") {

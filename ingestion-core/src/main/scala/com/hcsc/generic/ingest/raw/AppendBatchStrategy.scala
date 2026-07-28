@@ -19,12 +19,14 @@ final class AppendBatchStrategy extends RawWriteStrategy {
     val withPartitions = Partitioning(stamped, target.partitions)
     val rows = withPartitions.count()
 
-    spark.sql("SET hive.exec.dynamic.partition=true")
-    spark.sql("SET hive.exec.dynamic.partition.mode=nonstrict")
-
     if (spark.catalog.tableExists(target.fullTable)) {
-      AppendBatchStrategy.alignToTarget(spark, withPartitions, target.fullTable, logger)
-        .write.mode(SaveMode.Append).insertInto(target.fullTable)
+      // Needed only when appending into pre-existing Hive-serde tables;
+      // saved and restored so strict-mode protection is not silently lost
+      // for everything else sharing the session.
+      AppendBatchStrategy.withDynamicPartitions(spark) {
+        AppendBatchStrategy.alignToTarget(spark, withPartitions, target.fullTable, logger)
+          .write.mode(SaveMode.Append).insertInto(target.fullTable)
+      }
     } else {
       var writer = withPartitions.write.format("orc").mode(SaveMode.Overwrite)
       target.path.foreach(p => writer = writer.option("path", p))
@@ -38,6 +40,21 @@ final class AppendBatchStrategy extends RawWriteStrategy {
 }
 
 object AppendBatchStrategy {
+
+  /** Enables Hive dynamic partitioning for `body`, restoring the previous
+    * session values afterwards. */
+  private[raw] def withDynamicPartitions[A](spark: SparkSession)(body: => A): A = {
+    val keys = Seq("hive.exec.dynamic.partition", "hive.exec.dynamic.partition.mode")
+    val previous = keys.map(k => k -> spark.conf.getOption(k))
+    spark.conf.set(keys.head, "true")
+    spark.conf.set(keys(1), "nonstrict")
+    try body
+    finally previous.foreach {
+      case (k, Some(v)) => spark.conf.set(k, v)
+      case (k, None)    => spark.conf.unset(k)
+    }
+  }
+
   /** insertInto is positional: select the frame in the target's column order.
     * Missing target columns fail; extra source columns are dropped loudly. */
   private[raw] def alignToTarget(

@@ -1,6 +1,6 @@
 package com.hcsc.generic.ingest.jdbc.extraction
 
-import com.hcsc.generic.ingest.jdbc.extraction.store.InMemoryCheckpointStore
+import com.hcsc.generic.ingest.jdbc.extraction.store.{InMemoryCheckpointStore, RetryingCheckpointStore}
 import com.hcsc.generic.ingest.jdbc.extraction.strategies.StrategyKinds
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -47,6 +47,27 @@ class PlannerRegistryCheckpointTest extends AnyFunSuite {
     assert(ex.getMessage.contains("initial"))
   }
 
+  test("a reconfigured feed cannot plan from a mismatched stored checkpoint (EXT_006)") {
+    val store = new InMemoryCheckpointStore
+    store.commit(checkpoint("2026-07-28 09:00:00", version = 1L, kind = "TIMESTAMP"), expectedVersion = 0L)
+    val planner = ExtractionFramework.planner(new StubProbe(), store)
+
+    // Strategy changed since the checkpoint was written
+    val kindMismatch = intercept[IllegalArgumentException] {
+      planner.plan("claims_feed", "run-2",
+        spec(StrategyKinds.IncreasingKey, Seq(keyColumn), initial = Some("0")), capturedAt)
+    }
+    assert(kindMismatch.getMessage.contains("EXT_006"))
+
+    // Boundary arity changed since the checkpoint was written
+    val arityMismatch = intercept[IllegalArgumentException] {
+      planner.plan("claims_feed", "run-2",
+        spec(StrategyKinds.TimestampKey, Seq(tsColumn, keyColumn), initial = Some("1900-01-01 00:00:00|0")),
+        capturedAt)
+    }
+    assert(arityMismatch.getMessage.contains("EXT_006"))
+  }
+
   test("committer is advance-only and CAS-guarded") {
     val store = new InMemoryCheckpointStore
     val committer = ExtractionFramework.committer(store)
@@ -69,6 +90,31 @@ class PlannerRegistryCheckpointTest extends AnyFunSuite {
     // Direct CAS violation is detected
     intercept[CheckpointConflictException] {
       store.commit(checkpoint("2026-07-28 11:00:00", version = 9L), expectedVersion = 5L)
+    }
+  }
+
+  test("retrying commit resolves an ambiguous failure by read-back, not a false conflict") {
+    val inner = new InMemoryCheckpointStore
+    // The ambiguous case: the statement applies, then the connection "dies"
+    val flaky = new CheckpointStore {
+      var failNext = true
+      def latest(entity: String): Option[Checkpoint] = inner.latest(entity)
+      def commit(checkpoint: Checkpoint, expectedVersion: Long): Unit = {
+        inner.commit(checkpoint, expectedVersion)
+        if (failNext) { failNext = false; throw new RuntimeException("connection reset after apply") }
+      }
+    }
+    val retrying = new RetryingCheckpointStore(flaky, maxAttempts = 3, backoffMs = 1L)
+    val mine = Checkpoint("claims_feed", "TIMESTAMP",
+      BoundaryValue(Seq("2026-07-28 10:00:00")), version = 1L, runId = "run-1", committedAt = capturedAt)
+
+    retrying.commit(mine, expectedVersion = 0L) // must NOT raise EXT_005 against our own earlier apply
+    assert(inner.entries("claims_feed").size == 1, "the ambiguous commit applied exactly once")
+
+    // A conflict caused by someone ELSE advancing is still terminal
+    inner.commit(mine.copy(version = 2L, runId = "run-2"), expectedVersion = 1L)
+    intercept[CheckpointConflictException] {
+      retrying.commit(mine.copy(version = 2L), expectedVersion = 1L)
     }
   }
 

@@ -34,18 +34,25 @@ sealed trait Tolerance {
   def withinTolerance(expected: Long, actual: Long): Boolean
 }
 object Tolerance {
+  // All arithmetic through BigInt/BigDecimal: Long subtraction overflow
+  // would otherwise make a maximal mismatch pass as within-tolerance — the
+  // worst possible failure direction for a reconciliation engine.
   case object Exact extends Tolerance {
     def withinTolerance(expected: Long, actual: Long): Boolean = expected == actual
   }
   final case class Absolute(maxDelta: Long) extends Tolerance {
     require(maxDelta >= 0, "REC_001 tolerance delta must not be negative")
-    def withinTolerance(expected: Long, actual: Long): Boolean = math.abs(expected - actual) <= maxDelta
+    def withinTolerance(expected: Long, actual: Long): Boolean =
+      (BigInt(expected) - BigInt(actual)).abs <= BigInt(maxDelta)
   }
+  /** Note: an expected value of exactly 0 tolerates only an actual of 0 —
+    * a percentage of nothing is undefined, so any deviation fails. */
   final case class Percent(maxPercent: Double) extends Tolerance {
     require(maxPercent >= 0, "REC_001 tolerance percent must not be negative")
     def withinTolerance(expected: Long, actual: Long): Boolean = {
       if (expected == 0L) actual == 0L
-      else math.abs(expected - actual) * 100.0 / math.abs(expected.toDouble) <= maxPercent
+      else (BigDecimal(BigInt(expected) - BigInt(actual)).abs * 100 /
+        BigDecimal(expected).abs) <= BigDecimal(maxPercent)
     }
   }
 }
@@ -61,15 +68,16 @@ final case class BalanceEquation(
 }
 
 object BalanceEquation {
-  /** The framework's standard invariants; feeds add their own on top. */
+  /** The framework's standard invariants; feeds add their own on top.
+    * Deliberately absent: a curated-movement equation — for merge
+    * strategies the published count is the WHOLE merged table while
+    * insert+update counts only the incoming keys, so no equality holds;
+    * that coverage is an inequality the pipeline checks separately. */
   val standard: Seq[BalanceEquation] = Seq(
     BalanceEquation("source_equals_accepted_plus_rejected",
       left = Seq(Measure.SourceCount), right = Seq(Measure.AcceptedCount, Measure.RejectCount)),
     BalanceEquation("raw_equals_accepted",
-      left = Seq(Measure.RawCount), right = Seq(Measure.AcceptedCount)),
-    BalanceEquation("curated_movement_covered",
-      left = Seq(Measure.CuratedCount),
-      right = Seq(Measure.InsertCount, Measure.UpdateCount))
+      left = Seq(Measure.RawCount), right = Seq(Measure.AcceptedCount))
   )
 }
 
@@ -126,7 +134,15 @@ object ReconciliationEngine {
     val fatal = policy match {
       case FailurePolicy.Warn => Seq.empty
       case FailurePolicy.Fail => failed
-      case FailurePolicy.FailOn(names) => failed.filter(f => names.contains(f.equation))
+      case FailurePolicy.FailOn(names) =>
+        // A typo'd equation name would silently disable enforcement forever;
+        // surface names that match nothing evaluated this run.
+        val evaluated = findings.map(_.equation).toSet
+        val unmatched = names.diff(evaluated)
+        if (unmatched.nonEmpty)
+          logger.warn(s"[Reconciliation] FailOn names match no evaluated equation " +
+            s"(dead policy entries): ${unmatched.mkString(", ")}")
+        failed.filter(f => names.contains(f.equation))
     }
     if (fatal.nonEmpty)
       throw new ReconciliationException(

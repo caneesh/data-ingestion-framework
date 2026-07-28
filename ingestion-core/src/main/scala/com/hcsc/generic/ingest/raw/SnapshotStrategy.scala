@@ -19,7 +19,10 @@ final class SnapshotStrategy extends RawWriteStrategy {
   val kind: String = RawWriteStrategies.Snapshot
 
   def write(spark: SparkSession, stamped: DataFrame, target: RawTarget, context: BatchContext): RawWriteResult = {
-    val snapshotDt = context.loadTimestamp.toLocalDateTime.toLocalDate.toString
+    // UTC-derived so the same instant lands in the same partition regardless
+    // of the host JVM's default timezone.
+    val snapshotDt = context.loadTimestamp.toInstant
+      .atZone(java.time.ZoneOffset.UTC).toLocalDate.toString
     val withPartitions = Partitioning(stamped, target.partitions)
       .withColumn("snapshot_dt", org.apache.spark.sql.functions.lit(snapshotDt))
     val partitionKeys = target.partitions.keys :+ "snapshot_dt"
@@ -30,17 +33,13 @@ final class SnapshotStrategy extends RawWriteStrategy {
       target.path.foreach(p => writer = writer.option("path", p))
       writer.partitionBy(partitionKeys: _*).saveAsTable(target.fullTable)
     } else {
-      val aligned = AppendBatchStrategy.alignToTarget(spark, withPartitions, target.fullTable, logger)
-      // Dynamic partition overwrite: only partitions present in this batch
-      // (this snapshot_dt) are replaced; all earlier snapshots survive.
-      val overwriteModeKey = "spark.sql.sources.partitionOverwriteMode"
-      val previous = spark.conf.getOption(overwriteModeKey)
-      spark.conf.set(overwriteModeKey, "dynamic")
-      try aligned.write.mode(SaveMode.Overwrite).insertInto(target.fullTable)
-      finally previous match {
-        case Some(v) => spark.conf.set(overwriteModeKey, v)
-        case None    => spark.conf.unset(overwriteModeKey)
-      }
+      // Dynamic partition overwrite via a PER-WRITE option — never a session
+      // conf mutation, which under concurrent feeds could revert to static
+      // mid-write and turn partition replacement into whole-table overwrite.
+      AppendBatchStrategy.alignToTarget(spark, withPartitions, target.fullTable, logger)
+        .write.mode(SaveMode.Overwrite)
+        .option("partitionOverwriteMode", "dynamic")
+        .insertInto(target.fullTable)
     }
     logger.info(s"[RawWrite] snapshot_dt=$snapshotDt written to ${target.fullTable} ($rows rows)")
     RawWriteResult(target.fullTable, context.batchId, rows, detail = s"snapshot_dt=$snapshotDt")

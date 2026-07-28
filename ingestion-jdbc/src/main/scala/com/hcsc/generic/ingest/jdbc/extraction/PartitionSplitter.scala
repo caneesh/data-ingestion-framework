@@ -34,16 +34,21 @@ final class PartitionSplitter(probe: SourceBoundaryProbe) {
       case None => Seq.empty // empty source: one full (empty) read
       case Some((lo, hi)) =>
         require(lo <= hi, s"EXT_001 partition lower_bound $lo must not exceed upper_bound $hi")
-        val count = math.min(n.toLong, hi - lo + 1).toInt.max(1)
-        val stride = (hi - lo + 1 + count - 1) / count // ceil so ranges cover [lo, hi]
+        // Bounds SIZE the strides; they never filter. The first slice is
+        // lower-unbounded and the last upper-unbounded (Spark JDBC
+        // semantics), so rows outside [lo, hi] — stale bounds, values
+        // arriving after a MIN/MAX probe, DECIMAL truncation — are still
+        // read. BigInt keeps the stride math safe at Long extremes.
+        val range = BigInt(hi) - BigInt(lo) + 1
+        val count = range.min(BigInt(n)).toInt.max(1)
+        if (count == 1) return Seq.empty // one slice = plain full read
+        val stride = (range + count - 1) / count
+        val cut: Int => Long = i => (BigInt(lo) + stride * i).toLong
         (0 until count).map { i =>
-          val sliceLo = lo + i * stride
-          val sliceHi = math.min(sliceLo + stride, hi + 1)
           RangeSlice(
             column = column,
-            lowerInclusive = sliceLo,
-            upperBound = if (i == count - 1) hi else sliceHi,
-            upperInclusive = i == count - 1,
+            lowerInclusive = if (i == 0) None else Some(cut(i)),
+            upperExclusive = if (i == count - 1) None else Some(cut(i + 1)),
             includeNulls = i == 0,
             index = i)
         }

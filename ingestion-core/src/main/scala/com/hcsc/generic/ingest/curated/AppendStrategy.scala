@@ -21,8 +21,12 @@ final class AppendStrategy(
 
   def process(input: DataFrame, target: CuratedTarget, ctx: RunContext): CuratedMetrics = {
     val (metrics, elapsed) = preparation.timed {
-      val prepared = preparation.prepare(input, target)
+      val prepared = preparation.ensureAudit(input)
+      preparation.validateFinal(prepared, target)
       val rows = prepared.count()
+      if (rows == 0 && !target.allowEmpty)
+        throw new IllegalArgumentException(
+          s"CUR_002 empty curated append to ${target.fullTable} and allow_empty=false")
 
       if (ctx.dryRun) {
         logger.info(s"[Curated] DRY-RUN: would append $rows row(s) to ${target.fullTable}")

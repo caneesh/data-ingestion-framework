@@ -61,7 +61,11 @@ object ExtractionSpecParser {
           s"EXT_001 extraction.boundary.initial has ${v.values.size} part(s) but ${boundaryColumns.size} column(s) are declared")
     }
 
-    val overlap = boundaryConf.flatMap(b => ConfigUtils.optString(b, "overlap")).map(BigDecimal(_))
+    val overlap = boundaryConf.flatMap(b => ConfigUtils.optString(b, "overlap")).map { raw =>
+      try BigDecimal(raw.trim)
+      catch { case _: NumberFormatException =>
+        throw new IllegalArgumentException(s"EXT_001 extraction.boundary.overlap '$raw' is not numeric") }
+    }
     overlap.foreach(o => if (o < 0)
       throw new IllegalArgumentException(s"EXT_001 extraction.boundary.overlap must not be negative, found $o"))
 
@@ -83,7 +87,13 @@ object ExtractionSpecParser {
       strategyKind = required("strategy").toUpperCase,
       table = required("table"),
       projection = ConfigUtils.stringList(e, "columns"),
-      filters = ConfigUtils.stringList(e, "filters"),
+      // A blank filter would render as "()" and fail as SQL at read time;
+      // reject it where the operator can see the cause.
+      filters = ConfigUtils.stringList(e, "filters").map { f =>
+        if (f.trim.isEmpty)
+          throw new IllegalArgumentException("EXT_001 extraction.filters must not contain blank entries")
+        f
+      },
       boundaryColumns = boundaryColumns,
       initialBoundary = initial,
       overlap = overlap,

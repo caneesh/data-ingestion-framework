@@ -34,11 +34,12 @@ class FeedCompatibilityValidatorTest extends AnyFunSuite {
       .exists(_.contains("CFG_003")))
   }
 
-  test("CDC raw events with an append-only curated layer is rejected (CFG_004)") {
+  test("CDC raw events with a keyless state-deriving curated layer is rejected (CFG_004)") {
+    // Keyless curated with no explicit strategy would derive state lossily
     assert(errorsOf(
       """source { type = "jdbc" }
         |raw { strategy = "CDC_EVENTS" }
-        |curated { strategy = "APPEND" }""".stripMargin)
+        |curated { database = "d", table = "t" }""".stripMargin)
       .exists(_.contains("CFG_004")))
     // A keyed merge makes CDC coherent
     assert(errorsOf(
@@ -46,10 +47,23 @@ class FeedCompatibilityValidatorTest extends AnyFunSuite {
         |raw { strategy = "CDC_EVENTS" }
         |curated { strategy = "TYPE1_MERGE", merge { keys = ["id"] } }""".stripMargin)
       .isEmpty)
+    // Explicit APPEND is a legitimate keyless event-history curated layer
+    assert(errorsOf(
+      """source { type = "jdbc" }
+        |raw { strategy = "CDC_EVENTS" }
+        |curated { strategy = "APPEND" }""".stripMargin)
+      .isEmpty)
+    // Raw-only CDC archive (no curated block at all) is legitimate
+    assert(errorsOf(
+      """source { type = "jdbc" }
+        |raw { strategy = "CDC_EVENTS" }""".stripMargin)
+      .isEmpty)
   }
 
-  test("keyed merge without keys is rejected at startup (CFG_005)") {
+  test("keyed merge without keys is rejected at startup, including the MERGE alias (CFG_005)") {
     assert(errorsOf("""curated { strategy = "TYPE1_MERGE", merge { keys = [] } }""")
+      .exists(_.contains("CFG_005")))
+    assert(errorsOf("""curated { strategy = "MERGE", merge { keys = [] } }""")
       .exists(_.contains("CFG_005")))
   }
 
@@ -70,15 +84,25 @@ class FeedCompatibilityValidatorTest extends AnyFunSuite {
       .exists(_.contains("CFG_008")))
   }
 
-  test("incremental jdbc feeding a keyless curated layer is rejected (CFG_009)") {
+  test("incremental jdbc feeding a keyless state-deriving curated layer is rejected (CFG_009)") {
     assert(errorsOf(
       """source { type = "jdbc", mode = "INCREMENTAL" }
         |curated { database = "d", table = "t", merge { keys = [] } }""".stripMargin)
       .exists(_.contains("CFG_009")))
-    // Keys make it coherent; FULL mode without keys stays legal (true snapshots)
+    // Incremental EXTRACTION strategies are incremental sources too
+    assert(errorsOf(
+      """source { type = "jdbc", extraction { strategy = "TIMESTAMP",
+        |  boundary { columns = [ { name = "ts" } ], initial = "1900-01-01 00:00:00" } } }
+        |curated { database = "d", table = "t", merge { keys = [] } }""".stripMargin)
+      .exists(_.contains("CFG_009")))
+    // Keys make it coherent; explicit APPEND keeps delta history legally;
+    // FULL mode without keys stays legal (true snapshots)
     assert(errorsOf(
       """source { type = "jdbc", mode = "INCREMENTAL" }
         |curated { merge { keys = ["id"] } }""".stripMargin).isEmpty)
+    assert(errorsOf(
+      """source { type = "jdbc", mode = "INCREMENTAL" }
+        |curated { strategy = "APPEND" }""".stripMargin).isEmpty)
     assert(errorsOf(
       """source { type = "jdbc", mode = "FULL_TABLE" }
         |curated { merge { keys = [] } }""".stripMargin).isEmpty)

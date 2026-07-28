@@ -13,10 +13,14 @@ import org.apache.spark.sql.functions._
   *   lineage  source_file (kept when the connector already added it),
   *            row_idx, record_hash
   *
-  * record_hash is a SHA-256 over the business columns in SORTED column-name
-  * order with explicit null/empty markers, so it is stable across column
-  * reordering and distinguishes null from empty string. It fingerprints the
-  * record content for downstream duplicate analysis; it is not a key.
+  * record_hash is a SHA-256 over the business columns in case-insensitively
+  * SORTED column-name order with explicit null/empty markers: stable across
+  * column reordering and header case changes, and it distinguishes null from
+  * empty string. Honest limits: adding or removing ANY business column
+  * changes every record's hash (cross-schema-version comparison is not
+  * supported), and values containing the field separator (U+0001) or a literal
+  * null marker (U+0000) can collide with adjacent-field or null encodings. It fingerprints
+  * record content within one schema version; it is not a key.
   */
 final class RawMetadataStamper {
 
@@ -31,7 +35,7 @@ final class RawMetadataStamper {
 
     val businessColumns = df.columns
       .filterNot(c => RawMetadataStamper.Reserved.exists(_.equalsIgnoreCase(c)))
-      .sorted
+      .sortBy(_.toLowerCase) // case-insensitive: a header case change must not shift the hash
     val hashInput = businessColumns.map(c =>
       coalesce(col(c).cast("string"), lit(RawMetadataStamper.NullMarker)))
     val recordHash =
@@ -59,9 +63,15 @@ final class RawMetadataStamper {
 object RawMetadataStamper {
   /** Names owned by the Raw layer; a source column matching one (other than
     * connector-provided source_file) fails fast rather than being renamed. */
-  val Reserved: Seq[String] = Seq(
+  /** Columns the stamper itself adds to every batch. */
+  val StampedColumns: Seq[String] = Seq(
     "run_id", "batch_id", "load_timestamp", "source_system", "feed_name",
     "file_type", "source_file", "row_idx", "record_hash")
+
+  /** Names the Raw layer owns: everything stamped, plus columns claimed by
+    * strategies (snapshot_dt) that would otherwise silently overwrite a
+    * same-named source column. */
+  val Reserved: Seq[String] = StampedColumns :+ "snapshot_dt"
 
   private val AllowedPreexisting: Set[String] = Set("source_file")
 

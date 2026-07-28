@@ -27,8 +27,14 @@ object BatchContext {
     * a replayed batch is recognizable instead of being double-loaded. */
   def deterministicBatchId(runId: String, discriminators: Seq[String]): String = {
     val digest = MessageDigest.getInstance("SHA-256")
-    val material = (runId +: discriminators).mkString("")
-    digest.digest(material.getBytes(StandardCharsets.UTF_8))
+    // Length-prefixed parts: no separator character to collide with or to
+    // embed as a raw control byte in source.
+    (runId +: discriminators).foreach { part =>
+      val bytes = part.getBytes(StandardCharsets.UTF_8)
+      digest.update((bytes.length.toString + ":").getBytes(StandardCharsets.UTF_8))
+      digest.update(bytes)
+    }
+    digest.digest()
       .map("%02x".format(_)).mkString.take(32)
   }
 }

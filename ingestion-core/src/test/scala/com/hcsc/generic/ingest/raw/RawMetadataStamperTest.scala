@@ -21,7 +21,7 @@ class RawMetadataStamperTest extends AnyFunSuite with SharedSparkSession {
   test("stamps every required metadata column with the batch's values") {
     val stamped = stamper.stamp(Seq(("S1", "H1")).toDF("subscriber_id", "hios_id"), context)
 
-    RawMetadataStamper.Reserved.foreach(c =>
+    RawMetadataStamper.StampedColumns.foreach(c =>
       assert(stamped.columns.contains(c), s"missing stamped column $c"))
 
     val row = stamped.collect().head
@@ -76,6 +76,24 @@ class RawMetadataStamperTest extends AnyFunSuite with SharedSparkSession {
     val b = BatchContext.deterministicBatchId("run-1", Seq("f1.csv", "f2.csv"))
     val c = BatchContext.deterministicBatchId("run-1", Seq("f1.csv"))
     assert(a == b && a != c && a.length == 32)
+  }
+
+  test("deterministic batch ids resist part-boundary collisions") {
+    // Length-prefixed hashing: two files must never hash like one concatenated file
+    assert(BatchContext.deterministicBatchId("run-1", Seq("f1.csv", "f2.csv")) !=
+      BatchContext.deterministicBatchId("run-1", Seq("f1.csvf2.csv")))
+    // and the run-id/discriminator boundary is protected the same way
+    assert(BatchContext.deterministicBatchId("run-1", Seq("x")) !=
+      BatchContext.deterministicBatchId("run-1x", Seq.empty))
+  }
+
+  test("record_hash is stable when a header case change renames columns") {
+    def hashOf(df: org.apache.spark.sql.DataFrame): String =
+      stamper.stamp(df, context).select("record_hash").collect().head.getString(0)
+
+    val lower = hashOf(Seq(("S1", "H1")).toDF("subscriber_id", "hios_id"))
+    val upper = hashOf(Seq(("S1", "H1")).toDF("SUBSCRIBER_ID", "HIOS_ID"))
+    assert(lower == upper, "case-insensitive column sort must keep the hash stable")
   }
 
   test("unknown strategy kind is rejected with the available list") {

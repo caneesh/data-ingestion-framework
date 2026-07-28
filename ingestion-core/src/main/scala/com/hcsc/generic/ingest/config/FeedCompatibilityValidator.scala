@@ -39,14 +39,22 @@ object FeedCompatibilityValidator {
         errors += "CFG_003 FULL_SNAPSHOT has no incremental window; boundary.overlap is contradictory"
     }
 
-    // CDC events can only become current state through a keyed merge.
-    if (rawStrategy.contains("CDC_EVENTS") &&
-        (curatedStrategy.contains("APPEND") || (curatedStrategy.isEmpty && mergeKeys.isEmpty)))
-      errors += "CFG_004 raw.strategy CDC_EVENTS requires a keyed curated merge " +
-        "(curated.strategy TYPE1_MERGE with merge.keys); APPEND would never apply updates or deletes"
+    val curatedPresent = feed.hasPath("curated")
+    // Explicit APPEND is keyless by design (event-history curated tables);
+    // every other curated shape derives state and needs keys.
+    val keylessDerivingCurated =
+      curatedPresent && !curatedStrategy.contains("APPEND") && mergeKeys.isEmpty
+
+    // CDC events can only become current state through a keyed merge. A feed
+    // with NO curated block (raw-only CDC archive) is legitimate, as is an
+    // explicit APPEND event-history curated layer.
+    if (rawStrategy.contains("CDC_EVENTS") && keylessDerivingCurated)
+      errors += "CFG_004 raw.strategy CDC_EVENTS with a state-deriving curated layer requires " +
+        "merge.keys (curated.strategy TYPE1_MERGE); use curated.strategy APPEND for event history"
 
     // A keyed merge without keys fails at runtime; catch it at startup.
-    if (curatedStrategy.contains("TYPE1_MERGE") && mergeKeys.isEmpty)
+    // MERGE is the accepted alias for TYPE1_MERGE.
+    if (curatedStrategy.exists(s => s == "TYPE1_MERGE" || s == "MERGE") && mergeKeys.isEmpty)
       errors += "CFG_005 curated.strategy TYPE1_MERGE requires curated.merge.keys"
 
     // Contract-derived reject rules need a contract to derive from.
@@ -68,15 +76,21 @@ object FeedCompatibilityValidator {
     if (sourceType.contains("file") && feed.hasPath("source.incremental"))
       errors += "CFG_008 source.incremental (JDBC watermarks) has no effect on file sources"
 
-    // An incremental JDBC feed produces window deltas. A curated layer
-    // without merge keys publishes FULL overwrites of exactly those deltas —
-    // every run would replace the curated table with only the latest window,
-    // silently discarding all earlier state.
+    // An incremental JDBC feed produces window deltas — via the legacy
+    // source.mode OR an incremental extraction strategy. A state-deriving
+    // curated layer without merge keys publishes FULL overwrites of exactly
+    // those deltas: every run would replace the curated table with only the
+    // latest window, silently discarding earlier state. (Static limits: the
+    // actual overwrite is also selected by the CLI --mode at runtime, which
+    // configuration validation cannot see — this rule closes the config-side
+    // half of that hazard.)
     val jdbcIncremental = sourceType.contains("jdbc") &&
-      opt("source.mode").contains("INCREMENTAL")
-    if (jdbcIncremental && feed.hasPath("curated") && mergeKeys.isEmpty)
-      errors += "CFG_009 an INCREMENTAL jdbc source feeding curated requires curated.merge.keys; " +
-        "a keyless curated layer would overwrite the table with only the latest extraction window"
+      (opt("source.mode").contains("INCREMENTAL") ||
+        extractionStrategy.exists(IncrementalExtraction.contains))
+    if (jdbcIncremental && keylessDerivingCurated)
+      errors += "CFG_009 an incremental jdbc source feeding a state-deriving curated layer requires " +
+        "curated.merge.keys; a keyless overwrite would keep only the latest extraction window " +
+        "(use curated.strategy APPEND for delta-history tables)"
 
     errors.result()
   }

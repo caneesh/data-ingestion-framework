@@ -62,10 +62,11 @@ final class SqlPlanRenderer(dialect: JdbcDialect) {
 
   private def partitionPredicate(partition: ExtractionPartition): String = partition match {
     case PredicateSlice(predicate, _) => predicate
-    case RangeSlice(column, lo, hi, upperInclusive, includeNulls, _) =>
+    case RangeSlice(column, lo, hi, includeNulls, _) =>
       val q = dialect.quoteIdentifier(column)
-      val upperOp = if (upperInclusive) "<=" else "<"
-      val range = s"$q >= $lo AND $q $upperOp $hi"
+      val clauses = lo.map(v => s"$q >= $v").toSeq ++ hi.map(v => s"$q < $v").toSeq
+      require(clauses.nonEmpty, "EXT_002 a range slice needs at least one bound")
+      val range = clauses.mkString(" AND ")
       if (includeNulls) s"($range) OR $q IS NULL" else range
   }
 

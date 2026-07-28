@@ -27,13 +27,31 @@ object BoundaryType {
 final case class BoundaryColumn(name: String, columnType: String)
 
 /** A typed position on the boundary axis; composite boundaries carry one
-  * value per column, ordered lexicographically. Serialized with '|'. */
+  * value per column, ordered lexicographically. Serialized with '|', with
+  * backslash-escaping of '|' and '\' inside values — STRING tie-break
+  * values come from live source rows, and an unescaped pipe would poison
+  * the stored checkpoint permanently (arity mismatch on every later run).
+  * Values without those characters serialize exactly as before, so existing
+  * stored checkpoints parse unchanged. */
 final case class BoundaryValue(values: Seq[String]) {
-  def serialized: String = values.mkString("|")
+  def serialized: String =
+    values.map(_.replace("\\", "\\\\").replace("|", "\\|")).mkString("|")
 }
 
 object BoundaryValue {
-  def deserialize(s: String): BoundaryValue = BoundaryValue(s.split("\\|", -1).toSeq)
+  def deserialize(s: String): BoundaryValue = {
+    val parts = scala.collection.mutable.ArrayBuffer.empty[String]
+    val current = new StringBuilder
+    var i = 0
+    while (i < s.length) {
+      val c = s.charAt(i)
+      if (c == '\\' && i + 1 < s.length) { current.append(s.charAt(i + 1)); i += 2 }
+      else if (c == '|') { parts += current.toString; current.clear(); i += 1 }
+      else { current.append(c); i += 1 }
+    }
+    parts += current.toString
+    BoundaryValue(parts.toList)
+  }
 }
 
 /** The extraction window. HalfOpen is strictly-greater-than `lower` and, when

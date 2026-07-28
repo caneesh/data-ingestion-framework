@@ -136,13 +136,39 @@ class ParserAndRendererTest extends AnyFunSuite {
     assert(rendered.dbtable == "(SELECT [claim_id], [amount] FROM dbo.claims WHERE (state = 'IL')) src")
   }
 
-  test("range slices render disjoint predicates with NULLs in the first slice only") {
+  test("range slices render open-ended edge predicates with NULLs in the first slice only") {
     val partitions = Seq(
-      RangeSlice("claim_id", 1L, 5L, upperInclusive = false, includeNulls = true, index = 0),
-      RangeSlice("claim_id", 5L, 10L, upperInclusive = true, includeNulls = false, index = 1))
+      RangeSlice("claim_id", None, Some(5L), includeNulls = true, index = 0),
+      RangeSlice("claim_id", Some(5L), Some(10L), includeNulls = false, index = 1),
+      RangeSlice("claim_id", Some(10L), None, includeNulls = false, index = 2))
     val rendered = renderer.render(plainPlan(ExtractionBoundary.Unbounded, partitions = partitions))
     assert(rendered.partitionPredicates == Seq(
-      "([claim_id] >= 1 AND [claim_id] < 5) OR [claim_id] IS NULL",
-      "[claim_id] >= 5 AND [claim_id] <= 10"))
+      "([claim_id] < 5) OR [claim_id] IS NULL",
+      "[claim_id] >= 5 AND [claim_id] < 10",
+      "[claim_id] >= 10"))
+  }
+
+  test("boundary values with pipes and backslashes round-trip through serialization") {
+    val tricky = BoundaryValue(Seq("2026-07-28 10:00:00", "AB|CD", "x\\y", "trailing\\"))
+    assert(BoundaryValue.deserialize(tricky.serialized) == tricky)
+    // Plain values keep their historical wire form — stored checkpoints parse unchanged
+    assert(BoundaryValue(Seq("a", "b")).serialized == "a|b")
+    assert(BoundaryValue.deserialize("a|b") == BoundaryValue(Seq("a", "b")))
+  }
+
+  test("MySQL string literals escape backslashes so values cannot break out of the quote") {
+    import com.hcsc.generic.ingest.jdbc.dialect.MySqlDialect
+    assert(MySqlDialect.renderLiteral("STRING", "end\\") == "'end\\\\'")
+    assert(MySqlDialect.renderLiteral("STRING", "a'b") == "'a''b'")
+    assert(MySqlDialect.renderLiteral("NUMBER", "42") == "42")
+  }
+
+  test("blank filter entries and non-numeric overlap fail at parse with EXT_001") {
+    def failMessage2(hocon: String): String =
+      intercept[IllegalArgumentException](ExtractionSpecParser.parse(ConfigFactory.parseString(hocon))).getMessage
+    assert(failMessage2("""extraction { strategy = "T", table = "t", filters = ["", "x=1"] }""")
+      .contains("blank"))
+    assert(failMessage2("""extraction { strategy = "T", table = "t", boundary { overlap = "abc" } }""")
+      .contains("not numeric"))
   }
 }

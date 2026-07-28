@@ -30,7 +30,10 @@ final case class CuratedTarget(
 }
 
 /** Metrics for one curated processing run — the audit/observability payload.
-  * -1 marks "not measured" (same convention as StageCounts). */
+  * -1 marks "not measured" (same convention as StageCounts).
+  * `duplicateRows` counts EVERY row removed before publish: null/blank-key
+  * drops plus deduplication losers — so `inputRows = published-incoming +
+  * duplicateRows` always balances for merge strategies. */
 final case class CuratedMetrics(
   inputRows: Long,
   duplicateRows: Long,

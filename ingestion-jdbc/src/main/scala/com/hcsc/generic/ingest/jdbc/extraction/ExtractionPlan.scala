@@ -16,14 +16,16 @@ object Relation {
   * including NULL partition-column rows. */
 sealed trait ExtractionPartition { def index: Int }
 object ExtractionPartition {
-  /** [lowerInclusive, upperBound) — or inclusive upper on the final slice.
+  /** Half-open [lowerInclusive, upperExclusive) with OPTIONAL bounds: the
+    * first slice has no lower bound and the last no upper bound, matching
+    * Spark's own JDBC partitioning — configured/probed bounds size the
+    * strides, they never FILTER, so rows outside them are still read.
     * `includeNulls` puts NULL partition-column rows into this slice so they
     * are never silently dropped. */
   final case class RangeSlice(
     column: String,
-    lowerInclusive: Long,
-    upperBound: Long,
-    upperInclusive: Boolean,
+    lowerInclusive: Option[Long],
+    upperExclusive: Option[Long],
     includeNulls: Boolean,
     index: Int
   ) extends ExtractionPartition

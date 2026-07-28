@@ -30,7 +30,7 @@ final class SnapshotReplaceStrategy(
 
   def process(input: DataFrame, target: CuratedTarget, ctx: RunContext): CuratedMetrics = {
     val (metrics, elapsed) = preparation.timed {
-      val prepared = preparation.prepare(input, target)
+      val prepared = preparation.ensureAudit(input)
       val inputRows = prepared.count()
 
       val (deduplicated, duplicateRows, resolvedKeys) =
@@ -61,11 +61,16 @@ final class SnapshotReplaceStrategy(
         if (spark.catalog.tableExists(target.fullTable))
           transform.align(deduplicated, spark.table(target.fullTable).schema, contract)
         else deduplicated
+      // Validate the frame that will actually publish — post-align, so
+      // cast-induced corruption is caught before the swap.
+      preparation.validateFinal(toPublish, target)
       val published = publisher.publish(toPublish, request(target), ctx)
 
+      // -1 sentinels survive to the metrics: "not measured" (keyless or
+      // first run) must stay distinguishable from a measured zero.
       CuratedMetrics(inputRows, duplicateRows, published.publishedCount,
         insertRows = if (inserts >= 0) inserts else published.publishedCount,
-        updateRows = math.max(updates, 0L), deleteRows = math.max(deletes, 0L), durationMillis = 0L)
+        updateRows = updates, deleteRows = deletes, durationMillis = 0L)
     }
     logger.info(s"[Curated] $kind ${target.fullTable}: $metrics")
     metrics.copy(durationMillis = elapsed)

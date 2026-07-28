@@ -95,13 +95,11 @@ final class HiveWatermarkStore(spark: SparkSession, database: String, table: Str
     detail: WatermarkCommitDetail = WatermarkCommitDetail.empty
   ): Unit = {
     import spark.implicits._
-    spark.sql(s"CREATE DATABASE IF NOT EXISTS $database")
-    spark.sql(
-      s"""CREATE TABLE IF NOT EXISTS $fullTable (
-         |  entity STRING, watermark_value STRING, run_id STRING,
-         |  watermark_version BIGINT, lower_value STRING, query_hash STRING,
-         |  updated_ts TIMESTAMP
-         |) USING ORC""".stripMargin)
+    com.hcsc.generic.ingest.hive.HiveTables.ensure(
+      spark, database, fullTable,
+      "entity STRING, watermark_value STRING, run_id STRING, " +
+        "watermark_version BIGINT, lower_value STRING, query_hash STRING, " +
+        "updated_ts TIMESTAMP")
 
     val current = latestVersioned(entity).map(_.version).getOrElse(0L)
     if (current != expectedVersion)

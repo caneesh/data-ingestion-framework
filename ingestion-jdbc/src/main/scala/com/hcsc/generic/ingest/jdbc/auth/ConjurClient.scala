@@ -206,7 +206,7 @@ final class ConjurClient(config: ConjurConfig) {
         try out.write(bytes) finally out.close()
       }
       val status = connection.getResponseCode
-      val text = readAll(
+      val text = VaultHttp.readAll(
         if (status >= 200 && status < 300) connection.getInputStream
         else connection.getErrorStream)
       val retryAfterMs = Option(connection.getHeaderField("Retry-After"))
@@ -308,20 +308,6 @@ final class ConjurClient(config: ConjurConfig) {
   /** Encodes one path segment; '/' inside ids becomes %2F as Conjur requires. */
   private def encodePathSegment(value: String): String =
     URLEncoder.encode(value, StandardCharsets.UTF_8.name()).replace("+", "%20")
-
-  private def readAll(stream: java.io.InputStream): String = {
-    if (stream == null) return ""
-    try {
-      val out = new java.io.ByteArrayOutputStream()
-      val buffer = new Array[Byte](8192)
-      var read = stream.read(buffer)
-      while (read != -1) {
-        out.write(buffer, 0, read)
-        read = stream.read(buffer)
-      }
-      new String(out.toByteArray, StandardCharsets.UTF_8)
-    } finally stream.close()
-  }
 
   /** Error bodies are truncated — authentication systems sometimes echo
     * sensitive request details. */

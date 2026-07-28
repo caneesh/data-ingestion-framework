@@ -233,7 +233,7 @@ object JdbcSourceConfig {
       filters = filters,
       parameters = parameters,
       pipelineParameters = ConfigUtils.optConfig(source, "pipeline_parameters")
-        .map(c => ConfigUtils.stringMap(c.atKey("p"), "p")).getOrElse(Map.empty),
+        .map(ConfigUtils.flatStringMap).getOrElse(Map.empty),
       executorProbePartitions = ConfigUtils.optConfig(source, "health_check")
         .filter(h => ConfigUtils.optBoolean(h, "executor_probe").getOrElse(false))
         .map(h => ConfigUtils.optInt(h, "probe_partitions").getOrElse(2))
@@ -249,7 +249,7 @@ object JdbcSourceConfig {
     */
   private def userConnectionProperties(source: Config): Map[String, String] = {
     val props = ConfigUtils.optConfig(source, "connection_properties")
-      .map(c => ConfigUtils.stringMap(c.atKey("p"), "p")).getOrElse(Map.empty)
+      .map(ConfigUtils.flatStringMap).getOrElse(Map.empty)
 
     def truthy(v: String) = {
       val t = v.trim.toLowerCase

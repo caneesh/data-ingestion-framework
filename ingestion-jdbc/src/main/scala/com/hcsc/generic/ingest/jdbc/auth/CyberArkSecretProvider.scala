@@ -5,7 +5,6 @@ import com.typesafe.config.{Config, ConfigFactory}
 import org.apache.log4j.Logger
 
 import java.net.{HttpURLConnection, URL, URLEncoder}
-import java.nio.charset.StandardCharsets
 import scala.collection.JavaConverters._
 
 /**
@@ -84,26 +83,16 @@ object CyberArkSecretProvider extends SecretProvider {
     def required(key: String): String = ConfigUtils.optString(conf, key).getOrElse(
       throw new IllegalArgumentException(s"JDBC_003 cyberark secret reference requires '$key'"))
 
-    val base = required("url").stripSuffix("/")
-    if (!base.startsWith("https://") && !base.startsWith("http://"))
-      throw new IllegalArgumentException(s"JDBC_003 cyberark url '$base' must be an http(s) URL")
-    // CCP responses carry the retrieved credential: plain http ships it in
-    // cleartext. Rejected unless explicitly approved for isolated development
-    // setups (same gate as the Conjur provider).
-    if (base.startsWith("http://")) {
-      if (!ConfigUtils.optBoolean(conf, "allow_insecure_http").getOrElse(false))
-        throw new IllegalArgumentException(
-          s"JDBC_003 cyberark url '$base' uses plain http, which transmits retrieved credentials " +
-            "in cleartext; use https, or set allow_insecure_http = true only for isolated " +
-            "non-production environments")
+    val base = VaultHttp.requireSecureBase(conf, required("url"),
+      provider = "cyberark", transmitted = "retrieved credentials")
+    if (base.startsWith("http://"))
       logger.warn("[CyberArk] CCP url uses plain http (allow_insecure_http=true); " +
         "credentials transit unencrypted — never use this outside isolated development")
-    }
 
     val params =
       Seq("AppID" -> required("app_id"), "Safe" -> required("safe"), "Object" -> required("object")) ++
         ConfigUtils.optString(conf, "folder").map("Folder" -> _).toSeq ++
-        ConfigUtils.optConfig(conf, "params").map(p => ConfigUtils.stringMap(p.atKey("p"), "p")).getOrElse(Map.empty)
+        ConfigUtils.optConfig(conf, "params").map(ConfigUtils.flatStringMap).getOrElse(Map.empty)
 
     val query = params.map { case (k, v) =>
       s"${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
@@ -123,7 +112,7 @@ object CyberArkSecretProvider extends SecretProvider {
     connection.setReadTimeout(readMs)
     try {
       val status = connection.getResponseCode
-      val body = readAll(
+      val body = VaultHttp.readAll(
         if (status >= 200 && status < 300) connection.getInputStream else connection.getErrorStream)
       if (status < 200 || status >= 300)
         throw new IllegalArgumentException(
@@ -135,20 +124,6 @@ object CyberArkSecretProvider extends SecretProvider {
         throw new IllegalArgumentException(
           s"JDBC_002 CyberArk CCP request to ${sanitized(requestUrl)} failed: ${e.getMessage}", e)
     } finally connection.disconnect()
-  }
-
-  private def readAll(stream: java.io.InputStream): String = {
-    if (stream == null) return ""
-    try {
-      val out = new java.io.ByteArrayOutputStream()
-      val buffer = new Array[Byte](8192)
-      var read = stream.read(buffer)
-      while (read != -1) {
-        out.write(buffer, 0, read)
-        read = stream.read(buffer)
-      }
-      new String(out.toByteArray, StandardCharsets.UTF_8)
-    } finally stream.close()
   }
 
   /** JSON is valid HOCON, so the response parses without a JSON dependency.

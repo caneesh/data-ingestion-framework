@@ -363,10 +363,12 @@ object JdbcSource extends Source with WatermarkAdvancing {
         "JDBC_003 Cannot determine watermark identity; set incremental.watermark_name"))
 }
 
+/** Driver class-name constants, kept for external callers. The dialects are
+  * the single source of truth; these are aliases, not a second copy. */
 object JdbcDrivers {
-  val SqlServer = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
-  val Db2 = "com.ibm.db2.jcc.DB2Driver"
-  val Oracle = "oracle.jdbc.OracleDriver"
-  val PostgreSQL = "org.postgresql.Driver"
-  val MySQL = "com.mysql.cj.jdbc.Driver"
+  val SqlServer: String = dialect.SqlServerDialect.defaultDriver
+  val Db2: String = dialect.Db2Dialect.defaultDriver
+  val Oracle: String = dialect.OracleDialect.defaultDriver
+  val PostgreSQL: String = dialect.PostgresDialect.defaultDriver
+  val MySQL: String = dialect.MySqlDialect.defaultDriver
 }

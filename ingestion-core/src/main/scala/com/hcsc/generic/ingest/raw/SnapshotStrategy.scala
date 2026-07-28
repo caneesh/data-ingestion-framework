@@ -33,13 +33,19 @@ final class SnapshotStrategy extends RawWriteStrategy {
       target.path.foreach(p => writer = writer.option("path", p))
       writer.partitionBy(partitionKeys: _*).saveAsTable(target.fullTable)
     } else {
-      // Dynamic partition overwrite via a PER-WRITE option — never a session
-      // conf mutation, which under concurrent feeds could revert to static
-      // mid-write and turn partition replacement into whole-table overwrite.
-      AppendBatchStrategy.alignToTarget(spark, withPartitions, target.fullTable, logger)
-        .write.mode(SaveMode.Overwrite)
-        .option("partitionOverwriteMode", "dynamic")
-        .insertInto(target.fullTable)
+      // Dynamic partition overwrite MUST be a session setting here: per-write
+      // options never reach insertInto's plan for catalog tables (they are
+      // silently ignored, turning partition replacement into whole-table
+      // overwrite). Scoped set + finally-restore confines the mutation to
+      // this write.
+      AppendBatchStrategy.withSessionConf(spark, Seq(
+        "spark.sql.sources.partitionOverwriteMode" -> "dynamic",
+        "hive.exec.dynamic.partition" -> "true",
+        "hive.exec.dynamic.partition.mode" -> "nonstrict")) {
+        AppendBatchStrategy.alignToTarget(spark, withPartitions, target.fullTable, logger)
+          .write.mode(SaveMode.Overwrite)
+          .insertInto(target.fullTable)
+      }
     }
     logger.info(s"[RawWrite] snapshot_dt=$snapshotDt written to ${target.fullTable} ($rows rows)")
     RawWriteResult(target.fullTable, context.batchId, rows, detail = s"snapshot_dt=$snapshotDt")

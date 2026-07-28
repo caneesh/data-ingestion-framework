@@ -41,19 +41,27 @@ final class AppendBatchStrategy extends RawWriteStrategy {
 
 object AppendBatchStrategy {
 
-  /** Enables Hive dynamic partitioning for `body`, restoring the previous
-    * session values afterwards. */
-  private[raw] def withDynamicPartitions[A](spark: SparkSession)(body: => A): A = {
-    val keys = Seq("hive.exec.dynamic.partition", "hive.exec.dynamic.partition.mode")
-    val previous = keys.map(k => k -> spark.conf.getOption(k))
-    spark.conf.set(keys.head, "true")
-    spark.conf.set(keys(1), "nonstrict")
+  /** Applies session settings for the duration of `body`, restoring the
+    * previous values afterwards — even on failure. The conf is still
+    * session-global while `body` runs, so concurrent writers sharing one
+    * SparkSession see the temporary values; the guarantee here is that
+    * nothing LEAKS past the write. */
+  private[raw] def withSessionConf[A](spark: SparkSession, settings: Seq[(String, String)])(body: => A): A = {
+    val previous = settings.map { case (k, _) => k -> spark.conf.getOption(k) }
+    settings.foreach { case (k, v) => spark.conf.set(k, v) }
     try body
     finally previous.foreach {
       case (k, Some(v)) => spark.conf.set(k, v)
       case (k, None)    => spark.conf.unset(k)
     }
   }
+
+  /** Enables Hive dynamic partitioning for `body`, restoring the previous
+    * session values afterwards. */
+  private[raw] def withDynamicPartitions[A](spark: SparkSession)(body: => A): A =
+    withSessionConf(spark, Seq(
+      "hive.exec.dynamic.partition" -> "true",
+      "hive.exec.dynamic.partition.mode" -> "nonstrict"))(body)
 
   /** insertInto is positional: select the frame in the target's column order.
     * Missing target columns fail; extra source columns are dropped loudly. */

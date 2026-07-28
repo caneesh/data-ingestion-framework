@@ -68,6 +68,16 @@ object FeedCompatibilityValidator {
     if (sourceType.contains("file") && feed.hasPath("source.incremental"))
       errors += "CFG_008 source.incremental (JDBC watermarks) has no effect on file sources"
 
+    // An incremental JDBC feed produces window deltas. A curated layer
+    // without merge keys publishes FULL overwrites of exactly those deltas —
+    // every run would replace the curated table with only the latest window,
+    // silently discarding all earlier state.
+    val jdbcIncremental = sourceType.contains("jdbc") &&
+      opt("source.mode").contains("INCREMENTAL")
+    if (jdbcIncremental && feed.hasPath("curated") && mergeKeys.isEmpty)
+      errors += "CFG_009 an INCREMENTAL jdbc source feeding curated requires curated.merge.keys; " +
+        "a keyless curated layer would overwrite the table with only the latest extraction window"
+
     errors.result()
   }
 }

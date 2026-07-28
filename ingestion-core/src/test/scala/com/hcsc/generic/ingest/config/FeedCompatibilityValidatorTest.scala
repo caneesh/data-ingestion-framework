@@ -70,6 +70,20 @@ class FeedCompatibilityValidatorTest extends AnyFunSuite {
       .exists(_.contains("CFG_008")))
   }
 
+  test("incremental jdbc feeding a keyless curated layer is rejected (CFG_009)") {
+    assert(errorsOf(
+      """source { type = "jdbc", mode = "INCREMENTAL" }
+        |curated { database = "d", table = "t", merge { keys = [] } }""".stripMargin)
+      .exists(_.contains("CFG_009")))
+    // Keys make it coherent; FULL mode without keys stays legal (true snapshots)
+    assert(errorsOf(
+      """source { type = "jdbc", mode = "INCREMENTAL" }
+        |curated { merge { keys = ["id"] } }""".stripMargin).isEmpty)
+    assert(errorsOf(
+      """source { type = "jdbc", mode = "FULL_TABLE" }
+        |curated { merge { keys = [] } }""".stripMargin).isEmpty)
+  }
+
   test("multiple incompatibilities are all reported") {
     val errors = errorsOf(
       """source { type = "file", extraction { strategy = "TIMESTAMP" } }

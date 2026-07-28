@@ -63,8 +63,14 @@ final class CuratedTransform(spark: SparkSession) {
     val existingOrder = orderBy.flatMap(o => df.columns.find(_.equalsIgnoreCase(o)))
     if (existingOrder.isEmpty) df.dropDuplicates(keys)
     else {
+      // Rows tied on every order_by column previously produced an arbitrary
+      // winner (partition-layout dependent). row_idx — when present from RAW
+      // metadata — is a stable final tie-break: the later-read row wins,
+      // making replays and retries pick the same record every time.
+      val tieBreak = df.columns.find(_.equalsIgnoreCase("row_idx"))
+        .map(c => col(c).desc_nulls_last).toSeq
       val w = Window.partitionBy(keys.map(col): _*)
-        .orderBy(existingOrder.map(c => col(c).desc_nulls_last): _*)
+        .orderBy(existingOrder.map(c => col(c).desc_nulls_last) ++ tieBreak: _*)
       df.withColumn("_rn", row_number().over(w))
         .filter(col("_rn") === 1)
         .drop("_rn")

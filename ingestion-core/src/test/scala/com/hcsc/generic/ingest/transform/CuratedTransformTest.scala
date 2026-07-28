@@ -227,6 +227,28 @@ class CuratedTransformTest extends AnyFunSuite with SharedSparkSession {
     assert(aRow == 200)
   }
 
+  test("deduplicate breaks order_by ties deterministically via row_idx when present") {
+    import spark.implicits._
+    // Both A-rows tie on ts; row_idx must decide (later-read row wins),
+    // making the winner stable across replays and partition layouts.
+    val df = Seq(
+      ("A", "first", 100, 1L),
+      ("A", "second", 100, 2L),
+      ("B", "only", 300, 3L)
+    ).toDF("key", "payload", "ts", "row_idx")
+    (1 to 3).foreach { _ =>
+      val result = transform.deduplicate(df, Seq("key"), orderBy = Seq("ts"))
+      val winner = result.filter(result("key") === "A").select("payload").as[String].collect().head
+      assert(winner == "second", "the higher row_idx must win every time")
+    }
+  }
+
+  test("deduplicate without a row_idx column keeps the historical behavior") {
+    import spark.implicits._
+    val df = Seq(("A", 100, 1), ("A", 200, 2), ("B", 300, 3)).toDF("key", "amount", "ts")
+    assert(transform.deduplicate(df, Seq("key"), orderBy = Seq("ts")).count() == 2)
+  }
+
   test("deduplicate falls back to dropDuplicates when orderBy column not in DataFrame") {
     import spark.implicits._
     val df = Seq(

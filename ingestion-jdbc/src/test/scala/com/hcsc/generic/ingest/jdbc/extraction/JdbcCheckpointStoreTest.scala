@@ -47,25 +47,30 @@ class JdbcCheckpointStoreTest extends AnyFunSuite {
 
   test("retry decorator retries transient failures but never a lost CAS") {
     var attempts = 0
+    var commitCalls = 0
     val flaky = new CheckpointStore {
       def latest(entity: String): Option[Checkpoint] = {
         attempts += 1
         if (attempts < 3) throw new java.sql.SQLException("connection reset")
         store.latest(entity)
       }
-      def commit(cp: Checkpoint, expectedVersion: Long): Unit =
+      def commit(cp: Checkpoint, expectedVersion: Long): Unit = {
+        commitCalls += 1
         throw new CheckpointConflictException(cp.entity, expectedVersion, 99L)
+      }
     }
     val retrying = new RetryingCheckpointStore(flaky, maxAttempts = 3, backoffMs = 1L)
 
     assert(retrying.latest("e1").exists(_.version == 2L), "third attempt succeeds")
     assert(attempts == 3)
 
-    val conflictAttempts = attempts
+    // A conflict triggers ONE ambiguity read-back (was our commit already
+    // applied?) and, when the stored row is someone else's, rethrows without
+    // ever re-driving the commit itself.
     intercept[CheckpointConflictException] {
       retrying.commit(checkpoint("e1", "x", 3L), expectedVersion = 2L)
     }
-    assert(attempts == conflictAttempts, "conflicts are terminal — no retry")
+    assert(commitCalls == 1, "conflicts are terminal — commit is never re-driven")
   }
 
   test("new boundary types: CDC offsets order numerically and allow overlap; snapshot ids reject overlap") {

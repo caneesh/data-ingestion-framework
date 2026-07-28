@@ -6,12 +6,21 @@ package com.hcsc.generic.ingest.jdbc.extraction
   */
 
 /** Supported boundary column types. STRING is ordering-only (composite
-  * tie-break components); it supports no overlap arithmetic. */
+  * tie-break components); it supports no overlap arithmetic. CDC_OFFSET and
+  * SNAPSHOT_ID are numerically ordered positions (log offsets, LSN/SCN as
+  * numbers, snapshot sequence numbers): CDC offsets allow numeric overlap
+  * (deliberate offset re-reads), snapshot ids do not — a snapshot id is an
+  * identity, not a measure. */
 object BoundaryType {
   val Timestamp = "TIMESTAMP"
   val Numeric = "NUMERIC"
   val StringType = "STRING"
-  val all: Seq[String] = Seq(Timestamp, Numeric, StringType)
+  val CdcOffset = "CDC_OFFSET"
+  val SnapshotId = "SNAPSHOT_ID"
+  val all: Seq[String] = Seq(Timestamp, Numeric, StringType, CdcOffset, SnapshotId)
+
+  /** Types whose values compare and render as numbers. */
+  private[extraction] val numericFamily: Set[String] = Set(Numeric, CdcOffset, SnapshotId)
 }
 
 /** One boundary column: canonical name plus its BoundaryType. */
@@ -51,11 +60,10 @@ object BoundaryOrdering {
     0
   }
 
-  private def comparePart(columnType: String, a: String, b: String): Int = columnType match {
-    case BoundaryType.Numeric    => parseNumeric(a).compare(parseNumeric(b))
-    case BoundaryType.StringType => a.compareTo(b)
-    case _                       => parseTimestamp(a).compareTo(parseTimestamp(b))
-  }
+  private def comparePart(columnType: String, a: String, b: String): Int =
+    if (BoundaryType.numericFamily.contains(columnType)) parseNumeric(a).compare(parseNumeric(b))
+    else if (columnType == BoundaryType.StringType) a.compareTo(b)
+    else parseTimestamp(a).compareTo(parseTimestamp(b))
 
   private[extraction] def parseNumeric(value: String): BigDecimal =
     try BigDecimal(value.trim)
@@ -80,11 +88,14 @@ object OverlapPolicy {
       case Some(amount) =>
         require(columns.nonEmpty && value.values.nonEmpty, "EXT_002 overlap requires at least one boundary column")
         val widened = columns.head.columnType match {
-          case BoundaryType.Numeric =>
+          case BoundaryType.Numeric | BoundaryType.CdcOffset =>
             (BoundaryOrdering.parseNumeric(value.values.head) - amount).toString
           case BoundaryType.StringType =>
             throw new IllegalArgumentException(
               "EXT_002 overlap is not supported for STRING boundary columns (no arithmetic ordering)")
+          case BoundaryType.SnapshotId =>
+            throw new IllegalArgumentException(
+              "EXT_002 overlap is not supported for SNAPSHOT_ID boundaries (a snapshot id is an identity, not a measure)")
           case _ =>
             val ts = BoundaryOrdering.parseTimestamp(value.values.head)
             new java.sql.Timestamp(ts.getTime - (amount * 1000).toLong).toString

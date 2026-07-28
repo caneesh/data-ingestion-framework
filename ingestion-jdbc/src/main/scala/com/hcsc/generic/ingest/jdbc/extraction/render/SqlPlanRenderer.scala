@@ -76,7 +76,7 @@ final class SqlPlanRenderer(dialect: JdbcDialect) {
 
   /** BoundaryType -> the dialect's literal-type vocabulary. */
   private def literalType(boundaryType: String): String = boundaryType match {
-    case BoundaryType.Numeric    => "NUMBER"
+    case BoundaryType.Numeric | BoundaryType.CdcOffset | BoundaryType.SnapshotId => "NUMBER"
     case BoundaryType.StringType => "STRING"
     case _                       => "TIMESTAMP"
   }

@@ -63,7 +63,7 @@ class RawWriteStrategiesSpec extends AnyFunSuite with BeforeAndAfterAll {
     new RawWriter(new RawMetadataStamper, RawWriteStrategies.forKind(kind))
 
   private def df(rows: (String, String)*) = {
-    import spark.implicits._
+    val stable = spark; import stable.implicits._
     rows.toDF("subscriber_id", "hios_id")
   }
 
@@ -121,7 +121,7 @@ class RawWriteStrategiesSpec extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   test("CDC_EVENTS appends events verbatim — no collapsing") {
-    import spark.implicits._
+    val stable = spark; import stable.implicits._
     val events = Seq(
       ("K1", "I", 1L, "v1"),
       ("K1", "U", 2L, "v2"),

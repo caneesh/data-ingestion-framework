@@ -101,57 +101,97 @@ final class FileIntakeService(
   /** Stages landing files for processing. None = feed uses a static path. */
   def stage(ctx: RunContext): Option[Seq[StagedFile]] = layout.map { l =>
     val fs = FsUtils.fileSystem(l.landing, hadoopConf)
-    // fromLanding=false marks leftovers of a crashed run already in inprogress
-    val candidates =
-      FsUtils.listFiles(fs, l.landing).map(_ -> true) ++
-        FsUtils.listFiles(fs, l.inprogress).map(_ -> false)
+    val candidates = listCandidates(fs, l)
     logger.info(s"[FileIntake] Found ${candidates.size} candidate file(s) in landing/inprogress")
 
     val knownChecksums = if (idempotencyEnabled) processedChecksums(ctx.entity) else Set.empty[String]
-    // Checksums accepted in THIS batch: two identical files arriving together
-    // must not both stage (the registry only records completed runs).
     val stagedChecksums = scala.collection.mutable.Set.empty[String]
 
     candidates.flatMap { case (status, fromLanding) =>
-      val file = status.getPath
-      val name = file.getName
-      // Skip validator sidecar files themselves
-      if (isSidecar(name)) None
-      else {
-        val failures = validator.validate(fs, status)
-        if (failures.nonEmpty) {
-          val reason = failures.mkString("; ")
-          val dest = if (ctx.dryRun) file else FsUtils.moveToDir(fs, file, l.quarantine)
-          audit.recordFile(ctx, name, dest.toString, "", status.getLen, FileStatuses.Quarantined, reason)
-          logger.warn(s"[FileIntake] Quarantined $name: $reason")
-          None
-        } else {
-          // Per-file physical header + contract validation (multi-file
-          // batch safety: an invalid file must never contaminate the batch)
-          headerCheck(ctx, fs, l, status) match {
-            case HeaderCheck.Invalid => None
-            case HeaderCheck.SkipEmpty => None
-            case HeaderCheck.Ok(fingerprint) =>
-              val checksum = FsUtils.checksum(fs, file)
-              val duplicate = idempotencyEnabled && !ctx.forceReprocess &&
-                (knownChecksums.contains(checksum) || stagedChecksums.contains(checksum))
-              if (duplicate) {
-                handleDuplicate(ctx, fs, l, status, checksum)
-              } else {
-                if (idempotencyEnabled) stagedChecksums += checksum
-                val staged = if (ctx.dryRun) file else FsUtils.moveToDir(fs, file, l.inprogress)
-                // Re-staged leftovers were audited VALIDATED when first staged;
-                // don't write a duplicate audit row on restart.
-                if (fromLanding)
-                  audit.recordFile(ctx, name, staged.toString, checksum, status.getLen, FileStatuses.Validated)
-                else
-                  logger.info(s"[FileIntake] Re-staged leftover inprogress file $name (restart)")
-                Some(StagedFile(name, file.toString, staged.toString, checksum, status.getLen, fingerprint))
-              }
-          }
-        }
-      }
+      processCandidate(ctx, fs, l, status, fromLanding, knownChecksums, stagedChecksums)
     }
+  }
+
+  /** Lists candidate files from landing (new) and inprogress (leftover from crash). */
+  private def listCandidates(
+    fs: org.apache.hadoop.fs.FileSystem,
+    l: FolderLayout
+  ): Seq[(org.apache.hadoop.fs.FileStatus, Boolean)] =
+    FsUtils.listFiles(fs, l.landing).map(_ -> true) ++
+      FsUtils.listFiles(fs, l.inprogress).map(_ -> false)
+
+  /** Processes a single candidate file: validate, check headers, handle duplicates, stage. */
+  private def processCandidate(
+    ctx: RunContext,
+    fs: org.apache.hadoop.fs.FileSystem,
+    l: FolderLayout,
+    status: org.apache.hadoop.fs.FileStatus,
+    fromLanding: Boolean,
+    knownChecksums: Set[String],
+    stagedChecksums: scala.collection.mutable.Set[String]
+  ): Option[StagedFile] = {
+    val file = status.getPath
+    val name = file.getName
+
+    if (isSidecar(name)) return None
+
+    val failures = validator.validate(fs, status)
+    if (failures.nonEmpty) {
+      quarantineInvalid(ctx, fs, l, status, failures.mkString("; "))
+      return None
+    }
+
+    headerCheck(ctx, fs, l, status) match {
+      case HeaderCheck.Invalid => None
+      case HeaderCheck.SkipEmpty => None
+      case HeaderCheck.Ok(fingerprint) =>
+        val checksum = FsUtils.checksum(fs, file)
+        val duplicate = idempotencyEnabled && !ctx.forceReprocess &&
+          (knownChecksums.contains(checksum) || stagedChecksums.contains(checksum))
+        if (duplicate)
+          handleDuplicate(ctx, fs, l, status, checksum)
+        else
+          stageValidFile(ctx, fs, l, status, checksum, fingerprint, fromLanding, stagedChecksums)
+    }
+  }
+
+  /** Quarantines a file that failed validation. */
+  private def quarantineInvalid(
+    ctx: RunContext,
+    fs: org.apache.hadoop.fs.FileSystem,
+    l: FolderLayout,
+    status: org.apache.hadoop.fs.FileStatus,
+    reason: String
+  ): Unit = {
+    val file = status.getPath
+    val dest = if (ctx.dryRun) file else FsUtils.moveToDir(fs, file, l.quarantine)
+    audit.recordFile(ctx, file.getName, dest.toString, "", status.getLen, FileStatuses.Quarantined, reason)
+    logger.warn(s"[FileIntake] Quarantined ${file.getName}: $reason")
+  }
+
+  /** Stages a valid, non-duplicate file for processing. */
+  private def stageValidFile(
+    ctx: RunContext,
+    fs: org.apache.hadoop.fs.FileSystem,
+    l: FolderLayout,
+    status: org.apache.hadoop.fs.FileStatus,
+    checksum: String,
+    fingerprint: Option[String],
+    fromLanding: Boolean,
+    stagedChecksums: scala.collection.mutable.Set[String]
+  ): Option[StagedFile] = {
+    val file = status.getPath
+    val name = file.getName
+
+    if (idempotencyEnabled) stagedChecksums += checksum
+    val staged = if (ctx.dryRun) file else FsUtils.moveToDir(fs, file, l.inprogress)
+
+    if (fromLanding)
+      audit.recordFile(ctx, name, staged.toString, checksum, status.getLen, FileStatuses.Validated)
+    else
+      logger.info(s"[FileIntake] Re-staged leftover inprogress file $name (restart)")
+
+    Some(StagedFile(name, file.toString, staged.toString, checksum, status.getLen, fingerprint))
   }
 
   private sealed trait HeaderCheck

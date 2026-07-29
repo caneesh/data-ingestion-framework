@@ -136,81 +136,24 @@ object SchemaValidator {
     * their configured defaults.
     */
   def validateHeaders(headers: Seq[String], contract: SchemaContract, logger: Logger): HeaderResolution = {
-    val violations = scala.collection.mutable.ArrayBuffer.empty[SchemaViolation]
-
-    val resolved: Seq[(String, Option[String])] = headers.map(h => h -> contract.resolve(h))
-
-    // HDR_003: distinct source headers identical after normalization.
-    val byNormalized = headers.groupBy(SchemaContract.normalize).filter(_._2.size > 1)
-    byNormalized.foreach { case (norm, dupes) =>
-      violations += SchemaViolation(
-        ViolationKind.DuplicateHeader,
-        s"Headers ${dupes.mkString(", ")} all normalize to '$norm'"
-      )
-    }
-
-    // HDR_005: different headers (e.g. hios_id AND plan_hios_id) resolving to
-    // the same canonical column via aliases. Never silently prefer one.
-    resolved
-      .collect { case (h, Some(target)) => (h, target) }
-      .groupBy(_._2)
-      .filter { case (_, hs) => hs.map(h => SchemaContract.normalize(h._1)).distinct.size > 1 }
-      .foreach { case (canonical, dupes) =>
-        violations += SchemaViolation(
-          ViolationKind.MultipleSourcesOneCanonical,
-          s"Source columns ${dupes.map(_._1).mkString(", ")} all map to canonical '$canonical' " +
-            "(multiple_source_mapping_policy=FAIL)"
-        )
-      }
-
-    // Renamed columns: alias matches, plus case-only differences (JDBC
-    // engines often report uppercase names) normalized to canonical case.
-    val renames = resolved.collect {
-      case (h, Some(target)) if h != target =>
-        if (!h.equalsIgnoreCase(target))
-          logger.info(s"[SchemaValidator] Header '$h' recognized as renamed column '$target'")
-        h -> target
-    }
-
+    val resolved = headers.map(h => h -> contract.resolve(h))
     val matched = resolved.collect { case (h, Some(target)) => target }
 
-    // Missing columns: required ones are violations; optional ones get their
-    // configured defaults downstream.
-    val missingRequired = contract.requiredColumns.map(_.name)
-      .filterNot(n => matched.exists(_.equalsIgnoreCase(n)))
-    missingRequired.foreach { n =>
-      violations += SchemaViolation(ViolationKind.MissingColumn, s"Required column '$n' not found in source headers")
-    }
+    val duplicateViolations = detectDuplicateHeaders(headers)
+    val conflictViolations = detectConflictingMappings(resolved)
+    val renames = extractRenames(resolved, logger)
+    val (missingRequired, missingRequiredViolations) = detectMissingRequired(matched, contract)
+    val (missingOptional, missingOptionalViolations) = detectMissingOptional(matched, contract)
+    val extraViolations = detectExtraColumns(resolved)
+    val orderViolations = detectOrderChanges(resolved, contract)
 
-    val missingOptional = contract.optionalColumns
-      .filterNot(c => matched.exists(_.equalsIgnoreCase(c.name)))
-    if (contract.policies.failOnMissingOptional) {
-      missingOptional.foreach { c =>
-        violations += SchemaViolation(ViolationKind.MissingColumn, s"Optional column '${c.name}' not found and on_missing_optional=FAIL")
-      }
-    }
-
-    // Unexpected columns.
-    resolved.collect { case (h, None) => h }.foreach { h =>
-      violations += SchemaViolation(ViolationKind.ExtraColumn, s"Unexpected source column '$h' not declared in schema contract")
-    }
-
-    // Column-order changes against declared positions (compared over the
-    // sequence of matched contract columns).
-    val matchedInOrder = resolved.flatMap(_._2)
-    matchedInOrder.zipWithIndex.foreach { case (name, actualIdx) =>
-      contract.column(name).flatMap(_.position).foreach { expected =>
-        if (expected != actualIdx)
-          violations += SchemaViolation(
-            ViolationKind.OrderChange,
-            s"Column '$name' found at position $actualIdx, contract declares position $expected"
-          )
-      }
-    }
+    val violations = duplicateViolations ++ conflictViolations ++
+      missingRequiredViolations ++ missingOptionalViolations ++
+      extraViolations ++ orderViolations
 
     HeaderResolution(
       renames = renames,
-      violations = violations.toList,
+      violations = violations,
       actualHeaders = headers,
       normalizedHeaders = headers.map(SchemaContract.normalize),
       canonicalToActual = resolved.collect { case (h, Some(t)) => t -> h }.toMap,
@@ -218,6 +161,63 @@ object SchemaValidator {
       missingOptional = missingOptional
     )
   }
+
+  private def detectDuplicateHeaders(headers: Seq[String]): Seq[SchemaViolation] =
+    headers.groupBy(SchemaContract.normalize).filter(_._2.size > 1).map { case (norm, dupes) =>
+      SchemaViolation(ViolationKind.DuplicateHeader, s"Headers ${dupes.mkString(", ")} all normalize to '$norm'")
+    }.toSeq
+
+  private def detectConflictingMappings(resolved: Seq[(String, Option[String])]): Seq[SchemaViolation] =
+    resolved
+      .collect { case (h, Some(target)) => (h, target) }
+      .groupBy(_._2)
+      .filter { case (_, hs) => hs.map(h => SchemaContract.normalize(h._1)).distinct.size > 1 }
+      .map { case (canonical, dupes) =>
+        SchemaViolation(ViolationKind.MultipleSourcesOneCanonical,
+          s"Source columns ${dupes.map(_._1).mkString(", ")} all map to canonical '$canonical' " +
+            "(multiple_source_mapping_policy=FAIL)")
+      }.toSeq
+
+  private def extractRenames(resolved: Seq[(String, Option[String])], logger: Logger): Seq[(String, String)] =
+    resolved.collect {
+      case (h, Some(target)) if h != target =>
+        if (!h.equalsIgnoreCase(target))
+          logger.info(s"[SchemaValidator] Header '$h' recognized as renamed column '$target'")
+        h -> target
+    }
+
+  private def detectMissingRequired(matched: Seq[String], contract: SchemaContract): (Seq[String], Seq[SchemaViolation]) = {
+    val missing = contract.requiredColumns.map(_.name)
+      .filterNot(n => matched.exists(_.equalsIgnoreCase(n)))
+    val violations = missing.map(n =>
+      SchemaViolation(ViolationKind.MissingColumn, s"Required column '$n' not found in source headers"))
+    (missing, violations)
+  }
+
+  private def detectMissingOptional(matched: Seq[String], contract: SchemaContract): (Seq[ColumnContract], Seq[SchemaViolation]) = {
+    val missing = contract.optionalColumns
+      .filterNot(c => matched.exists(_.equalsIgnoreCase(c.name)))
+    val violations = if (contract.policies.failOnMissingOptional)
+      missing.map(c => SchemaViolation(ViolationKind.MissingColumn,
+        s"Optional column '${c.name}' not found and on_missing_optional=FAIL"))
+    else Seq.empty
+    (missing, violations)
+  }
+
+  private def detectExtraColumns(resolved: Seq[(String, Option[String])]): Seq[SchemaViolation] =
+    resolved.collect { case (h, None) =>
+      SchemaViolation(ViolationKind.ExtraColumn, s"Unexpected source column '$h' not declared in schema contract")
+    }
+
+  private def detectOrderChanges(resolved: Seq[(String, Option[String])], contract: SchemaContract): Seq[SchemaViolation] =
+    resolved.flatMap(_._2).zipWithIndex.flatMap { case (name, actualIdx) =>
+      contract.column(name).flatMap(_.position).flatMap { expected =>
+        if (expected != actualIdx)
+          Some(SchemaViolation(ViolationKind.OrderChange,
+            s"Column '$name' found at position $actualIdx, contract declares position $expected"))
+        else None
+      }
+    }
 
   /**
     * Validates a DataFrame against the contract: data-type changes and

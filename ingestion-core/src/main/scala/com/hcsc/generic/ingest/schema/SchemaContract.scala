@@ -158,76 +158,91 @@ object SchemaContract {
     if (!conf.hasPath("schema")) return None
     val s = conf.getConfig("schema")
 
-    // header_validation / content_validation may live inside the schema block
-    // or as siblings of it (source-level layout).
     def block(name: String): Option[Config] =
       ConfigUtils.optConfig(s, name).orElse(ConfigUtils.optConfig(conf, name))
 
     val headerValidation = block("header_validation")
     val contentValidationConf = block("content_validation")
 
-    val columns = s.getConfigList("columns").asScala.map { c =>
-      // Rules may live inline on the column or in a nested `validation` block
-      val v: Config = ConfigUtils.optConfig(c, "validation").getOrElse(c)
-      val validation = ColumnValidation(
-        regex = ConfigUtils.optString(v, "regex"),
-        minLength = ConfigUtils.optInt(v, "min_length"),
-        maxLength = ConfigUtils.optInt(v, "max_length"),
-        allowedValues = ConfigUtils.stringList(v, "allowed_values"),
-        nonblank = ConfigUtils.optBoolean(v, "nonblank").getOrElse(false),
-        numericParse = ConfigUtils.optBoolean(v, "numeric_parse").getOrElse(false),
-        dateFormats = ConfigUtils.stringList(v, "accepted_date_formats"),
-        timestampFormats = ConfigUtils.stringList(v, "accepted_timestamp_formats"),
-        maxNullPercentage = ConfigUtils.optString(v, "max_null_percentage").map(_.toDouble)
-      )
-      // `default = null` in HOCON is an explicit null default; hasPath is
-      // false for null values so hasPathOrNull must be used.
-      val default =
-        if (c.hasPathOrNull("default") && !c.getIsNull("default")) Some(c.getString("default"))
-        else None
-      ColumnContract(
-        name = c.getString("name"),
-        dataType = ConfigUtils.optString(c, "type")
-          .orElse(ConfigUtils.optString(c, "data_type")).getOrElse("string"),
-        nullable = ConfigUtils.optBoolean(c, "nullable").getOrElse(true),
-        aliases = parseAliases(c),
-        position = ConfigUtils.optInt(c, "position"),
-        required = ConfigUtils.optBoolean(c, "required").getOrElse(true),
-        default = default,
-        category = ConfigUtils.optString(c, "category").getOrElse("business").toLowerCase,
-        validation = if (validation.isDefined) Some(validation) else None
-      )
-    }.toSeq
+    val columns = parseColumns(s)
+    validateColumns(columns)
 
+    val policies = parsePolicies(s, headerValidation)
+    val strategy = parseStrategy(s, headerValidation)
+    val fallback = parsePositionalFallback(headerValidation, strategy)
+    val contentValidation = parseContentValidation(contentValidationConf)
+    val (batchPolicy, repeatedHeaderPolicy, headerOnlyPolicy, quarantineOnFailure) =
+      parseHeaderValidationOptions(headerValidation)
+
+    Some(SchemaContract(
+      version = s.getString("version"),
+      compatibility = ConfigUtils.optString(s, "compatibility").getOrElse("BACKWARD").toUpperCase,
+      columns = columns,
+      policies = policies,
+      strategy = strategy,
+      positionalFallback = fallback,
+      contentValidation = contentValidation,
+      quarantineOnFailure = quarantineOnFailure,
+      batchPolicy = batchPolicy,
+      repeatedHeaderPolicy = repeatedHeaderPolicy,
+      headerOnlyPolicy = headerOnlyPolicy
+    ))
+  }
+
+  private def parseColumns(s: Config): Seq[ColumnContract] =
+    s.getConfigList("columns").asScala.map(parseColumn).toSeq
+
+  private def parseColumn(c: Config): ColumnContract = {
+    val v: Config = ConfigUtils.optConfig(c, "validation").getOrElse(c)
+    val validation = ColumnValidation(
+      regex = ConfigUtils.optString(v, "regex"),
+      minLength = ConfigUtils.optInt(v, "min_length"),
+      maxLength = ConfigUtils.optInt(v, "max_length"),
+      allowedValues = ConfigUtils.stringList(v, "allowed_values"),
+      nonblank = ConfigUtils.optBoolean(v, "nonblank").getOrElse(false),
+      numericParse = ConfigUtils.optBoolean(v, "numeric_parse").getOrElse(false),
+      dateFormats = ConfigUtils.stringList(v, "accepted_date_formats"),
+      timestampFormats = ConfigUtils.stringList(v, "accepted_timestamp_formats"),
+      maxNullPercentage = ConfigUtils.optString(v, "max_null_percentage").map(_.toDouble)
+    )
+    val default =
+      if (c.hasPathOrNull("default") && !c.getIsNull("default")) Some(c.getString("default"))
+      else None
+    ColumnContract(
+      name = c.getString("name"),
+      dataType = ConfigUtils.optString(c, "type")
+        .orElse(ConfigUtils.optString(c, "data_type")).getOrElse("string"),
+      nullable = ConfigUtils.optBoolean(c, "nullable").getOrElse(true),
+      aliases = parseAliases(c),
+      position = ConfigUtils.optInt(c, "position"),
+      required = ConfigUtils.optBoolean(c, "required").getOrElse(true),
+      default = default,
+      category = ConfigUtils.optString(c, "category").getOrElse("business").toLowerCase,
+      validation = if (validation.isDefined) Some(validation) else None
+    )
+  }
+
+  private def validateColumns(columns: Seq[ColumnContract]): Unit = {
     require(columns.nonEmpty, "schema.columns must not be empty")
 
     val duplicateNames = columns.groupBy(c => normalize(c.name)).filter(_._2.size > 1).keys.toSeq
-    require(
-      duplicateNames.isEmpty,
-      s"HDR_017 schema.columns contains duplicate canonical names after normalization: ${duplicateNames.mkString(",")}"
-    )
+    require(duplicateNames.isEmpty,
+      s"HDR_017 schema.columns contains duplicate canonical names after normalization: ${duplicateNames.mkString(",")}")
 
     val aliasOwners = columns.flatMap(c => (c.name +: c.aliases).map(a => normalize(a) -> c.name))
     val conflictingAliases = aliasOwners.groupBy(_._1)
       .filter(_._2.map(_._2).distinct.size > 1)
       .map { case (alias, owners) => s"'$alias' -> ${owners.map(_._2).distinct.mkString("/")}" }
-    require(
-      conflictingAliases.isEmpty,
-      s"HDR_017 schema.columns aliases/names collide across columns after normalization: ${conflictingAliases.mkString("; ")}"
-    )
+    require(conflictingAliases.isEmpty,
+      s"HDR_017 schema.columns aliases/names collide across columns after normalization: ${conflictingAliases.mkString("; ")}")
 
     val declaredPositions = columns.flatMap(_.position)
     val duplicatePositions = declaredPositions.groupBy(identity).filter(_._2.size > 1).keys.toSeq
-    require(
-      duplicatePositions.isEmpty,
-      s"HDR_017 schema.columns contains duplicate positions: ${duplicatePositions.mkString(",")}"
-    )
-    require(
-      declaredPositions.forall(_ >= 0),
-      s"HDR_017 schema.columns contains negative positions: ${declaredPositions.filter(_ < 0).mkString(",")}"
-    )
+    require(duplicatePositions.isEmpty,
+      s"HDR_017 schema.columns contains duplicate positions: ${duplicatePositions.mkString(",")}")
+    require(declaredPositions.forall(_ >= 0),
+      s"HDR_017 schema.columns contains negative positions: ${declaredPositions.filter(_ < 0).mkString(",")}")
 
-    // Eager data-type validation: bad types fail at startup, not mid-run
     columns.foreach { c =>
       try org.apache.spark.sql.types.DataType.fromDDL(c.dataType)
       catch {
@@ -243,18 +258,17 @@ object SchemaContract {
         s"HDR_017 schema.columns['${c.name}'] has unknown category '${c.category}'; " +
           s"expected one of ${validCategories.mkString(", ")}")
     }
+  }
 
-    def policy(path: String, default: PolicyAction): PolicyAction = {
-      val fromSchema = ConfigUtils.optString(s, path)
-      fromSchema.map(PolicyAction.parse).getOrElse(default)
-    }
+  private def parsePolicies(s: Config, headerValidation: Option[Config]): SchemaPolicies = {
+    def policy(path: String, default: PolicyAction): PolicyAction =
+      ConfigUtils.optString(s, path).map(PolicyAction.parse).getOrElse(default)
 
-    // header_validation block keys override the schema-level on_* keys.
     def hvPolicy(hvKey: String, fallback: PolicyAction): PolicyAction =
       headerValidation.flatMap(h => ConfigUtils.optString(h, hvKey))
         .map(PolicyAction.parse).getOrElse(fallback)
 
-    val policies = SchemaPolicies(
+    SchemaPolicies(
       onMissingColumn = hvPolicy("on_missing_required", policy("on_missing_column", PolicyAction.Fail)),
       onExtraColumn = hvPolicy("on_extra_columns", policy("on_extra_column", PolicyAction.Warn)),
       onTypeChange = policy("on_type_change", PolicyAction.Fail),
@@ -266,14 +280,17 @@ object SchemaContract {
         .flatMap(h => ConfigUtils.optString(h, "on_missing_optional"))
         .exists(_.equalsIgnoreCase("FAIL"))
     )
+  }
 
-    val strategy = headerValidation
+  private def parseStrategy(s: Config, headerValidation: Option[Config]): HeaderStrategy =
+    headerValidation
       .flatMap(h => ConfigUtils.optString(h, "strategy"))
       .orElse(ConfigUtils.optString(s, "strategy"))
       .map(HeaderStrategy.parse)
       .getOrElse(HeaderStrategy.NameWithAliases)
 
-    val fallback = headerValidation.flatMap(h => ConfigUtils.optConfig(h, "positional_fallback")) match {
+  private def parsePositionalFallback(headerValidation: Option[Config], strategy: HeaderStrategy): PositionalFallback =
+    headerValidation.flatMap(h => ConfigUtils.optConfig(h, "positional_fallback")) match {
       case Some(f) => PositionalFallback(
         enabled = ConfigUtils.optBoolean(f, "enabled").getOrElse(false),
         requireExactColumnCount = ConfigUtils.optBoolean(f, "require_exact_column_count").getOrElse(true),
@@ -286,7 +303,8 @@ object SchemaContract {
       )
     }
 
-    val contentValidation = contentValidationConf match {
+  private def parseContentValidation(conf: Option[Config]): ContentValidationConfig =
+    conf match {
       case Some(cv) => ContentValidationConfig(
         enabled = ConfigUtils.optBoolean(cv, "enabled").getOrElse(true),
         sampleMode = ConfigUtils.optString(cv, "mode").forall(_.equalsIgnoreCase("SAMPLE")),
@@ -297,6 +315,7 @@ object SchemaContract {
       case None => ContentValidationConfig(enabled = false, sampleMode = true, sampleRows = 1000, maxFailurePercentage = 0.0)
     }
 
+  private def parseHeaderValidationOptions(headerValidation: Option[Config]): (String, Option[String], String, Boolean) = {
     val quarantineOnFailure = headerValidation
       .flatMap(h => ConfigUtils.optBoolean(h, "quarantine_on_failure"))
       .getOrElse(false)
@@ -304,39 +323,22 @@ object SchemaContract {
     val batchPolicy = headerValidation
       .flatMap(h => ConfigUtils.optString(h, "batch_policy")).map(_.toUpperCase)
       .getOrElse(BatchPolicy.FileAtomic)
-    require(
-      Set(BatchPolicy.FileAtomic, BatchPolicy.BatchAtomic).contains(batchPolicy),
-      s"HDR_017 header_validation.batch_policy '$batchPolicy' must be FILE_ATOMIC or BATCH_ATOMIC"
-    )
+    require(Set(BatchPolicy.FileAtomic, BatchPolicy.BatchAtomic).contains(batchPolicy),
+      s"HDR_017 header_validation.batch_policy '$batchPolicy' must be FILE_ATOMIC or BATCH_ATOMIC")
 
     val repeatedHeaderPolicy = headerValidation
       .flatMap(h => ConfigUtils.optString(h, "repeated_header_policy")).map(_.toUpperCase)
     repeatedHeaderPolicy.foreach(p => require(
       Set("FAIL", "REJECT_ROW", "DROP_WITH_WARNING").contains(p),
-      s"HDR_017 header_validation.repeated_header_policy '$p' must be FAIL, REJECT_ROW or DROP_WITH_WARNING"
-    ))
+      s"HDR_017 header_validation.repeated_header_policy '$p' must be FAIL, REJECT_ROW or DROP_WITH_WARNING"))
 
     val headerOnlyPolicy = headerValidation
       .flatMap(h => ConfigUtils.optString(h, "header_only_policy")).map(_.toUpperCase)
       .getOrElse("WARN_AND_SKIP")
-    require(
-      Set("FAIL", "WARN_AND_SKIP").contains(headerOnlyPolicy),
-      s"HDR_017 header_validation.header_only_policy '$headerOnlyPolicy' must be FAIL or WARN_AND_SKIP"
-    )
+    require(Set("FAIL", "WARN_AND_SKIP").contains(headerOnlyPolicy),
+      s"HDR_017 header_validation.header_only_policy '$headerOnlyPolicy' must be FAIL or WARN_AND_SKIP")
 
-    Some(SchemaContract(
-      version = s.getString("version"),
-      compatibility = ConfigUtils.optString(s, "compatibility").getOrElse("BACKWARD").toUpperCase,
-      columns = columns,
-      policies = policies,
-      strategy = strategy,
-      positionalFallback = fallback,
-      contentValidation = contentValidation,
-      quarantineOnFailure = quarantineOnFailure,
-      batchPolicy = batchPolicy,
-      repeatedHeaderPolicy = repeatedHeaderPolicy,
-      headerOnlyPolicy = headerOnlyPolicy
-    ))
+    (batchPolicy, repeatedHeaderPolicy, headerOnlyPolicy, quarantineOnFailure)
   }
 
   /** Aliases may be plain strings or objects with governance metadata:

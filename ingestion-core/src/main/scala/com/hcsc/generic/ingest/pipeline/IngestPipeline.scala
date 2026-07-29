@@ -53,12 +53,21 @@ final class IngestPipeline(
 
   private def track(df: DataFrame): DataFrame = { cached += df; df }
 
-  def run(): Unit =
+  def run(): Unit = {
+    // Entity-level run lease: acquired BEFORE any extraction, held through
+    // the watermark commit — two concurrent runs of one entity would extract
+    // overlapping windows and erase each other's curated writes.
+    val lock = com.hcsc.generic.ingest.lock.LockService.fromConfig(spark, feedConf, logger)
+    val held = if (ctx.dryRun) None else lock.map { l => l.acquire(ctx.entity, ctx.runId); l }
     try runInternal()
     finally {
+      held.foreach(l =>
+        try l.release(ctx.entity, ctx.runId)
+        catch { case e: Exception => logger.warn(s"[Pipeline] Lock release failed: ${e.getMessage}") })
       cached.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
       cached.clear()
     }
+  }
 
   /**
     * --validate-only: discovers files, extracts and validates physical
@@ -132,7 +141,7 @@ final class IngestPipeline(
         logger.info(s"[Pipeline] ${fs.size} file(s) staged for processing")
       }
       (files, StageCounts(sourceCount = files.map(_.size.toLong).getOrElse(-1L)))
-    }.getOrElse(None)
+    }.flatten
 
     if (intake.managed && staged.exists(_.isEmpty)) {
       audit.recordStage(ctx, Stages.Raw, StageStatus.Skipped, message = "No valid files to process")
@@ -144,28 +153,34 @@ final class IngestPipeline(
     val rejectService = new RejectService(
       spark, ConfigUtils.optConfig(feedConf, "rejects"), contract, logger)
 
-    val rawOutcome: Option[RawOutcome] = runStage(Stages.Raw) {
+    val rawOutcome: RawOutcome = runStage(Stages.Raw) {
       val outcome = runRaw(sourceConf, rawConf, staged, rejectService, intake)
-      (Some(outcome), outcome.counts)
-    }.getOrElse(readRawSlice(rawConf))
-
-    val acceptedDf = rawOutcome.map(_.accepted).getOrElse(
+      (outcome, outcome.counts)
+    }.orElse(readRawSlice(rawConf)).getOrElse(
       throw new IllegalStateException("RAW stage produced no data and no prior RAW slice was found for resume")
     )
 
+    val acceptedDf = rawOutcome.accepted
+
     // ---- Stage: curated + publish -------------------------------------------
-    val curatedResult: Option[CuratedResult] =
+    // curatedOutcome distinguishes three states the watermark gate needs:
+    //   None             -> stage skipped (--stage raw, or resume-skip)
+    //   Some(None)       -> stage ran but published nothing (disabled/absent)
+    //   Some(Some(r))    -> curated actually published
+    val curatedOutcome: Option[Option[CuratedResult]] =
       if (cli.stage.equalsIgnoreCase("raw")) {
         audit.recordStage(ctx, Stages.Curated, StageStatus.Skipped, message = "--stage raw")
         logger.info("[Pipeline] --stage raw: curated stage skipped")
         None
       } else runStage(Stages.Curated) {
-        val result = new CuratedStageRunner(spark, curatedConf, logger).run(acceptedDf, ctx.mode, ctx, contract)
+        val result = new CuratedStageRunner(spark, curatedConf, logger)
+          .run(acceptedDf, ctx.mode, ctx, contract, Some(rejectService))
         val counts = result.map(r => StageCounts(
           insertCount = r.insertCount, updateCount = r.updateCount, deleteCount = r.deleteCount
         )).getOrElse(StageCounts())
         (result, counts)
-      }.getOrElse(None)
+      }
+    val curatedResult: Option[CuratedResult] = curatedOutcome.flatten
 
     // ---- Completion: reconcile FIRST, then file lifecycle -------------------
     // Reconciliation runs before any irreversible file movement so a count
@@ -173,16 +188,31 @@ final class IngestPipeline(
     // (normal retry remains possible). complete() itself registers before
     // moving, so every partial-failure state is resolved idempotently by the
     // next run's duplicate policy.
-    reconcile(rawOutcome, curatedResult)
+    reconcile(Some(rawOutcome), curatedResult)
     staged.foreach(files => intake.complete(ctx, files))
 
-    // Watermarks advance ONLY here, after everything above succeeded — a
-    // failed run never moves the incremental position.
+    // Watermarks advance ONLY here, and only when the curated publish
+    // actually happened in (or before, on resume) this run — a raw-only
+    // execution must not burn the source window, whatever the route
+    // (--stage raw, curated.enabled=false, or a missing curated block).
+    // Feeds that are intentionally raw-only declare watermark.advance_after=RAW.
     if (!ctx.dryRun) {
       val sourceType = ConfigUtils.optString(sourceConf, "type").getOrElse("file")
       SourceRegistry.resolve(sourceType) match {
         case w: com.hcsc.generic.ingest.source.WatermarkAdvancing =>
-          rawOutcome.foreach(o => w.advanceWatermark(spark, sourceConf, ctx.entity, ctx.runId, o.accepted))
+          val advanceAfter = ConfigUtils.optConfig(feedConf, "watermark")
+            .flatMap(wm => ConfigUtils.optString(wm, "advance_after"))
+            .getOrElse("CURATED").toUpperCase
+          val curatedResumedComplete = curatedOutcome.isEmpty &&
+            !cli.stage.equalsIgnoreCase("raw") && ctx.resume &&
+            audit.stageStatus(ctx.runId, ctx.entity, Stages.Curated).contains(StageStatus.Success)
+          if (curatedResult.isDefined || curatedResumedComplete || advanceAfter == "RAW")
+            w.advanceWatermark(spark, sourceConf, ctx.entity, ctx.runId, rawOutcome.accepted)
+          else
+            logger.warn(s"[Pipeline] Watermark NOT advanced: no curated publish in this run " +
+              s"(stage=${cli.stage}, curated config ${if (curatedConf.isEmpty) "absent" else "present but produced no publish"}). " +
+              "The source window will be re-read next run. Declare watermark.advance_after=RAW " +
+              "for intentionally raw-only feeds.")
         case _ => ()
       }
     }
@@ -290,7 +320,31 @@ final class IngestPipeline(
           throw e
       }
 
-    val withMeta0 = RawMetadata.add(df0, ctx.rawFlag, ctx.runId)
+    // Lineage: source identity from config, extract window from the source's
+    // read (JDBC records the bounded watermark window it actually used).
+    val window = source match {
+      case w: com.hcsc.generic.ingest.source.WatermarkAdvancing =>
+        w.lastWindow(ctx.entity, Some(ctx.runId))
+      case _ => None
+    }
+    // String-only reads: the pipeline attaches the schema CONTRACT as an
+    // OBJECT under source.schema, so the schema NAME lives at
+    // source.source_schema (with a string-typed source.schema still honored).
+    def lineageStr(path: String): Option[String] =
+      if (effectiveSource.hasPath(path) &&
+          effectiveSource.getValue(path).valueType() == com.typesafe.config.ConfigValueType.STRING)
+        Some(effectiveSource.getString(path))
+      else None
+    val lineage = com.hcsc.generic.ingest.transform.RawLineage(
+      runId = ctx.runId,
+      sourceSystem = lineageStr("system"),
+      sourceDatabase = lineageStr("database"),
+      sourceSchema = lineageStr("source_schema").orElse(lineageStr("schema")),
+      sourceTable = lineageStr("table"),
+      extractStart = window.map(_._1),
+      extractEnd = window.flatMap(_._2)
+    )
+    val withMeta0 = RawMetadata.add(df0, ctx.rawFlag, lineage)
     val withMeta1 = ctx.fileIdFilter match {
       case Some(fileId) if staged.isEmpty => withMeta0.filter(col("file_id") === lit(fileId))
       case _ => withMeta0
@@ -438,10 +492,18 @@ final class IngestPipeline(
         checks += (("raw_equals_accepted", c.acceptedCount.toString, c.rawCount.toString, c.rawCount == c.acceptedCount))
       }
     }
+    // Full accounting identity: every accepted RAW row must be explained by
+    // the curated outcome — a distinct key that was inserted, updated or
+    // ignored as stale, a quarantined null-key row, or an in-batch
+    // dedup loser. Rows silently vanishing between RAW and CURATED fail this.
     curated.foreach { r =>
-      checks += (("curated_inserts_plus_updates_covered",
-        s"<= ${r.publishedCount}", (r.insertCount + r.updateCount).toString,
-        r.insertCount + r.updateCount <= r.publishedCount || r.publishedCount == 0))
+      val rawAccepted = raw.map(_.counts.acceptedCount).getOrElse(-1L)
+      if (!ctx.dryRun && rawAccepted >= 0) {
+        val accounted = r.insertCount + r.updateCount + r.ignoredCount +
+          r.nullKeyCount + r.dedupedCount
+        checks += (("curated_accounts_for_accepted_rows",
+          rawAccepted.toString, accounted.toString, accounted == rawAccepted))
+      }
     }
 
     if (checks.isEmpty) return

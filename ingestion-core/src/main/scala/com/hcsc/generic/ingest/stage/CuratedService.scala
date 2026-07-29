@@ -2,13 +2,15 @@ package com.hcsc.generic.ingest.stage
 
 import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.publish.{PublishRequest, PublishService}
+import com.hcsc.generic.ingest.reject.RejectService
 import com.hcsc.generic.ingest.runtime.RunContext
 import com.hcsc.generic.ingest.schema.{CuratedContractValidator, SchemaContract, SchemaContractViolationException}
 import com.hcsc.generic.ingest.transform.CuratedTransform
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.functions.{col, lit, row_number}
 
 import java.util.UUID
 
@@ -16,14 +18,21 @@ final case class CuratedResult(
   publishedCount: Long,
   insertCount: Long,
   updateCount: Long,
-  deleteCount: Long
+  deleteCount: Long,
+  ignoredCount: Long = 0L,
+  nullKeyCount: Long = 0L,
+  dedupedCount: Long = 0L
 )
+
+/** Source-freshness contract for the incremental merge: the column whose
+  * highest value wins per business key, plus deterministic tie-breakers
+  * (all compared descending, nulls last; remaining ties keep the target). */
+final case class FreshnessSpec(column: String, tieBreakers: Seq[String])
 
 final class CuratedService(spark: SparkSession, conf: Config) {
   private val logger = Logger.getLogger(getClass.getName)
   private val transform = new CuratedTransform(spark)
   private val publisher = new PublishService(spark, logger)
-  private var contract: Option[SchemaContract] = None
 
   val enabled: Boolean =
     ConfigUtils.optBoolean(conf, "enabled").getOrElse(true)
@@ -35,8 +44,16 @@ final class CuratedService(spark: SparkSession, conf: Config) {
   def process(rawDf: DataFrame, runMode: String, ctx: RunContext): Option[CuratedResult] =
     process(rawDf, runMode, ctx, None)
 
-  def process(rawDf: DataFrame, runMode: String, ctx: RunContext, contract: Option[SchemaContract]): Option[CuratedResult] = {
-    this.contract = contract
+  def process(rawDf: DataFrame, runMode: String, ctx: RunContext, contract: Option[SchemaContract]): Option[CuratedResult] =
+    process(rawDf, runMode, ctx, contract, None)
+
+  def process(
+    rawDf: DataFrame,
+    runMode: String,
+    ctx: RunContext,
+    contract: Option[SchemaContract],
+    rejects: Option[RejectService]
+  ): Option[CuratedResult] = {
     if (!enabled) return None
 
     val database = ConfigUtils.sqlIdentifier(conf, "database")
@@ -50,54 +67,139 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     val prepared2 = transform.ensureAudit(prepared1)
     val prepared = transform.normalizeKeys(prepared2, conf)
 
+    val mergeConf = ConfigUtils.optConfig(conf, "merge")
+    val keys = mergeConf.map(m => ConfigUtils.stringList(m, "keys")).getOrElse(Seq.empty)
+    val freshness = parseFreshness(mergeConf)
+    val ordering = effectiveOrdering(freshness)
+
     // Second validation gate (HDR_018): the CURATED contract is validated
     // independently of RAW, immediately before publication.
     contract.foreach { c =>
-      val mergeKeys =
-        if (runMode.equalsIgnoreCase("INCR")) ConfigUtils.optConfig(conf, "merge")
-          .map(m => ConfigUtils.stringList(m, "keys")).getOrElse(Seq.empty)
-        else Seq.empty
-      val dedupOrder = ConfigUtils.stringList(conf, "dedup.order_by")
-      val violations = CuratedContractValidator.validate(prepared, c, mergeKeys, dedupOrder, logger)
+      val violations = CuratedContractValidator.validate(prepared, c, keys, ordering, logger)
       if (violations.nonEmpty)
         throw new SchemaContractViolationException(violations)
     }
 
+    val isIncremental =
+      runMode.equalsIgnoreCase("INCR") && spark.catalog.tableExists(fullTable)
+
     val publishConf = ConfigUtils.optConfig(conf, "publish")
+    val enforceUnique = publishConf
+      .flatMap(p => ConfigUtils.optBoolean(p, "enforce_unique_keys"))
+      .getOrElse(keys.nonEmpty)
     val request = PublishRequest(
       database = database,
       table = table,
       format = format,
       path = path,
       allowEmpty = publishConf.flatMap(p => ConfigUtils.optBoolean(p, "allow_empty")).getOrElse(false),
-      validationQuery = publishConf.flatMap(p => ConfigUtils.optString(p, "validation_query"))
+      validationQuery = publishConf.flatMap(p => ConfigUtils.optString(p, "validation_query")),
+      enforceUniqueKeys = if (enforceUnique) keys else Seq.empty,
+      // Incremental merges preserve all untouched target rows, so a large
+      // shrink can only mean a defect; FULL replaces are opt-in.
+      maxShrinkPercent = publishConf.flatMap(p => ConfigUtils.optDouble(p, "max_shrink_percent"))
+        .orElse(if (isIncremental) Some(CuratedService.DefaultIncrementalMaxShrinkPercent) else None)
     )
 
-    val result =
-      if (runMode.equalsIgnoreCase("FULL") || !spark.catalog.tableExists(fullTable))
-        publishFull(prepared, fullTable, request, ctx)
-      else
-        publishIncremental(prepared, fullTable, request, ctx)
+    // Key hygiene (null-key quarantine + deterministic dedup) applies in
+    // EVERY mode with configured keys — FULL loads and the first run of an
+    // incremental feed must not seed curated with duplicate or null keys.
+    var hygienePersisted: Option[DataFrame] = None
+    try {
+      val (hygienic, nullKeyCount, inputCount) =
+        if (keys.isEmpty) (prepared, 0L, -1L)
+        else {
+          val missingKeys = keys.filterNot(k => prepared.columns.exists(_.equalsIgnoreCase(k)))
+          require(missingKeys.isEmpty,
+            s"curated.merge.keys missing from incoming data: ${missingKeys.mkString(",")}")
+          val dropNull = mergeConf.flatMap(m => ConfigUtils.optBoolean(m, "null_handling.drop_null_keys")).getOrElse(true)
+          val blanksAsNull = mergeConf.flatMap(m => ConfigUtils.optBoolean(m, "null_handling.treat_blank_as_null")).getOrElse(true)
+          val (valid, dropped) = transform.splitNullKeys(prepared, keys, dropNull, blanksAsNull)
+          val nullCount = if (dropNull) quarantineNullKeys(dropped, ctx, rejects) else 0L
+          val persisted = valid.persist()
+          hygienePersisted = Some(persisted)
+          val count = persisted.count()
+          (transform.deduplicate(persisted, keys, ordering), nullCount, count)
+        }
 
-    logger.info(
-      s"[CuratedService] published=${result.publishedCount} inserts=${result.insertCount} " +
-        s"updates=${result.updateCount} deletes=${result.deleteCount}"
-    )
-    Some(result)
+      val result =
+        if (!isIncremental)
+          publishFull(hygienic, nullKeyCount, inputCount, fullTable, request, ctx, contract)
+        else
+          publishIncremental(hygienic, nullKeyCount, inputCount, keys, freshness,
+            fullTable, request, ctx, contract)
+
+      logger.info(
+        s"[CuratedService] published=${result.publishedCount} inserts=${result.insertCount} " +
+          s"updates=${result.updateCount} deletes=${result.deleteCount} " +
+          s"ignoredStale=${result.ignoredCount} nullKeys=${result.nullKeyCount} deduped=${result.dedupedCount}"
+      )
+      Some(result)
+    } finally {
+      hygienePersisted.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
+    }
   }
+
+  /** merge.freshness { column, tie_breakers } — the source-provided
+    * last-modified column that decides merge winners. Framework audit
+    * columns are rejected: they are stamped at ingestion time and would
+    * make run order, not source freshness, decide the winner. */
+  private def parseFreshness(mergeConf: Option[Config]): Option[FreshnessSpec] =
+    mergeConf.flatMap(m => ConfigUtils.optConfig(m, "freshness")).map { f =>
+      val column = f.getString("column")
+      require(!CuratedService.FrameworkAuditColumns.contains(column.toLowerCase),
+        s"curated.merge.freshness.column '$column' collides with a framework audit column; " +
+          "designate the source-provided freshness column instead")
+      FreshnessSpec(column, ConfigUtils.stringList(f, "tie_breakers"))
+    }
+
+  /** Dedup ordering: freshness spec first (it also decides the cross-run
+    * merge), then any additionally configured dedup.order_by columns. */
+  private def effectiveOrdering(freshness: Option[FreshnessSpec]): Seq[String] = {
+    val configured = ConfigUtils.stringList(conf, "dedup.order_by")
+    freshness match {
+      case Some(f) =>
+        val primary = f.column +: f.tieBreakers
+        primary ++ configured.filterNot(o => primary.exists(_.equalsIgnoreCase(o)))
+      case None => configured
+    }
+  }
+
+  private def quarantineNullKeys(dropped: DataFrame, ctx: RunContext, rejects: Option[RejectService]): Long =
+    rejects match {
+      case Some(rs) =>
+        val count = rs.persistRows(dropped, ctx, CuratedService.NullKeyErrorCode,
+          "One or more business-key columns are null or blank", "NULL_BUSINESS_KEY")
+        if (count > 0)
+          logger.warn(s"[CuratedService] $count row(s) with null/blank business keys quarantined " +
+            s"(${CuratedService.NullKeyErrorCode})")
+        count
+      case None =>
+        val count = dropped.count()
+        if (count > 0)
+          logger.warn(s"[CuratedService] $count row(s) with null/blank business keys DROPPED " +
+            "(no reject service wired; configure rejects{} and run via the pipeline to quarantine them)")
+        count
+    }
 
   private def publishFull(
     df: DataFrame,
+    nullKeyCount: Long,
+    inputCount: Long,
     fullTable: String,
     request: PublishRequest,
-    ctx: RunContext
+    ctx: RunContext,
+    contract: Option[SchemaContract]
   ): CuratedResult = {
     val publishDf =
       if (spark.catalog.tableExists(fullTable)) transform.align(df, spark.table(fullTable).schema, contract)
       else df
 
     val published = publisher.publish(publishDf, request, ctx)
-    CuratedResult(published.publishedCount, insertCount = published.publishedCount, updateCount = 0L, deleteCount = 0L)
+    val dedupedCount = if (inputCount >= 0) math.max(inputCount - published.publishedCount, 0L) else 0L
+    CuratedResult(published.publishedCount, insertCount = published.publishedCount,
+      updateCount = 0L, deleteCount = 0L,
+      ignoredCount = 0L, nullKeyCount = nullKeyCount, dedupedCount = dedupedCount)
   }
 
   /**
@@ -108,7 +210,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     * without the audit columns pass through unchanged.
     */
   private[stage] def applyUpdateAudit(incoming: DataFrame, target: DataFrame, keys: Seq[String]): DataFrame = {
-    import org.apache.spark.sql.functions.{coalesce, lit, when}
+    import org.apache.spark.sql.functions.{coalesce, when}
     def actual(df: DataFrame, name: String): Option[String] =
       df.columns.find(_.equalsIgnoreCase(name))
 
@@ -126,53 +228,120 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     }
   }
 
+  /**
+    * Freshness-compared merge: for every business key contested by this
+    * batch, the row with the highest freshness value (then tie-breakers)
+    * wins — whether it comes from the incoming batch or the existing
+    * target. A late-arriving older record therefore never overwrites a
+    * newer curated row; remaining exact ties keep the target row. Without a
+    * configured (and target-present) freshness column the merge falls back
+    * to the legacy last-write-wins replacement, loudly.
+    */
   private def publishIncremental(
     incoming: DataFrame,
+    nullKeyCount: Long,
+    inputCount: Long,
+    keys: Seq[String],
+    freshness: Option[FreshnessSpec],
     fullTable: String,
     request: PublishRequest,
-    ctx: RunContext
+    ctx: RunContext,
+    contract: Option[SchemaContract]
   ): CuratedResult = {
-    val target = spark.table(fullTable)
-    val merge = conf.getConfig("merge")
-    val keys = ConfigUtils.stringList(merge, "keys")
-
     require(keys.nonEmpty, "INCR mode requires curated.merge.keys")
+    val target = spark.table(fullTable)
 
-    val missingKeys = keys.filterNot { key =>
-      incoming.columns.exists(_.equalsIgnoreCase(key)) &&
-        target.columns.exists(_.equalsIgnoreCase(key))
-    }
-    require(missingKeys.isEmpty, s"Merge keys missing from incoming or target: ${missingKeys.mkString(",")}")
+    val missingKeys = keys.filterNot(key => target.columns.exists(_.equalsIgnoreCase(key)))
+    require(missingKeys.isEmpty, s"Merge keys missing from target: ${missingKeys.mkString(",")}")
 
-    val dropNull = ConfigUtils.optBoolean(merge, "null_handling.drop_null_keys").getOrElse(true)
-    val blanksAsNull = ConfigUtils.optBoolean(merge, "null_handling.treat_blank_as_null").getOrElse(true)
-    val orderBy = ConfigUtils.stringList(conf, "dedup.order_by")
-
-    val cleaned = transform.filterNullKeys(incoming, keys, dropNull, blanksAsNull)
-    val deduped = transform.deduplicate(cleaned, keys, orderBy)
-    val alignedIncoming0 = transform.align(deduped, target.schema, contract)
+    val aligned0 = transform.align(incoming, target.schema, contract)
     // Update audit semantics: rows replacing an existing key keep the
     // ORIGINAL create_timestamp and are stamped operation 'U'; only truly
     // new keys carry 'I' and their fresh creation time.
-    val alignedIncoming = applyUpdateAudit(alignedIncoming0, target, keys).persist()
-    val incomingKeys = alignedIncoming.select(keys.map(col): _*).distinct().persist()
+    val alignedIncoming = applyUpdateAudit(aligned0, target, keys).persist()
+
+    // Distinct incoming keys under prefixed names: prefixing breaks the
+    // shared-lineage ambiguity (alignedIncoming embeds target attributes
+    // via applyUpdateAudit) and lets the join be null-safe (<=>), so
+    // null-key target rows are matched and replaced rather than
+    // re-accumulated forever when drop_null_keys = false.
+    val keyCols = keys.map(k => target.columns.find(_.equalsIgnoreCase(k)).getOrElse(k))
+    val ik = alignedIncoming.select(keyCols.map(col): _*).distinct()
+      .toDF(keyCols.map(k => s"__ik_$k"): _*).persist()
+    var winnersPersisted: Option[DataFrame] = None
     try {
-      val targetKeys = target.select(keys.map(col): _*).distinct()
+      val totalIncoming = ik.count()
+      val dedupedCount = if (inputCount >= 0) math.max(inputCount - totalIncoming, 0L) else 0L
 
-      val totalIncoming = incomingKeys.count()
-      val updateCount = incomingKeys.join(targetKeys, keys, "inner").count()
-      val insertCount = totalIncoming - updateCount
+      if (totalIncoming == 0) {
+        logger.info(s"[CuratedService] Zero incoming rows after key hygiene; $fullTable left untouched")
+        return CuratedResult(0L, 0L, 0L, 0L,
+          ignoredCount = 0L, nullKeyCount = nullKeyCount, dedupedCount = dedupedCount)
+      }
 
-      // No forced broadcast: incoming key sets can be large; the optimizer
-      // still broadcasts automatically when under the threshold.
-      val unchanged = target.join(incomingKeys, keys, "left_anti")
-      val merged = unchanged.unionByName(alignedIncoming)
+      val joinCond = keyCols.map(k => col(k) <=> col(s"__ik_$k")).reduce(_ && _)
+      val contested = target.join(ik, joinCond, "left_semi")
+      val unchanged = target.join(ik, joinCond, "left_anti")
+      val contestedKeyCount = contested.select(keyCols.map(col): _*).distinct().count()
+      val insertCount = totalIncoming - contestedKeyCount
 
+      val freshnessUsable = freshness.filter { f =>
+        val present = target.columns.exists(_.equalsIgnoreCase(f.column))
+        if (!present)
+          logger.warn(s"[CuratedService] merge.freshness.column '${f.column}' is not a column of " +
+            s"$fullTable; falling back to last-write-wins replacement until the target carries it")
+        present
+      }
+
+      val (replacement, updateCount, ignoredCount) = freshnessUsable match {
+        case Some(f) =>
+          val src = CuratedService.MergeProvenanceColumn
+          require(!target.columns.exists(_.equalsIgnoreCase(src)),
+            s"Target $fullTable contains reserved column '$src'")
+          val union = contested.withColumn(src, lit("T"))
+            .unionByName(alignedIncoming.withColumn(src, lit("I")))
+          val orderCols = (f.column +: f.tieBreakers)
+            .flatMap(o => union.columns.find(_.equalsIgnoreCase(o)))
+            .map(c => col(c).desc_nulls_last) :+ col(src).desc // 'T' > 'I': exact ties keep the target
+          val w = Window.partitionBy(keyCols.map(col): _*).orderBy(orderCols: _*)
+          val winners = union.withColumn("_rn", row_number().over(w))
+            .filter(col("_rn") === 1).drop("_rn").persist()
+          winnersPersisted = Some(winners)
+          val incomingWinners = winners.filter(col(src) === "I").count()
+          val updates = incomingWinners - insertCount
+          val ignored = totalIncoming - incomingWinners
+          (winners.drop(src), updates, ignored)
+        case None =>
+          if (freshness.isEmpty)
+            logger.warn("[CuratedService] No curated.merge.freshness configured: the incremental " +
+              "merge is last-write-wins by run order — a late-arriving OLDER record will overwrite " +
+              "a newer curated row. Configure merge.freshness.column to enable freshness comparison.")
+          (alignedIncoming, contestedKeyCount, 0L)
+      }
+
+      val merged = unchanged.unionByName(replacement)
       val published = publisher.publish(merged, request, ctx)
-      CuratedResult(published.publishedCount, insertCount, updateCount, deleteCount = 0L)
+      CuratedResult(published.publishedCount, insertCount, updateCount, deleteCount = 0L,
+        ignoredCount = ignoredCount, nullKeyCount = nullKeyCount, dedupedCount = dedupedCount)
     } finally {
-      incomingKeys.unpersist(false)
+      winnersPersisted.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
+      ik.unpersist(false)
       alignedIncoming.unpersist(false)
     }
   }
+}
+
+object CuratedService {
+  /** Reject error code for rows dropped for null/blank business keys. */
+  val NullKeyErrorCode = "CUR_001"
+
+  /** Provenance marker used internally by the freshness merge. */
+  val MergeProvenanceColumn = "__merge_src"
+
+  /** Default publish shrink guard for incremental merges (percent). */
+  val DefaultIncrementalMaxShrinkPercent = 20.0
+
+  /** Columns stamped by ensureAudit; not usable as a freshness column. */
+  val FrameworkAuditColumns: Set[String] =
+    Set("create_timestamp", "last_modified_ts", "last_modified_op")
 }

@@ -17,4 +17,10 @@ trait WatermarkAdvancing { self: Source =>
     runId: String,
     accepted: DataFrame
   ): Unit
+
+  /** The extraction window observed by this run's read, serialized:
+    * (lower bound, captured upper bound when one exists). The pipeline
+    * stamps it onto RAW records as extract_start_ts / extract_end_ts.
+    * Sources without window tracking return None. */
+  def lastWindow(entity: String, runId: Option[String]): Option[(String, Option[String])] = None
 }

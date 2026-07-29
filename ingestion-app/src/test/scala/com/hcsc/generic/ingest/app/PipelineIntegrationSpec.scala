@@ -133,6 +133,7 @@ class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
        |  database = p_audit
        |  control_total_expr = "count(*)"
        |}
+       |concurrency { settle_ms = 0 }
        |raw {
        |  database = p_raw
        |  table = member

@@ -119,8 +119,9 @@ final class RejectService(
     val accepted = df.filter(!isRejected)
     val rejected = df.filter(isRejected)
 
-    val businessCols = df.columns
-      .filterNot(c => Seq("row_idx", "load_timestamp", "file_type", "file_id").exists(c.equalsIgnoreCase))
+    val businessCols = df.columns.filterNot(c =>
+      com.hcsc.generic.ingest.transform.RawMetadata.ColumnNames.contains(c.toLowerCase) &&
+        !c.equalsIgnoreCase("source_file") && !c.equalsIgnoreCase("run_id"))
 
     val rejectRows = rejected.select(
       lit(ctx.runId).as("run_id"),
@@ -147,7 +148,46 @@ final class RejectService(
     RejectSplit(accepted, acceptedCount, rejectedCount)
   }
 
-  private def persist(rejectRows: DataFrame, ctx: RunContext): Long = {
+  private def persist(rejectRows: DataFrame, ctx: RunContext): Long =
+    persistGuarded(rejectRows, ctx, guardCode = None)
+
+  /**
+    * Quarantines rows rejected by a later stage (e.g. null business keys
+    * dropped before the curated merge) with full lineage and a stable error
+    * code. Lineage columns absent from the DataFrame are stored as null.
+    * Returns the number of rows quarantined; in dry-run only counts.
+    */
+  def persistRows(df: DataFrame, ctx: RunContext, errorCode: String, message: String, category: String): Long = {
+    if (!enabled) {
+      val count = df.count()
+      if (count > 0)
+        logger.warn(s"[RejectService] $count row(s) rejected with $errorCode but no rejects " +
+          "config is present; rows are dropped WITHOUT quarantine")
+      return count
+    }
+    def lineage(name: String, dataType: String): Column =
+      df.columns.find(_.equalsIgnoreCase(name)).map(col).getOrElse(lit(null).cast(dataType))
+
+    val businessCols = df.columns
+      .filterNot(c => Seq("row_idx", "load_timestamp", "file_type", "file_id").exists(c.equalsIgnoreCase))
+
+    val rejectRows = df.select(
+      lit(ctx.runId).as("run_id"),
+      lit(ctx.entity).as("entity"),
+      lineage("file_id", "string").as("file_id"),
+      lineage("source_file", "string").as("source_file"),
+      lineage("row_idx", "bigint").as("row_idx"),
+      to_json(struct(businessCols.map(col): _*)).as("raw_record"),
+      lit(errorCode).as("error_code"),
+      lit(message).as("error_message"),
+      lit(category).as("reject_category"),
+      current_timestamp().as("reject_ts")
+    )
+    if (ctx.dryRun) df.count()
+    else persistGuarded(rejectRows, ctx, guardCode = Some(errorCode))
+  }
+
+  private def persistGuarded(rejectRows: DataFrame, ctx: RunContext, guardCode: Option[String]): Long = {
     val count = rejectRows.count()
     if (count > 0) {
       val db = rejectTable.split("\\.")(0)
@@ -162,13 +202,16 @@ final class RejectService(
            |) USING ORC""".stripMargin)
       // Idempotency guard (mirrors the RAW one): a run that failed after this
       // append and was resumed with the same --run-id must not append the same
-      // reject rows a second time.
-      val alreadyPersisted = spark.table(rejectTable)
+      // reject rows a second time. Stage-specific rejects (guardCode) are
+      // guarded per error code so raw-stage rejects do not mask them.
+      val guard = spark.table(rejectTable)
         .filter(col("run_id") === ctx.runId && col("entity") === ctx.entity)
+      val alreadyPersisted = guardCode
+        .fold(guard)(code => guard.filter(col("error_code") === code))
         .limit(1).count() > 0
       if (alreadyPersisted)
-        logger.warn(s"[RejectService] Reject table already holds rows for run ${ctx.runId}; " +
-          "skipping append (idempotent replay)")
+        logger.warn(s"[RejectService] Reject table already holds rows for run ${ctx.runId}" +
+          guardCode.fold("")(c => s" code=$c") + "; skipping append (idempotent replay)")
       else
         rejectRows.write.mode(SaveMode.Append).insertInto(rejectTable)
     }

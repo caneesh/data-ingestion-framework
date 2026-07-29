@@ -11,7 +11,9 @@ final case class PublishRequest(
   path: Option[String],
   expectedCount: Option[Long] = None,
   allowEmpty: Boolean = false,
-  validationQuery: Option[String] = None
+  validationQuery: Option[String] = None,
+  enforceUniqueKeys: Seq[String] = Seq.empty,
+  maxShrinkPercent: Option[Double] = None
 )
 
 final case class PublishResult(publishedCount: Long, stagingTable: String)
@@ -63,6 +65,7 @@ final class PublishService(spark: SparkSession, logger: Logger) {
     try {
       val stagedCount = spark.table(stagingTable).count()
       validate(stagingTable, stagedCount, req)
+      validateShrink(fullTable, stagedCount, req)
 
       if (spark.catalog.tableExists(fullTable)) {
         spark.sql(s"INSERT OVERWRITE TABLE $fullTable SELECT * FROM $stagingTable")
@@ -98,7 +101,42 @@ final class PublishService(spark: SparkSession, logger: Logger) {
           s"Publish validation query returned $failures failing row(s); publish aborted, target untouched. Query: $query"
         )
     }
+
+    if (req.enforceUniqueKeys.nonEmpty) {
+      val keyList = req.enforceUniqueKeys.map { k =>
+        require(k.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"merge key '$k' is not a safe SQL identifier")
+        s"`$k`"
+      }.mkString(", ")
+      val dupes = spark.sql(
+        s"SELECT $keyList, COUNT(*) AS dupe_count FROM $stagingTable GROUP BY $keyList HAVING COUNT(*) > 1 LIMIT 10"
+      ).collect()
+      if (dupes.nonEmpty) {
+        val sample = dupes.map(_.toSeq.mkString("(", ", ", ")")).mkString("; ")
+        throw new PublishValidationException(
+          s"Business-key uniqueness violated in staged curated data (${dupes.length}+ duplicate key(s), " +
+            s"sample with counts: $sample); publish aborted, target untouched"
+        )
+      }
+    }
   }
+
+  /** Refuses to replace the target with a drastically smaller dataset — a
+    * partial extract (bad filter, wrong parameter, truncated source view)
+    * must not silently wipe most of the curated table. */
+  private def validateShrink(fullTable: String, stagedCount: Long, req: PublishRequest): Unit =
+    req.maxShrinkPercent.foreach { pct =>
+      if (spark.catalog.tableExists(fullTable)) {
+        val current = spark.table(fullTable).count()
+        if (current > 0) {
+          val floor = current * (100.0 - pct) / 100.0
+          if (stagedCount < floor)
+            throw new PublishValidationException(
+              f"Staged count $stagedCount is more than $pct%.1f%% below the current target count $current " +
+                s"of $fullTable; publish aborted, target untouched (curated.publish.max_shrink_percent)"
+            )
+        }
+      }
+    }
 
   /** Drops leftover staging tables from crashed runs of the same target.
     * Tables younger than [[PublishService.StaleStagingAgeMillis]] are presumed

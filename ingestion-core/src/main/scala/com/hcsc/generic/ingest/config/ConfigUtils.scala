@@ -16,6 +16,9 @@ object ConfigUtils {
   def optLong(c: Config, path: String): Option[Long] =
     if (c.hasPath(path)) Some(c.getLong(path)) else None
 
+  def optDouble(c: Config, path: String): Option[Double] =
+    if (c.hasPath(path)) Some(c.getDouble(path)) else None
+
   def optConfig(c: Config, path: String): Option[Config] =
     if (c.hasPath(path)) Some(c.getConfig(path)) else None
 

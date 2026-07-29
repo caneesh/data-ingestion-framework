@@ -1,7 +1,7 @@
 package com.hcsc.generic.ingest.sink
 
 import com.hcsc.generic.ingest.config.ConfigUtils
-import com.hcsc.generic.ingest.transform.Partitioning
+import com.hcsc.generic.ingest.transform.{Partitioning, RawMetadata}
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
@@ -34,10 +34,39 @@ object HiveSink extends Sink {
 
       val targetSet = targetCols.map(_.toLowerCase).toSet
       val extra = withPartitions.columns.filterNot(c => targetSet.contains(c.toLowerCase))
-      if (extra.nonEmpty)
-        logger.warn(s"[HiveSink] Source columns not in target $fullTable will be dropped: ${extra.mkString(",")}")
+      // Framework metadata columns are never silently dropped: without them
+      // (run_id above all) run traceability, the replay guard, raw-count
+      // reconciliation and --resume all silently stop working.
+      val (metaExtra, businessExtra) =
+        extra.partition(c => RawMetadata.ColumnNames.contains(c.toLowerCase))
+      if (businessExtra.nonEmpty)
+        logger.warn(s"[HiveSink] Source columns not in target $fullTable will be dropped: ${businessExtra.mkString(",")}")
 
-      withPartitions.select(targetCols.map(col): _*)
+      val finalTargetCols =
+        if (metaExtra.isEmpty) targetCols
+        else ConfigUtils.optString(sinkConf, "metadata_columns").map(_.toUpperCase).getOrElse("FAIL") match {
+          case "ALTER" =>
+            val ddl = metaExtra.map(c => s"${c.toLowerCase} ${RawMetadata.sqlType(c)}").mkString(", ")
+            logger.warn(s"[HiveSink] Adding framework metadata column(s) to $fullTable: $ddl")
+            spark.sql(s"ALTER TABLE $fullTable ADD COLUMNS ($ddl)")
+            spark.table(fullTable).columns
+          case "WARN" =>
+            logger.warn(s"[HiveSink] Framework metadata column(s) ${metaExtra.mkString(",")} are " +
+              s"missing from $fullTable and will be DROPPED (raw.metadata_columns=WARN): run " +
+              "traceability, replay guards, reconciliation and --resume are degraded for this table")
+            targetCols
+          case "FAIL" =>
+            throw new IllegalStateException(
+              s"RAW_001 Target table $fullTable is missing framework metadata column(s): " +
+                s"${metaExtra.mkString(", ")}. Dropping them silently disables run traceability, " +
+                "the replay guard, raw-count reconciliation and --resume. Add the columns " +
+                "(ALTER TABLE ... ADD COLUMNS), or set raw.metadata_columns = ALTER to add them " +
+                "automatically, or WARN to accept the degraded legacy behavior.")
+          case other =>
+            throw new IllegalArgumentException(s"raw.metadata_columns '$other' must be FAIL, ALTER or WARN")
+        }
+
+      withPartitions.select(finalTargetCols.map(col): _*)
         .write
         .mode(SaveMode.Append)
         .insertInto(fullTable)

@@ -1,5 +1,6 @@
 package com.hcsc.generic.ingest.app
 
+import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.file.FileSource
 import com.hcsc.generic.ingest.jdbc.JdbcSource
 import com.hcsc.generic.ingest.kafka.KafkaSource
@@ -31,6 +32,11 @@ object IngestMain {
     val spark = SparkSession.builder().enableHiveSupport().getOrCreate()
     try {
       spark.sqlContext.setConf("spark.sql.caseSensitive", "false")
+      // All framework-stamped timestamps (load_timestamp, create_timestamp,
+      // last_modified_ts, ingest_dt derivations) are UTC unless a site
+      // explicitly overrides the session zone.
+      val sessionTz = ConfigUtils.optString(baseConf, "app.spark.session_time_zone").getOrElse("UTC")
+      spark.sqlContext.setConf("spark.sql.session.timeZone", sessionTz)
 
       if (cli.validateOnly) {
         new IngestPipeline(spark, feedConf, cli, logger).validateOnly(cli.explainMapping)
@@ -49,25 +55,35 @@ object IngestMain {
     }
   }
 
-  /** Legacy replay path: rebuild curated from an existing RAW partition. */
+  /** Legacy replay path: rebuild curated from an existing RAW partition.
+    * Held under the same entity lock as full pipeline runs — this path
+    * INSERT OVERWRITEs the real curated table. */
   private def runCuratedOnly(spark: SparkSession, feedConf: Config, cli: Cli): Unit = {
     val curatedConf =
       if (feedConf.hasPath("curated")) Some(feedConf.getConfig("curated")) else None
     val rawFlag = cli.rawFlag.getOrElse(if (cli.mode == "FULL") "F" else "I")
+    val runId = cli.runId.getOrElse(java.util.UUID.randomUUID().toString)
 
-    val rawDf = new RawStageRunner(
-      spark = spark,
-      feedConf = feedConf,
-      cli = cli,
-      rawFlag = rawFlag,
-      logger = logger
-    ).run()
+    val lock = com.hcsc.generic.ingest.lock.LockService.fromConfig(spark, feedConf, logger)
+    lock.foreach(_.acquire(cli.entity, runId))
+    try {
+      val rawDf = new RawStageRunner(
+        spark = spark,
+        feedConf = feedConf,
+        cli = cli,
+        rawFlag = rawFlag,
+        logger = logger
+      ).run()
 
-    new CuratedStageRunner(
-      spark = spark,
-      curatedConf = curatedConf,
-      logger = logger
-    ).run(rawDf, cli.mode)
+      new CuratedStageRunner(
+        spark = spark,
+        curatedConf = curatedConf,
+        logger = logger
+      ).run(rawDf, cli.mode)
+    } finally lock.foreach { l =>
+      try l.release(cli.entity, runId)
+      catch { case e: Exception => logger.warn(s"Lock release failed: ${e.getMessage}") }
+    }
   }
 
   private def registerConnectors(): Unit = {

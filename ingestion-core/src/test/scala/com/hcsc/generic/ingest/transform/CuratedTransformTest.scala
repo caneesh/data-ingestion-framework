@@ -227,16 +227,36 @@ class CuratedTransformTest extends AnyFunSuite with SharedSparkSession {
     assert(aRow == 200)
   }
 
-  test("deduplicate falls back to dropDuplicates when orderBy column not in DataFrame") {
+  test("deduplicate fails fast (HDR_019) when a configured orderBy column is missing") {
     import spark.implicits._
     val df = Seq(
       ("A", 1),
       ("A", 1),
       ("B", 2)
     ).toDF("key", "value")
-    // orderBy col does not exist in the DataFrame
-    val result = transform.deduplicate(df, Seq("key", "value"), orderBy = Seq("nonexistent_col"))
-    assert(result.count() == 2)
+    // A configured ordering column absent from the data must not silently
+    // degrade into a nondeterministic dropDuplicates.
+    val e = intercept[IllegalStateException] {
+      transform.deduplicate(df, Seq("key", "value"), orderBy = Seq("nonexistent_col"))
+    }
+    assert(e.getMessage.contains("HDR_019"))
+    assert(e.getMessage.contains("nonexistent_col"))
+  }
+
+  test("splitNullKeys returns dropped rows separately for quarantine") {
+    import spark.implicits._
+    val df = Seq(Some("Alice"), None, Some("  ")).toDF("name")
+    val (valid, dropped) = transform.splitNullKeys(df, Seq("name"), drop = true, blanks = true)
+    assert(valid.count() == 1)
+    assert(dropped.count() == 2)
+  }
+
+  test("splitNullKeys dropped side is empty when drop=false") {
+    import spark.implicits._
+    val df = Seq(Some("Alice"), None).toDF("name")
+    val (valid, dropped) = transform.splitNullKeys(df, Seq("name"), drop = false, blanks = false)
+    assert(valid.count() == 2)
+    assert(dropped.count() == 0)
   }
 
   test("deduplicate is no-op when keys list is empty") {

@@ -219,6 +219,119 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
     assert(InMemoryWatermarkStore.latest("numeric_feed").get.values.head == "40")
   }
 
+  test("SOURCE_CLOCK upper bound: idle source still advances; empty window commits") {
+    val incremental = conf(
+      """
+        |mode = "INCREMENTAL"
+        |table = "members"
+        |entity = "clock_feed"
+        |incremental {
+        |  watermark_type = "TIMESTAMP"
+        |  watermark_columns = ["modified_ts"]
+        |  initial_value = "1900-01-01 00:00:00"
+        |  upper_bound = "SOURCE_CLOCK"
+        |  watermark_store { type = "memory" }
+        |}
+      """.stripMargin)
+
+    // First run: everything before the source clock; commits the clock value
+    val first = JdbcSource.read(spark, incremental)
+    assert(first.count() >= 3)
+    JdbcSource.advanceWatermark(spark, incremental, "clock_feed", "run-c1", first)
+    val committed1 = java.sql.Timestamp.valueOf(
+      InMemoryWatermarkStore.latest("clock_feed").get.values.head)
+    assert(committed1.after(java.sql.Timestamp.valueOf("2026-04-02 00:00:00")),
+      s"clock cutoff $committed1 must be the source clock, not the row max")
+
+    // Second run with NO new rows: still advances to the fresh clock value —
+    // an idle-but-alive source keeps moving (and rerun cost stays bounded)
+    Thread.sleep(50)
+    val second = JdbcSource.read(spark, incremental)
+    assert(second.count() == 0)
+    JdbcSource.advanceWatermark(spark, incremental, "clock_feed", "run-c2", second)
+    val committed2 = java.sql.Timestamp.valueOf(
+      InMemoryWatermarkStore.latest("clock_feed").get.values.head)
+    assert(committed2.after(committed1), "empty run against a live source must advance the clock cutoff")
+  }
+
+  test("NULL watermark values fail fast (JDBC_006) instead of silent loss") {
+    H2TestDatabase.execute(
+      "DROP TABLE IF EXISTS null_wm",
+      "CREATE TABLE null_wm (id VARCHAR(10), modified_ts TIMESTAMP)",
+      "INSERT INTO null_wm VALUES ('R1', '2026-01-01 10:00:00')",
+      "INSERT INTO null_wm VALUES ('R2', NULL)"
+    )
+    def incremental(extra: String) = conf(
+      s"""
+        |mode = "INCREMENTAL"
+        |table = "null_wm"
+        |entity = "null_wm_feed"
+        |incremental {
+        |  watermark_type = "TIMESTAMP"
+        |  watermark_columns = ["modified_ts"]
+        |  initial_value = "1900-01-01 00:00:00"
+        |  watermark_store { type = "memory" }
+        |  $extra
+        |}
+      """.stripMargin)
+
+    val ex = intercept[IllegalStateException] {
+      JdbcSource.read(spark, incremental(""))
+    }
+    assert(ex.getMessage.contains("JDBC_006"))
+    assert(ex.getMessage.contains("NULL"))
+
+    // Explicit override accepts the (documented) loss of NULL-watermark rows
+    val df = JdbcSource.read(spark, incremental("allow_null_watermark = true"))
+    assert(df.count() == 1) // only the non-NULL row is extractable
+
+    H2TestDatabase.execute("DROP TABLE IF EXISTS null_wm")
+  }
+
+  test("FULL_TABLE with an incremental block seeds the watermark (FULL -> INCR handoff)") {
+    val incrementalBlock =
+      """
+        |entity = "seed_feed"
+        |incremental {
+        |  watermark_type = "TIMESTAMP"
+        |  watermark_columns = ["modified_ts"]
+        |  initial_value = "1900-01-01 00:00:00"
+        |  watermark_store { type = "memory" }
+        |}
+      """.stripMargin
+
+    // Full load: unfiltered read (NULL rows included, no predicate), but the
+    // cutoff is captured and committed as the seed after success
+    val full = JdbcSource.read(spark, conf(s"""table = "members"\n$incrementalBlock"""))
+    val fullCount = full.count()
+    assert(fullCount >= 3)
+    JdbcSource.advanceWatermark(spark, conf(s"""table = "members"\n$incrementalBlock"""),
+      "seed_feed", "run-seed", full)
+    val seeded = InMemoryWatermarkStore.latest("seed_feed")
+    assert(seeded.isDefined, "FULL_TABLE run with incremental block must seed the watermark")
+
+    // Handoff: the first INCREMENTAL run extracts nothing new
+    val incr = JdbcSource.read(spark, conf(s"""mode = "INCREMENTAL"\ntable = "members"\n$incrementalBlock"""))
+    assert(incr.count() == 0, "seeded watermark must hand off cleanly to INCREMENTAL")
+  }
+
+  test("SOURCE_CLOCK upper bound rejects non-timestamp watermark types at parse") {
+    val ex = intercept[IllegalArgumentException] {
+      JdbcSourceConfig.parse(conf(
+        """
+          |mode = "INCREMENTAL"
+          |table = "members"
+          |incremental {
+          |  watermark_type = "NUMERIC"
+          |  watermark_columns = ["amount"]
+          |  initial_value = "0"
+          |  upper_bound = "SOURCE_CLOCK"
+          |}
+        """.stripMargin))
+    }
+    assert(ex.getMessage.contains("SOURCE_CLOCK"))
+  }
+
   test("schema contract detects drift: aliases map, unknown required column fails") {
     val contract =
       """

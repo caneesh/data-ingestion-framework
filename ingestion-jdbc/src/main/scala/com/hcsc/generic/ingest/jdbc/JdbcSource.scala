@@ -61,26 +61,43 @@ object JdbcSource extends Source with WatermarkAdvancing {
 
     val runId = ConfigUtils.optString(sourceConf, "run_id")
 
-    val watermarkPredicate = cfg.watermark.map { wm =>
+    val watermarkPredicate = cfg.watermark.flatMap { wm =>
       val entity = entityKey(sourceConf, cfg)
       val store = WatermarkStores.from(wm, spark)
       val versioned = store.latestVersioned(entity)
       val lower = versioned.map(_.value).getOrElse(WatermarkValue.deserialize(wm.initialValue))
       val version = versioned.map(_.version).getOrElse(0L)
 
-      // Bounded window: capture the source's upper watermark BEFORE the read
+      // First run for this entity: verify no rows carry NULL watermark
+      // values — such rows are invisible to `col > lower` forever.
+      if (versioned.isEmpty && !wm.allowNullWatermark) validateNoNullWatermarks(cfg, wm)
+
+      // Bounded window: capture the source's upper bound BEFORE the read
+      // (MAX of the watermark column, or the source clock for SOURCE_CLOCK).
       val upper = captureUpper(cfg, wm)
       readWindows.put(windowKey(entity, runId), ReadWindow(lower, upper, version))
       contextLower = Some(lower.serialized)
       contextUpper = upper.map(_.serialized)
 
-      val predicate = upper match {
-        case Some(u) => Watermarks.boundedPredicate(wm, cfg.dialect, lower, u)
-        case None    => Watermarks.predicate(wm, cfg.dialect, lower) // empty source; extract is empty anyway
+      if (cfg.mode == JdbcMode.Incremental) {
+        val predicate = upper match {
+          case Some(u) => Watermarks.boundedPredicate(wm, cfg.dialect, lower, u)
+          // captureUpper only returns None for a verified-empty source (or an
+          // explicit allow_null_watermark override); the unbounded predicate
+          // then extracts nothing / only non-null-watermark rows.
+          case None => Watermarks.predicate(wm, cfg.dialect, lower)
+        }
+        logger.info(s"[JdbcSource] entity=$entity incremental window " +
+          s"columns=[${wm.columns.mkString(",")}] version=$version bounded=${upper.isDefined} " +
+          s"upperBound=${wm.upperBound}")
+        Some(predicate)
+      } else {
+        // FULL_TABLE with an incremental block: unfiltered read, but the
+        // captured cutoff SEEDS the watermark on success (FULL -> INCR handoff).
+        logger.info(s"[JdbcSource] entity=$entity FULL_TABLE run captured watermark seed " +
+          s"cutoff=${upper.map(_.serialized).getOrElse("<none>")} (committed only after success)")
+        None
       }
-      logger.info(s"[JdbcSource] entity=$entity incremental window " +
-        s"columns=[${wm.columns.mkString(",")}] version=$version bounded=${upper.isDefined}")
-      predicate
     }
 
     // Dynamic parameter sources resolve against the read-time context (the
@@ -210,8 +227,45 @@ object JdbcSource extends Source with WatermarkAdvancing {
     }
   }
 
-  /** Driver-side capture of the source's current maximum watermark, so the
-    * extraction window has a stable, reproducible upper edge. */
+  /** First-run guard (JDBC_006): rows whose watermark column is NULL can
+    * never be selected by the incremental predicate — they would be lost
+    * silently and permanently. Verified once per entity, before the first
+    * window is established, via COUNT(1) vs COUNT(column) (COUNT(col)
+    * excludes NULLs), scoped to the same filters as the extraction query. */
+  private def validateNoNullWatermarks(cfg: JdbcSourceConfig, wm: WatermarkConfig): Unit = {
+    val baseFrom = (cfg.table, cfg.sql) match {
+      case (Some(t), _)    => t
+      case (None, Some(s)) => s"($s) base"
+      case _ => return
+    }
+    val whereClause = QueryBuilder.filterWhereClause(cfg)
+    val perColumn = wm.columns.map(c => s"COUNT(${cfg.dialect.quoteIdentifier(c)})").mkString(", ")
+    val sql = s"SELECT COUNT(1), $perColumn FROM $baseFrom$whereClause"
+
+    DriverQueries.firstRow(cfg, sql, logger).foreach { row =>
+      val counts = row.map(_.map(v => BigDecimal(v).toLong).getOrElse(0L))
+      val total = counts.head
+      val maxNulls = counts.tail.map(total - _).max
+      if (maxNulls > 0)
+        throw new IllegalStateException(
+          s"JDBC_006 $maxNulls row(s) in scope have NULL in watermark column(s) " +
+            s"[${wm.columns.mkString(",")}]; the incremental predicate can never extract them " +
+            "(silent permanent data loss). Fix the source data, filter NULL rows explicitly, " +
+            "or set incremental.allow_null_watermark = true to accept the loss.")
+    }
+  }
+
+  /** Driver-side capture of the window's upper edge BEFORE the read, so the
+    * extraction window is stable and reproducible.
+    *
+    * SOURCE_CLOCK: the database server's current timestamp — idle sources
+    * still advance and zero-row windows have a real boundary.
+    *
+    * MAX_VALUE: MAX(watermark_column) scoped to the extraction filters. A
+    * NULL result is only accepted for a VERIFIED-EMPTY source; NULL with
+    * rows present means the watermark column carries NULLs — those rows can
+    * never be extracted by `col > lower`, so this fails loudly (JDBC_006)
+    * instead of silently degrading to an unbounded, non-reproducible window. */
   private def captureUpper(cfg: JdbcSourceConfig, wm: WatermarkConfig): Option[WatermarkValue] = {
     val baseFrom = (cfg.table, cfg.sql) match {
       case (Some(t), _)   => t
@@ -223,6 +277,15 @@ object JdbcSource extends Source with WatermarkAdvancing {
     // filtered read never extracts — permanent silent data loss.
     val whereClause = QueryBuilder.filterWhereClause(cfg)
 
+    if (wm.upperBound == WatermarkUpperBound.SourceClock) {
+      val clockSql = cfg.dialect.currentTimestampSql(wm.watermarkType)
+      val clock = DriverQueries.firstRow(cfg, clockSql, logger)
+        .flatMap(_.headOption.flatten)
+        .getOrElse(throw new IllegalStateException(
+          s"JDBC_006 source clock capture returned no value ($clockSql); cannot form a bounded window"))
+      return Some(WatermarkValue(Seq(clock)))
+    }
+
     val sql =
       if (wm.columns.size == 1)
         s"SELECT MAX(${cfg.dialect.quoteIdentifier(wm.columns.head)}) FROM $baseFrom$whereClause"
@@ -233,9 +296,25 @@ object JdbcSource extends Source with WatermarkAdvancing {
           wm.columns.map(c => s"${cfg.dialect.quoteIdentifier(c)} DESC").mkString(", ")
         )
 
-    DriverQueries.firstRow(cfg, sql, logger).flatMap { row =>
-      if (row.exists(_.isEmpty)) None // any null component -> no usable upper
-      else Some(WatermarkValue(row.map(_.get)))
+    DriverQueries.firstRow(cfg, sql, logger) match {
+      case Some(row) if !row.exists(_.isEmpty) => Some(WatermarkValue(row.map(_.get)))
+      case _ => // no row, or a NULL component: empty source or NULL watermark data
+        if (wm.allowNullWatermark) {
+          logger.warn("[JdbcSource] watermark capture returned NULL and allow_null_watermark=true: " +
+            "rows with NULL watermark values are NEVER extracted by the incremental predicate")
+          None
+        } else {
+          val countSql = s"SELECT COUNT(1) FROM $baseFrom$whereClause"
+          val rows = DriverQueries.firstRow(cfg, countSql, logger)
+            .flatMap(_.headOption.flatten).map(BigDecimal(_).toLong).getOrElse(0L)
+          if (rows == 0L) None // verified empty; the unbounded predicate extracts nothing
+          else throw new IllegalStateException(
+            s"JDBC_006 watermark capture returned NULL but the source has $rows row(s) in scope: " +
+              s"column(s) [${wm.columns.mkString(",")}] contain NULLs, and rows with NULL watermark " +
+              "values can never be extracted incrementally (silent permanent data loss). Fix the " +
+              "source data, filter NULL rows explicitly, or set incremental.allow_null_watermark = true " +
+              "to accept the loss.")
+        }
     }
   }
 
@@ -321,9 +400,15 @@ object JdbcSource extends Source with WatermarkAdvancing {
             v.map(_.version).getOrElse(0L))
       }
 
-      val candidate = window.flatMap(_.capturedUpper)
-        .orElse(Watermarks.computeNext(accepted, wm))
-        .filter(next => Watermarks.compare(wm, next, lower) > 0) // advance-only
+      // Windowed reads commit ONLY the captured upper: falling back to the
+      // extracted max after an unbounded read would commit a boundary that
+      // depends on when each partition happened to run. computeNext remains
+      // solely for the resume path, where no window exists and the accepted
+      // DataFrame is the replayed RAW slice of this run.
+      val candidate = (window match {
+        case Some(w) => w.capturedUpper
+        case None    => Watermarks.computeNext(accepted, wm)
+      }).filter(next => Watermarks.compare(wm, next, lower) > 0) // advance-only
 
       candidate match {
         case None =>
@@ -345,6 +430,14 @@ object JdbcSource extends Source with WatermarkAdvancing {
       }
     }
   }
+
+  /** Peek (not consume) at the window recorded by this run's read so the
+    * pipeline can stamp it onto RAW records; advanceWatermark still removes
+    * the entry when committing. */
+  override def lastWindow(entity: String, runId: Option[String]): Option[(String, Option[String])] =
+    Option(readWindows.get(windowKey(entity, runId)))
+      .orElse(Option(readWindows.get(windowKey(entity, None))))
+      .map(w => (w.lower.serialized, w.capturedUpper.map(_.serialized)))
 
   def register(): Unit = SourceRegistry.register(this)
 

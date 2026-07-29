@@ -137,6 +137,13 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(spark.table("j_raw.claims").count() == 3)
     assert(spark.table("j_raw.claims").filter(col("run_id") === "jrun-2").count() == 1)
     assert(InMemoryWatermarkStore.latest(entity).get.values.head.startsWith("2026-01-03 09:00:00"))
+
+    // RAW rows carry the extraction window and source identity (lineage)
+    val meta = spark.table("j_raw.claims").filter(col("run_id") === "jrun-2")
+      .select("extract_start_ts", "extract_end_ts", "source_table").collect().head
+    assert(meta.getString(0).startsWith("2026-01-02 09:00:00"), "extract_start_ts = previous watermark")
+    assert(meta.getString(1).startsWith("2026-01-03 09:00:00"), "extract_end_ts = captured upper")
+    assert(meta.getString(2) == "claims")
   }
 
   test("failed publish does not advance the watermark; replay picks the rows up again") {
@@ -158,5 +165,29 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     new IngestPipeline(spark, feedConf(), Cli(entity = entity, mode = "FULL", runId = Some("jrun-4")), logger).run()
     assert(InMemoryWatermarkStore.latest(entity).get.values.head.startsWith("2026-01-04 09:00:00"))
     assert(spark.table("j_curated.claims").count() == 1)
+  }
+
+  test("--stage raw does not advance the watermark; advance_after=RAW opts in") {
+    h2("INSERT INTO claims VALUES ('C005', 500, '2026-01-05 09:00:00')")
+    val before = InMemoryWatermarkStore.latest(entity).get
+
+    // RAW-only run: the source window must NOT be burned, because curated
+    // never processed it.
+    new IngestPipeline(spark, feedConf(),
+      Cli(entity = entity, mode = "FULL", runId = Some("jrun-5"), stage = "raw"), logger).run()
+
+    import org.apache.spark.sql.functions.col
+    assert(spark.table("j_raw.claims").filter(col("run_id") === "jrun-5").count() == 1,
+      "raw must still be loaded by a --stage raw run")
+    assert(InMemoryWatermarkStore.latest(entity).get == before,
+      "--stage raw must not advance the watermark: curated never saw the window")
+
+    // Declared raw-only topology: the same raw-only run advances once the
+    // feed opts in explicitly.
+    val rawOnly = ConfigFactory.parseString("""watermark { advance_after = "RAW" }""")
+      .withFallback(feedConf())
+    new IngestPipeline(spark, rawOnly,
+      Cli(entity = entity, mode = "FULL", runId = Some("jrun-6"), stage = "raw"), logger).run()
+    assert(InMemoryWatermarkStore.latest(entity).get.values.head.startsWith("2026-01-05 09:00:00"))
   }
 }

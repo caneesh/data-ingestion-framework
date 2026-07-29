@@ -43,6 +43,15 @@ object PartitionStrategy {
   val all = Seq(StaticRange, MinMaxQuery, Predicates)
 }
 
+object WatermarkUpperBound {
+  /** Upper bound = MAX(watermark_column) observed before the read. */
+  val MaxValue = "MAX_VALUE"
+  /** Upper bound = the source database's clock (SYSUTCDATETIME() on SQL
+    * Server), captured before the read. Idle sources still advance. */
+  val SourceClock = "SOURCE_CLOCK"
+  val all = Seq(MaxValue, SourceClock)
+}
+
 final case class WatermarkConfig(
   watermarkType: String,
   columns: Seq[String],
@@ -51,7 +60,9 @@ final case class WatermarkConfig(
   overlap: Option[BigDecimal], // seconds for TIMESTAMP, amount for NUMERIC
   storeType: String,        // hive | memory
   storeDatabase: Option[String],
-  storeTable: String
+  storeTable: String,
+  upperBound: String = WatermarkUpperBound.MaxValue,
+  allowNullWatermark: Boolean = false
 )
 
 final case class JdbcPartitioning(
@@ -96,114 +107,19 @@ final case class JdbcSourceConfig(
 object JdbcSourceConfig {
 
   def parse(source: Config): JdbcSourceConfig = {
-    val url = ConfigUtils.optString(source, "url").getOrElse(
-      fail("source.url is required for jdbc sources"))
-
-    val dialect = ConfigUtils.optString(source, "dialect") match {
-      case Some(name) => DialectRegistry.resolve(name)
-      case None       => inferDialect(url)
-    }
-    if (!url.startsWith(dialect.urlPrefix))
-      fail(s"source.url '$url' does not match dialect '${dialect.name}' prefix '${dialect.urlPrefix}'")
-
-    val driver = ConfigUtils.optString(source, "driver").getOrElse(dialect.defaultDriver)
-    if (driver.isEmpty)
-      fail(s"source.driver is required for dialect '${dialect.name}'")
-
-    val mode = ConfigUtils.optString(source, "mode").getOrElse(JdbcMode.FullTable).toUpperCase
-    if (!JdbcMode.all.contains(mode))
-      fail(s"source.mode '$mode' must be one of ${JdbcMode.all.mkString(", ")}")
-
-    val table = ConfigUtils.optString(source, "table")
-    val sql = ConfigUtils.optString(source, "sql").orElse(ConfigUtils.optString(source, "query"))
-
-    val structuredColumns = source.hasPath("columns") &&
-      source.getList("columns").asScala.exists(_.valueType() == com.typesafe.config.ConfigValueType.OBJECT)
-    val columns = if (structuredColumns) Seq.empty else ConfigUtils.stringList(source, "columns")
-    val projections = com.hcsc.generic.ingest.jdbc.query.QueryProjection.parseAll(source)
-    val filters = com.hcsc.generic.ingest.jdbc.query.QueryFilter.parseAll(source)
-    val parameters = com.hcsc.generic.ingest.jdbc.query.QueryParameter.parseAll(source)
-    val where = ConfigUtils.optString(source, "where")
-
-    mode match {
-      case JdbcMode.FullTable =>
-        if (table.isEmpty) fail(s"source.table is required for mode $mode")
-        // FULL_TABLE ignores projections and predicates: reject rather than
-        // silently dropping configured intent.
-        if (source.hasPath("columns") || where.isDefined || source.hasPath("filters"))
-          fail("FULL_TABLE mode does not apply columns/where/filters; use SELECT_QUERY or INCREMENTAL")
-      case JdbcMode.SelectQuery =>
-        if (table.isEmpty) fail(s"source.table is required for mode $mode")
-      case JdbcMode.CustomSql =>
-        if (sql.isEmpty) fail("source.sql is required for mode CUSTOM_SQL")
-      case JdbcMode.SqlTemplate =>
-        if (sql.isEmpty) fail("source.sql (the template) is required for mode SQL_TEMPLATE")
-      case JdbcMode.Incremental =>
-        if (table.isEmpty && sql.isEmpty) fail("source.table or source.sql is required for mode INCREMENTAL")
-    }
-
-    val strategy = ConfigUtils.optString(source, "partition_strategy").map(_.toUpperCase)
-      .getOrElse(if (source.hasPath("partition_predicates")) PartitionStrategy.Predicates
-                 else PartitionStrategy.StaticRange)
-    if (!PartitionStrategy.all.contains(strategy))
-      fail(s"partition_strategy '$strategy' must be one of ${PartitionStrategy.all.mkString(", ")}")
-
-    val partitioning = JdbcPartitioning(
-      numPartitions = ConfigUtils.optInt(source, "numPartitions"),
-      partitionColumn = ConfigUtils.optString(source, "partitionColumn"),
-      lowerBound = ConfigUtils.optLong(source, "lowerBound"),
-      upperBound = ConfigUtils.optLong(source, "upperBound"),
-      strategy = strategy,
-      predicates = ConfigUtils.stringList(source, "partition_predicates"),
-      skewMetrics = ConfigUtils.optBoolean(source, "skew_metrics").getOrElse(false)
-    )
-
-    val maxPartitions = ConfigUtils.optInt(source, "max_partitions").getOrElse(64)
-    partitioning.numPartitions.foreach { n =>
-      if (n <= 0) fail(s"numPartitions must be greater than zero, found $n")
-      if (n > maxPartitions)
-        fail(s"numPartitions $n exceeds the operational maximum $maxPartitions (raise max_partitions deliberately)")
-    }
-
-    strategy match {
-      case PartitionStrategy.StaticRange =>
-        // Range partitioning is atomic: all four options or none of them.
-        val partitionFields = Seq(
-          partitioning.numPartitions.isDefined,
-          partitioning.partitionColumn.isDefined,
-          partitioning.lowerBound.isDefined,
-          partitioning.upperBound.isDefined)
-        if (partitionFields.exists(identity) && !partitionFields.forall(identity))
-          fail("numPartitions, partitionColumn, lowerBound and upperBound must all be configured together (or none)")
-        for (lo <- partitioning.lowerBound; hi <- partitioning.upperBound)
-          if (lo >= hi) fail(s"lowerBound $lo must be less than upperBound $hi")
-        if (partitioning.predicates.nonEmpty)
-          fail("partition_predicates requires partition_strategy = PREDICATES")
-      case PartitionStrategy.MinMaxQuery =>
-        if (partitioning.partitionColumn.isEmpty || partitioning.numPartitions.isEmpty)
-          fail("MIN_MAX_QUERY partitioning requires partitionColumn and numPartitions")
-        if (partitioning.lowerBound.isDefined || partitioning.upperBound.isDefined)
-          fail("MIN_MAX_QUERY discovers bounds; lowerBound/upperBound must not be configured")
-      case PartitionStrategy.Predicates =>
-        if (partitioning.predicates.isEmpty)
-          fail("PREDICATES partitioning requires a non-empty partition_predicates list")
-        if (partitioning.partitionColumn.isDefined || partitioning.lowerBound.isDefined ||
-            partitioning.upperBound.isDefined || partitioning.numPartitions.isDefined)
-          fail("PREDICATES partitioning is exclusive with range partitioning options")
-        if (partitioning.predicates.size > maxPartitions)
-          fail(s"partition_predicates count ${partitioning.predicates.size} exceeds max_partitions $maxPartitions")
-    }
-
-    val retryConf = ConfigUtils.optConfig(source, "retry")
-    val retry = RetryConfig(
-      maxAttempts = retryConf.flatMap(c => ConfigUtils.optInt(c, "max_attempts")).getOrElse(3),
-      backoffMs = retryConf.flatMap(c => ConfigUtils.optLong(c, "backoff_ms")).getOrElse(2000L)
-    )
-
+    val (url, dialect, driver) = parseConnection(source)
+    val (mode, table, sql) = parseMode(source)
+    val (structuredColumns, columns, projections, filters, parameters, where) = parseQueryComponents(source)
+    validateModeRequirements(mode, table, sql, where, source)
+    val partitioning = parsePartitioning(source)
+    val retry = parseRetry(source)
+    // INCREMENTAL requires the watermark config; FULL_TABLE may carry one to
+    // capture an extraction cutoff and SEED the incremental watermark on
+    // success (the supported FULL -> INCREMENTAL handoff).
     val watermark =
       if (mode == JdbcMode.Incremental) Some(parseWatermark(source))
+      else if (mode == JdbcMode.FullTable && source.hasPath("incremental")) Some(parseWatermark(source))
       else None
-
     val (authType, user, password, authProps) = resolveAuth(source, dialect)
 
     JdbcSourceConfig(
@@ -237,6 +153,128 @@ object JdbcSourceConfig {
       executorProbePartitions = ConfigUtils.optConfig(source, "health_check")
         .filter(h => ConfigUtils.optBoolean(h, "executor_probe").getOrElse(false))
         .map(h => ConfigUtils.optInt(h, "probe_partitions").getOrElse(2))
+    )
+  }
+
+  private def parseConnection(source: Config): (String, JdbcDialect, String) = {
+    val url = ConfigUtils.optString(source, "url").getOrElse(
+      fail("source.url is required for jdbc sources"))
+
+    val dialect = ConfigUtils.optString(source, "dialect") match {
+      case Some(name) => DialectRegistry.resolve(name)
+      case None       => inferDialect(url)
+    }
+    if (!url.startsWith(dialect.urlPrefix))
+      fail(s"source.url '$url' does not match dialect '${dialect.name}' prefix '${dialect.urlPrefix}'")
+
+    val driver = ConfigUtils.optString(source, "driver").getOrElse(dialect.defaultDriver)
+    if (driver.isEmpty)
+      fail(s"source.driver is required for dialect '${dialect.name}'")
+
+    (url, dialect, driver)
+  }
+
+  private def parseMode(source: Config): (String, Option[String], Option[String]) = {
+    val mode = ConfigUtils.optString(source, "mode").getOrElse(JdbcMode.FullTable).toUpperCase
+    if (!JdbcMode.all.contains(mode))
+      fail(s"source.mode '$mode' must be one of ${JdbcMode.all.mkString(", ")}")
+
+    val table = ConfigUtils.optString(source, "table")
+    val sql = ConfigUtils.optString(source, "sql").orElse(ConfigUtils.optString(source, "query"))
+    (mode, table, sql)
+  }
+
+  private def parseQueryComponents(source: Config): (Boolean, Seq[String], Seq[com.hcsc.generic.ingest.jdbc.query.QueryProjection], Seq[com.hcsc.generic.ingest.jdbc.query.QueryFilter], Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameterDef], Option[String]) = {
+    val structuredColumns = source.hasPath("columns") &&
+      source.getList("columns").asScala.exists(_.valueType() == com.typesafe.config.ConfigValueType.OBJECT)
+    val columns = if (structuredColumns) Seq.empty else ConfigUtils.stringList(source, "columns")
+    val projections = com.hcsc.generic.ingest.jdbc.query.QueryProjection.parseAll(source)
+    val filters = com.hcsc.generic.ingest.jdbc.query.QueryFilter.parseAll(source)
+    val parameters = com.hcsc.generic.ingest.jdbc.query.QueryParameter.parseAll(source)
+    val where = ConfigUtils.optString(source, "where")
+    (structuredColumns, columns, projections, filters, parameters, where)
+  }
+
+  private def validateModeRequirements(mode: String, table: Option[String], sql: Option[String], where: Option[String], source: Config): Unit = {
+    mode match {
+      case JdbcMode.FullTable =>
+        if (table.isEmpty) fail(s"source.table is required for mode $mode")
+        if (source.hasPath("columns") || where.isDefined || source.hasPath("filters"))
+          fail("FULL_TABLE mode does not apply columns/where/filters; use SELECT_QUERY or INCREMENTAL")
+      case JdbcMode.SelectQuery =>
+        if (table.isEmpty) fail(s"source.table is required for mode $mode")
+      case JdbcMode.CustomSql =>
+        if (sql.isEmpty) fail("source.sql is required for mode CUSTOM_SQL")
+      case JdbcMode.SqlTemplate =>
+        if (sql.isEmpty) fail("source.sql (the template) is required for mode SQL_TEMPLATE")
+      case JdbcMode.Incremental =>
+        if (table.isEmpty && sql.isEmpty) fail("source.table or source.sql is required for mode INCREMENTAL")
+    }
+  }
+
+  private def parsePartitioning(source: Config): JdbcPartitioning = {
+    val strategy = ConfigUtils.optString(source, "partition_strategy").map(_.toUpperCase)
+      .getOrElse(if (source.hasPath("partition_predicates")) PartitionStrategy.Predicates
+                 else PartitionStrategy.StaticRange)
+    if (!PartitionStrategy.all.contains(strategy))
+      fail(s"partition_strategy '$strategy' must be one of ${PartitionStrategy.all.mkString(", ")}")
+
+    val partitioning = JdbcPartitioning(
+      numPartitions = ConfigUtils.optInt(source, "numPartitions"),
+      partitionColumn = ConfigUtils.optString(source, "partitionColumn"),
+      lowerBound = ConfigUtils.optLong(source, "lowerBound"),
+      upperBound = ConfigUtils.optLong(source, "upperBound"),
+      strategy = strategy,
+      predicates = ConfigUtils.stringList(source, "partition_predicates"),
+      skewMetrics = ConfigUtils.optBoolean(source, "skew_metrics").getOrElse(false)
+    )
+
+    validatePartitioning(partitioning, source)
+    partitioning
+  }
+
+  private def validatePartitioning(partitioning: JdbcPartitioning, source: Config): Unit = {
+    val maxPartitions = ConfigUtils.optInt(source, "max_partitions").getOrElse(64)
+    partitioning.numPartitions.foreach { n =>
+      if (n <= 0) fail(s"numPartitions must be greater than zero, found $n")
+      if (n > maxPartitions)
+        fail(s"numPartitions $n exceeds the operational maximum $maxPartitions (raise max_partitions deliberately)")
+    }
+
+    partitioning.strategy match {
+      case PartitionStrategy.StaticRange =>
+        val partitionFields = Seq(
+          partitioning.numPartitions.isDefined,
+          partitioning.partitionColumn.isDefined,
+          partitioning.lowerBound.isDefined,
+          partitioning.upperBound.isDefined)
+        if (partitionFields.exists(identity) && !partitionFields.forall(identity))
+          fail("numPartitions, partitionColumn, lowerBound and upperBound must all be configured together (or none)")
+        for (lo <- partitioning.lowerBound; hi <- partitioning.upperBound)
+          if (lo >= hi) fail(s"lowerBound $lo must be less than upperBound $hi")
+        if (partitioning.predicates.nonEmpty)
+          fail("partition_predicates requires partition_strategy = PREDICATES")
+      case PartitionStrategy.MinMaxQuery =>
+        if (partitioning.partitionColumn.isEmpty || partitioning.numPartitions.isEmpty)
+          fail("MIN_MAX_QUERY partitioning requires partitionColumn and numPartitions")
+        if (partitioning.lowerBound.isDefined || partitioning.upperBound.isDefined)
+          fail("MIN_MAX_QUERY discovers bounds; lowerBound/upperBound must not be configured")
+      case PartitionStrategy.Predicates =>
+        if (partitioning.predicates.isEmpty)
+          fail("PREDICATES partitioning requires a non-empty partition_predicates list")
+        if (partitioning.partitionColumn.isDefined || partitioning.lowerBound.isDefined ||
+            partitioning.upperBound.isDefined || partitioning.numPartitions.isDefined)
+          fail("PREDICATES partitioning is exclusive with range partitioning options")
+        if (partitioning.predicates.size > maxPartitions)
+          fail(s"partition_predicates count ${partitioning.predicates.size} exceeds max_partitions $maxPartitions")
+    }
+  }
+
+  private def parseRetry(source: Config): RetryConfig = {
+    val retryConf = ConfigUtils.optConfig(source, "retry")
+    RetryConfig(
+      maxAttempts = retryConf.flatMap(c => ConfigUtils.optInt(c, "max_attempts")).getOrElse(3),
+      backoffMs = retryConf.flatMap(c => ConfigUtils.optLong(c, "backoff_ms")).getOrElse(2000L)
     )
   }
 
@@ -348,6 +386,15 @@ object JdbcSourceConfig {
       }
     }
 
+    val upperBound = ConfigUtils.optString(inc, "upper_bound").map(_.toUpperCase)
+      .getOrElse(WatermarkUpperBound.MaxValue)
+    if (!WatermarkUpperBound.all.contains(upperBound))
+      fail(s"incremental.upper_bound '$upperBound' must be one of ${WatermarkUpperBound.all.mkString(", ")}")
+    if (upperBound == WatermarkUpperBound.SourceClock &&
+        !Seq(WatermarkType.Timestamp, WatermarkType.DatetimeOffset).contains(watermarkType))
+      fail("incremental.upper_bound = SOURCE_CLOCK requires a single TIMESTAMP or DATETIMEOFFSET " +
+        "watermark column (the source clock is a timestamp)")
+
     val store = ConfigUtils.optConfig(inc, "watermark_store")
     WatermarkConfig(
       watermarkType = watermarkType,
@@ -358,7 +405,9 @@ object JdbcSourceConfig {
       overlap = overlapValue,
       storeType = store.flatMap(s => ConfigUtils.optString(s, "type")).getOrElse("hive").toLowerCase,
       storeDatabase = store.flatMap(s => ConfigUtils.optString(s, "database")),
-      storeTable = store.flatMap(s => ConfigUtils.optString(s, "table")).getOrElse("ingest_watermarks")
+      storeTable = store.flatMap(s => ConfigUtils.optString(s, "table")).getOrElse("ingest_watermarks"),
+      upperBound = upperBound,
+      allowNullWatermark = ConfigUtils.optBoolean(inc, "allow_null_watermark").getOrElse(false)
     )
   }
 

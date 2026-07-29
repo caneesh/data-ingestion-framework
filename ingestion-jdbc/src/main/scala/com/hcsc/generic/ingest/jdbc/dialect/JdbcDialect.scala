@@ -81,6 +81,16 @@ trait JdbcDialect {
   /** Health-check probe statement. */
   def validationQuery: String = "SELECT 1"
 
+  /** Statement returning the database server's current timestamp — the
+    * SOURCE_CLOCK upper bound for incremental windows. Preferring the
+    * source clock over MAX(watermark_column) lets an idle source still
+    * advance the watermark and gives zero-row windows a recordable
+    * boundary; it also avoids Spark-driver clock skew entirely.
+    * LOCALTIMESTAMP (plain timestamp, session zone) round-trips through
+    * TIMESTAMP watermark parsing; the clock's zone must match the
+    * watermark column's zone. */
+  def currentTimestampSql(watermarkType: String): String = "SELECT LOCALTIMESTAMP"
+
   /** SELECT of one row ordered as given (SQL-standard FETCH FIRST default;
     * engine-specific overrides where needed). Used for composite upper
     * watermark capture. */
@@ -119,6 +129,9 @@ object SqlServerDialect extends JdbcDialect {
     s"SELECT TOP 1 $projection FROM $from ORDER BY $orderBy"
   override protected def booleanTrueLiteral: String = "1"
   override protected def booleanFalseLiteral: String = "0"
+  override def currentTimestampSql(watermarkType: String): String =
+    if (watermarkType.equalsIgnoreCase("DATETIMEOFFSET")) "SELECT SYSDATETIMEOFFSET()"
+    else "SELECT SYSUTCDATETIME()"
 }
 
 object PostgresDialect extends JdbcDialect {
@@ -132,6 +145,8 @@ object OracleDialect extends JdbcDialect {
   val defaultDriver = "oracle.jdbc.OracleDriver"
   val urlPrefix = "jdbc:oracle:"
   override def validationQuery: String = "SELECT 1 FROM DUAL"
+  override def currentTimestampSql(watermarkType: String): String =
+    "SELECT SYSTIMESTAMP FROM DUAL"
 }
 
 object Db2Dialect extends JdbcDialect {

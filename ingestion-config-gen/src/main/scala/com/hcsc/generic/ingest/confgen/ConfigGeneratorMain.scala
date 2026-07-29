@@ -95,6 +95,24 @@ object ConfigGeneratorMain {
     // saved draft, not a generation run.
     if (findMissing(flow, completed).nonEmpty) return 0
 
+    // JDBC schema introspection: generate the column mapping from the source
+    // table's metadata. An explicitly supplied schema.columns answer wins.
+    if (sourceType == "jdbc" && completed.isTrue("_schema.use_contract") &&
+        completed.isTrue("_schema.introspect") && !completed.contains("schema.columns")) {
+      val draftFeed = ConfigAssembler.assemble(flow, completed)
+      com.hcsc.generic.ingest.confgen.introspect.JdbcSchemaIntrospector
+        .introspect(draftFeed, console) match {
+        case Right(columns) =>
+          completed.put("schema.columns",
+            com.hcsc.generic.ingest.confgen.model.AnswerValue.Blocks(columns))
+        case Left(problem) =>
+          console.error(s"Schema introspection failed: $problem")
+          console.error("Re-run answering 'n' to introspection and supply the columns " +
+            "inline or via @file, or fix the connectivity/table name and retry.")
+          return 1
+      }
+    }
+
     val feed = ConfigAssembler.assemble(flow, completed)
     val report = DryRunValidator.validate(feed)
 
@@ -119,11 +137,42 @@ object ConfigGeneratorMain {
     val entity = feed.getString("entity")
     val wrapped = ConfigAssembler.wrapAsFeeds(feed)
     Files.createDirectories(Paths.get(options.outputDir))
-    options.formats.foreach { format =>
-      val path = Paths.get(options.outputDir, s"$entity.${ConfigRenderers.extensionFor(format)}")
-      Files.write(path, ConfigRenderers.render(wrapped, format)
-        .getBytes(java.nio.charset.StandardCharsets.UTF_8))
-      console.success(s"Wrote $path")
+    val utf8 = java.nio.charset.StandardCharsets.UTF_8
+    val writeProblems = scala.collection.mutable.ArrayBuffer.empty[String]
+    options.formats.foreach {
+      case "hocon" =>
+        // HOCON output is split for maintainability: the (potentially very
+        // large) schema contract goes to its own file, included from the
+        // main feed file. The runtime resolves the include natively.
+        val schemaFile = com.hcsc.generic.ingest.confgen.render.HoconFeedWriter
+          .renderSchema(entity, feed)
+          .map { content =>
+            val name = com.hcsc.generic.ingest.confgen.render.HoconFeedWriter.schemaFileName(entity)
+            val path = Paths.get(options.outputDir, name)
+            Files.write(path, content.getBytes(utf8))
+            console.success(s"Wrote $path (schema contract / mapping document)")
+            name
+          }
+        val mainPath = Paths.get(options.outputDir, s"$entity.conf")
+        Files.write(mainPath, com.hcsc.generic.ingest.confgen.render.HoconFeedWriter
+          .renderMain(entity, feed, schemaFile).getBytes(utf8))
+        console.success(s"Wrote $mainPath")
+
+        // Self-check: the split files must re-parse to EXACTLY the assembled
+        // configuration the dry-run validated.
+        val reparsed = com.typesafe.config.ConfigFactory.parseFile(mainPath.toFile)
+        if (ConfigRenderers.render(reparsed, "json") != ConfigRenderers.render(wrapped, "json"))
+          writeProblems += s"$mainPath did not round-trip to the validated configuration " +
+            "(generator bug — do not deploy these files)"
+
+      case format =>
+        val path = Paths.get(options.outputDir, s"$entity.${ConfigRenderers.extensionFor(format)}")
+        Files.write(path, ConfigRenderers.render(wrapped, format).getBytes(utf8))
+        console.success(s"Wrote $path")
+    }
+    if (writeProblems.nonEmpty) {
+      writeProblems.foreach(p => console.error(p))
+      return 1
     }
 
     console.header("\n--- Configuration summary (secrets masked) ---")

@@ -61,6 +61,64 @@ while you are still in the wizard. For schema-contract columns, JSON objects
 carry the full contract (`name/type/nullable/required/aliases/position`);
 plain CSV names become minimal `string` columns you can refine later.
 
+## Split output: the mapping document gets its own file
+
+For HOCON output, a feed with a schema contract is written as **two files**
+so a wide mapping (hundreds of columns) does not bury the rest of the
+configuration:
+
+```
+generated-configs/
+  claims.conf           # feed: source, watermark, audit, raw, curated ...
+  claims-schema.conf    # the schema contract (source-to-target mapping)
+```
+
+The main file pulls the contract in with a standard HOCON include:
+
+```hocon
+feeds.claims {
+  include required("claims-schema.conf")
+
+  source { ... }
+  raw { ... }
+  curated { ... }
+}
+```
+
+`include required(...)` is resolved natively by `ConfigFactory.parseFile`
+relative to the including file, so **the runtime pipeline needs no changes**
+— `IngestMain --conf claims.conf` sees one logical configuration. `required`
+means a missing/renamed schema file fails the parse loudly instead of
+silently running without a contract. The generator re-parses the written
+pair and verifies it matches the validated configuration exactly before
+reporting success.
+
+Sections in the main file are emitted in reading order (identity, source,
+schema include, rejects/idempotency, audit, raw, curated) rather than
+alphabetically. JSON/YAML outputs stay single-file (those formats have no
+include mechanism); they carry the schema inline.
+
+The schema-contract questions are available in both the **file** and
+**JDBC** flows (opt-in for JDBC; strongly recommended for wide or
+long-lived feeds). For a wide table you have two ways to produce the
+mapping:
+
+- **Introspect it** (JDBC): answer `y` to *"Generate the column mapping by
+  introspecting the source table?"* — the generator connects with the
+  feed's own URL/auth/TLS settings and emits one contract column per
+  source column (name, Spark type, nullability, 0-based position) via
+  `DatabaseMetaData`/INFORMATION_SCHEMA. SQL Server types map to what the
+  Spark JDBC reader produces (`decimal(p,s)` preserved, `datetimeoffset`
+  → `string`, unknown engine types → `string`), so `on_type_change`
+  validation stays green. An explicitly supplied `schema.columns` answer
+  always wins over introspection.
+- **Supply it**: maintain the mapping as a JSON array in its own file and
+  answer `@/path/columns.json`.
+
+Either way the mapping lands in `<entity>-schema.conf`, which is the file
+you review and maintain going forward (add aliases, defaults, validation
+rules there).
+
 ## Secrets
 
 Credentials are captured as **references**, never values (unless you

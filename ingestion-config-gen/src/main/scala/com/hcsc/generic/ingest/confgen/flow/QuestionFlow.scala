@@ -1,6 +1,7 @@
 package com.hcsc.generic.ingest.confgen.flow
 
 import com.hcsc.generic.ingest.confgen.model.{Answers, Question, QuestionGroups => G, QuestionKind => K, Validators => V}
+import com.typesafe.config.{Config, ConfigFactory}
 
 import java.util.concurrent.ConcurrentHashMap
 import scala.collection.JavaConverters._
@@ -49,6 +50,74 @@ object CommonQuestions {
       kind = K.Choice(Seq("FULL", "INCR")), default = Some("FULL"),
       validate = V.oneOf(Seq("FULL", "INCR")))
   )
+
+  private val Policies = Seq("FAIL", "WARN", "IGNORE")
+  private val Strategies = Seq("STRICT_NAME", "NAME_WITH_ALIASES", "NAME_ALIAS_POSITION_FALLBACK")
+
+  /** Plain CSV items become minimal column contracts. */
+  private[confgen] def plainColumn(name: String): Config =
+    ConfigFactory.parseString(
+      s"""name = "${name.trim}"
+         |type = "string"
+         |nullable = true
+         |required = true""".stripMargin)
+
+  /**
+    * Schema-contract (source-to-target mapping) questions, shared by the
+    * file and JDBC flows. The generated contract is written to its own
+    * `<entity>-schema.conf` file so a wide mapping (hundreds of columns)
+    * stays maintainable without burying the rest of the feed config.
+    */
+  def schemaContract(gateDefault: String, gateHelp: String, introspectable: Boolean = false): Seq[Question] = {
+    def contract(a: Answers) = a.isTrue("_schema.use_contract")
+    def manualColumns(a: Answers) =
+      contract(a) && !(introspectable && a.isTrue("_schema.introspect"))
+    val introspect =
+      if (!introspectable) Seq.empty
+      else Seq(
+        Question("_schema.introspect", G.Extraction,
+          "Generate the column mapping by introspecting the source table?",
+          help = "Connects to the database at generation time and emits one contract column " +
+            "per source column (name, type, nullability, position) via " +
+            "DatabaseMetaData/INFORMATION_SCHEMA — ideal for wide tables. The result is " +
+            "written to <entity>-schema.conf for review. Answer n to type or @file the " +
+            "columns instead.",
+          kind = K.BoolKind, default = Some("true"), appliesWhen = contract))
+    Seq(
+      Question("_schema.use_contract", G.Extraction, "Define a schema contract?",
+        help = gateHelp, kind = K.BoolKind, default = Some(gateDefault))) ++
+    introspect ++
+    Seq(
+      Question("schema.columns", G.Extraction, "Contract columns",
+        help = "CSV of names (typed string/required), or JSON objects with " +
+          "name/type/nullable/required/aliases/position — inline or @file. For wide " +
+          "tables keep the mapping in a file and answer @/path/columns.json; the " +
+          "generator writes the contract to <entity>-schema.conf.",
+        kind = K.BlockList(plainColumn), appliesWhen = manualColumns, validate = V.nonEmpty),
+      Question("schema.version", G.Extraction, "Contract version",
+        default = Some("1.0"), appliesWhen = contract),
+      Question("schema.header_validation.strategy", G.Extraction, "Header matching strategy",
+        help = "STRICT_NAME: canonical names only. NAME_WITH_ALIASES: plus approved aliases. " +
+          "NAME_ALIAS_POSITION_FALLBACK: adds guarded positional fallback (stable-order vendors only).",
+        kind = K.Choice(Strategies), default = Some("NAME_WITH_ALIASES"),
+        validate = V.oneOf(Strategies), appliesWhen = contract),
+      Question("_schema.policy_defaults", G.Extraction,
+        "Accept recommended drift policies (missing=FAIL, extra=WARN, type=FAIL, duplicate=FAIL)?",
+        kind = K.BoolKind, default = Some("true"), appliesWhen = contract),
+      Question("schema.on_missing_column", G.Extraction, "Policy: missing column",
+        kind = K.Choice(Policies), default = Some("FAIL"), validate = V.oneOf(Policies),
+        appliesWhen = a => contract(a) && !a.isTrue("_schema.policy_defaults")),
+      Question("schema.on_extra_column", G.Extraction, "Policy: extra column",
+        kind = K.Choice(Policies), default = Some("WARN"), validate = V.oneOf(Policies),
+        appliesWhen = a => contract(a) && !a.isTrue("_schema.policy_defaults")),
+      Question("schema.on_type_change", G.Extraction, "Policy: type change",
+        kind = K.Choice(Policies), default = Some("FAIL"), validate = V.oneOf(Policies),
+        appliesWhen = a => contract(a) && !a.isTrue("_schema.policy_defaults")),
+      Question("schema.on_duplicate_header", G.Extraction, "Policy: duplicate header",
+        kind = K.Choice(Policies), default = Some("FAIL"), validate = V.oneOf(Policies),
+        appliesWhen = a => contract(a) && !a.isTrue("_schema.policy_defaults"))
+    )
+  }
 
   def audit: Seq[Question] = Seq(
     Question("_audit.enabled", G.Audit, "Enable audit and reconciliation?",

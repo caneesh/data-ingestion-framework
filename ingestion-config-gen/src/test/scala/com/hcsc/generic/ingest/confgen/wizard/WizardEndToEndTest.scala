@@ -38,6 +38,7 @@ class WizardEndToEndTest extends AnyFunSuite {
     "d_claims",          // table
     "claim_id, state, modified_ts", // columns
     "state = 'IL'",      // where
+    "n",                 // schema contract? (opt-in for JDBC)
     "NUMERIC",           // watermark type
     "claim_id",          // watermark columns
     "0",                 // initial value

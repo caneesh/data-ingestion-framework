@@ -53,6 +53,13 @@ object JdbcQuestionFlow extends SourceQuestionFlow {
 
   override def questions: Seq[Question] =
     CommonQuestions.general ++ source ++ authentication ++ extraction ++
+      CommonQuestions.schemaContract(
+        gateDefault = "false",
+        gateHelp = "Recommended for wide/long-lived feeds: validates source columns by " +
+          "name/alias and applies drift policies (missing/extra/type changes) before any " +
+          "RAW write. The mapping can be introspected from the database or supplied " +
+          "via @/path/columns.json.",
+        introspectable = true) ++
       watermark ++ retry ++ CommonQuestions.audit ++ performance ++
       CommonQuestions.destination
 

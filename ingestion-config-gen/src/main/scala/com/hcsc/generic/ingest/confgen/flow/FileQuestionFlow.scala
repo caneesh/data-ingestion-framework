@@ -12,23 +12,18 @@ object FileQuestionFlow extends SourceQuestionFlow {
 
   override val sourceType: String = "file"
 
-  private val Policies = Seq("FAIL", "WARN", "IGNORE")
-  private val Strategies = Seq("STRICT_NAME", "NAME_WITH_ALIASES", "NAME_ALIAS_POSITION_FALLBACK")
-
   private def managed(a: Answers) = a.isTrue("_file.managed")
   private def csv(a: Answers) = a.is("source.file_type", "csv") || a.is("source.file_type", "text")
   private def contract(a: Answers) = a.isTrue("_schema.use_contract")
 
   /** Plain CSV items become minimal column contracts. */
-  private[confgen] def plainColumn(name: String): Config =
-    ConfigFactory.parseString(
-      s"""name = "${name.trim}"
-         |type = "string"
-         |nullable = true
-         |required = true""".stripMargin)
+  private[confgen] def plainColumn(name: String): Config = CommonQuestions.plainColumn(name)
 
   override def questions: Seq[Question] =
-    CommonQuestions.general ++ source ++ validation ++ schema ++
+    CommonQuestions.general ++ source ++ validation ++
+      CommonQuestions.schemaContract(
+        gateDefault = "true",
+        gateHelp = "Strongly recommended: validates headers by name/alias and detects every drift.") ++
       CommonQuestions.audit ++ governance ++ CommonQuestions.destination
 
   private def source = Seq(
@@ -75,38 +70,6 @@ object FileQuestionFlow extends SourceQuestionFlow {
     Question("source.validation.min_size_bytes", G.Source, "Minimum file size (bytes)",
       kind = K.IntKind, default = Some("1"), validate = V.positiveInt,
       appliesWhen = _.isTrue("_file.validation"))
-  )
-
-  private def schema = Seq(
-    Question("_schema.use_contract", G.Extraction, "Define a schema contract?",
-      help = "Strongly recommended: validates headers by name/alias and detects every drift.",
-      kind = K.BoolKind, default = Some("true")),
-    Question("schema.columns", G.Extraction, "Contract columns",
-      help = "CSV of names (typed string/required), or JSON objects with " +
-        "name/type/nullable/required/aliases/position — inline or @file.",
-      kind = K.BlockList(plainColumn), appliesWhen = contract, validate = V.nonEmpty),
-    Question("schema.version", G.Extraction, "Contract version",
-      default = Some("1.0"), appliesWhen = contract),
-    Question("schema.header_validation.strategy", G.Extraction, "Header matching strategy",
-      help = "STRICT_NAME: canonical names only. NAME_WITH_ALIASES: plus approved aliases. " +
-        "NAME_ALIAS_POSITION_FALLBACK: adds guarded positional fallback (stable-order vendors only).",
-      kind = K.Choice(Strategies), default = Some("NAME_WITH_ALIASES"),
-      validate = V.oneOf(Strategies), appliesWhen = contract),
-    Question("_schema.policy_defaults", G.Extraction,
-      "Accept recommended drift policies (missing=FAIL, extra=WARN, type=FAIL, duplicate=FAIL)?",
-      kind = K.BoolKind, default = Some("true"), appliesWhen = contract),
-    Question("schema.on_missing_column", G.Extraction, "Policy: missing column",
-      kind = K.Choice(Policies), default = Some("FAIL"), validate = V.oneOf(Policies),
-      appliesWhen = a => contract(a) && !a.isTrue("_schema.policy_defaults")),
-    Question("schema.on_extra_column", G.Extraction, "Policy: extra column",
-      kind = K.Choice(Policies), default = Some("WARN"), validate = V.oneOf(Policies),
-      appliesWhen = a => contract(a) && !a.isTrue("_schema.policy_defaults")),
-    Question("schema.on_type_change", G.Extraction, "Policy: type change",
-      kind = K.Choice(Policies), default = Some("FAIL"), validate = V.oneOf(Policies),
-      appliesWhen = a => contract(a) && !a.isTrue("_schema.policy_defaults")),
-    Question("schema.on_duplicate_header", G.Extraction, "Policy: duplicate header",
-      kind = K.Choice(Policies), default = Some("FAIL"), validate = V.oneOf(Policies),
-      appliesWhen = a => contract(a) && !a.isTrue("_schema.policy_defaults"))
   )
 
   /** Content idempotency and record-level rejects (file feeds only). */

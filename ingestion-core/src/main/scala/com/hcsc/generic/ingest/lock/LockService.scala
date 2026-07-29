@@ -57,7 +57,7 @@ final class LockService(
       throw new PipelineLockException(contention(entity, held))
     }
 
-    appendRow(entity, runId, "CLAIM", Some(new Timestamp(System.currentTimeMillis() + leaseMillis)))
+    appendRow(entity, runId, "CLAIM", Some(leaseMillis))
     if (settleMillis > 0) Thread.sleep(settleMillis)
 
     // Settle re-read: if a competing claim landed before (or tied with)
@@ -121,8 +121,15 @@ final class LockService(
         eventTs = r.getAs[Timestamp]("event_ts")))
       .toSeq
 
-  private def appendRow(entity: String, runId: String, action: String, leaseUntil: Option[Timestamp]): Unit = {
-    val lease = leaseUntil.map(t => s"timestamp'$t'").getOrElse("CAST(NULL AS TIMESTAMP)")
+  private def appendRow(entity: String, runId: String, action: String, leaseForMillis: Option[Long]): Unit = {
+    // lease_until is computed IN SQL from the same clock/session semantics
+    // as event_ts. A JVM-formatted timestamp literal would be rendered in
+    // the JVM default zone but parsed in the Spark session zone (UTC by
+    // default) — on a non-UTC cluster that skew can exceed the lease and
+    // create locks that are born expired.
+    val lease = leaseForMillis
+      .map(ms => s"timestampadd(SECOND, ${math.max(ms / 1000L, 1L)}, current_timestamp())")
+      .getOrElse("CAST(NULL AS TIMESTAMP)")
     spark.sql(
       s"INSERT INTO $fullTable VALUES ('$entity', '$runId', '$action', $lease, current_timestamp())")
   }

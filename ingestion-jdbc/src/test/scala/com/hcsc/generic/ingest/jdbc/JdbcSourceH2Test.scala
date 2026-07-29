@@ -230,6 +230,7 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
         |  watermark_columns = ["modified_ts"]
         |  initial_value = "1900-01-01 00:00:00"
         |  upper_bound = "SOURCE_CLOCK"
+        |  clock_zone = "LOCAL"
         |  watermark_store { type = "memory" }
         |}
       """.stripMargin)
@@ -313,6 +314,16 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
     // Handoff: the first INCREMENTAL run extracts nothing new
     val incr = JdbcSource.read(spark, conf(s"""mode = "INCREMENTAL"\ntable = "members"\n$incrementalBlock"""))
     assert(incr.count() == 0, "seeded watermark must hand off cleanly to INCREMENTAL")
+
+    // Reseed guard: a LATER FULL_TABLE rerun against the populated store
+    // must not jump the watermark (an ad-hoc full reload would otherwise
+    // skip every row between the incremental cursor and "now")
+    val before = InMemoryWatermarkStore.latest("seed_feed")
+    val rerun = JdbcSource.read(spark, conf(s"""table = "members"\n$incrementalBlock"""))
+    JdbcSource.advanceWatermark(spark, conf(s"""table = "members"\n$incrementalBlock"""),
+      "seed_feed", "run-seed-2", rerun)
+    assert(InMemoryWatermarkStore.latest("seed_feed") == before,
+      "FULL_TABLE rerun must never reseed an existing watermark")
   }
 
   test("SOURCE_CLOCK upper bound rejects non-timestamp watermark types at parse") {
@@ -330,6 +341,39 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
         """.stripMargin))
     }
     assert(ex.getMessage.contains("SOURCE_CLOCK"))
+  }
+
+  test("SOURCE_CLOCK with a TIMESTAMP watermark requires an explicit clock_zone") {
+    val ex = intercept[IllegalArgumentException] {
+      JdbcSourceConfig.parse(conf(
+        """
+          |mode = "INCREMENTAL"
+          |table = "members"
+          |incremental {
+          |  watermark_type = "TIMESTAMP"
+          |  watermark_columns = ["modified_ts"]
+          |  initial_value = "1900-01-01 00:00:00"
+          |  upper_bound = "SOURCE_CLOCK"
+          |}
+        """.stripMargin))
+    }
+    assert(ex.getMessage.contains("clock_zone"))
+  }
+
+  test("a stray incremental block under SELECT_QUERY is rejected, not silently ignored") {
+    val ex = intercept[IllegalArgumentException] {
+      JdbcSourceConfig.parse(conf(
+        """
+          |mode = "SELECT_QUERY"
+          |table = "members"
+          |incremental {
+          |  watermark_type = "TIMESTAMP"
+          |  watermark_columns = ["modified_ts"]
+          |  initial_value = "1900-01-01 00:00:00"
+          |}
+        """.stripMargin))
+    }
+    assert(ex.getMessage.contains("incremental"))
   }
 
   test("schema contract detects drift: aliases map, unknown required column fails") {

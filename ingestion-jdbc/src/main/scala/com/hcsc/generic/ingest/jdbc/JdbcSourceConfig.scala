@@ -62,7 +62,8 @@ final case class WatermarkConfig(
   storeDatabase: Option[String],
   storeTable: String,
   upperBound: String = WatermarkUpperBound.MaxValue,
-  allowNullWatermark: Boolean = false
+  allowNullWatermark: Boolean = false,
+  clockZone: Option[String] = None // UTC | LOCAL: the zone the watermark column stores
 )
 
 final case class JdbcPartitioning(
@@ -203,14 +204,25 @@ object JdbcSourceConfig {
           fail("FULL_TABLE mode does not apply columns/where/filters; use SELECT_QUERY or INCREMENTAL")
       case JdbcMode.SelectQuery =>
         if (table.isEmpty) fail(s"source.table is required for mode $mode")
+        rejectStrayIncremental(mode, source)
       case JdbcMode.CustomSql =>
         if (sql.isEmpty) fail("source.sql is required for mode CUSTOM_SQL")
+        rejectStrayIncremental(mode, source)
       case JdbcMode.SqlTemplate =>
         if (sql.isEmpty) fail("source.sql (the template) is required for mode SQL_TEMPLATE")
+        rejectStrayIncremental(mode, source)
       case JdbcMode.Incremental =>
         if (table.isEmpty && sql.isEmpty) fail("source.table or source.sql is required for mode INCREMENTAL")
     }
   }
+
+  /** An incremental block is only consumed by INCREMENTAL (and FULL_TABLE,
+    * for one-time watermark seeding); anywhere else it is leftover intent
+    * from a mode change and is rejected rather than silently ignored. */
+  private def rejectStrayIncremental(mode: String, source: Config): Unit =
+    if (source.hasPath("incremental"))
+      fail(s"mode $mode does not consume an incremental block; remove it or switch to " +
+        "INCREMENTAL (or FULL_TABLE for watermark seeding)")
 
   private def parsePartitioning(source: Config): JdbcPartitioning = {
     val strategy = ConfigUtils.optString(source, "partition_strategy").map(_.toUpperCase)
@@ -395,6 +407,20 @@ object JdbcSourceConfig {
       fail("incremental.upper_bound = SOURCE_CLOCK requires a single TIMESTAMP or DATETIMEOFFSET " +
         "watermark column (the source clock is a timestamp)")
 
+    // A plain-TIMESTAMP watermark column has no zone; committing a clock in
+    // a DIFFERENT zone permanently skips one offset-worth of rows. Force the
+    // operator to declare which zone the column stores. DATETIMEOFFSET is
+    // offset-aware, so no declaration is needed there.
+    val clockZone = ConfigUtils.optString(inc, "clock_zone").map(_.toUpperCase)
+    clockZone.foreach { z =>
+      if (!Seq("UTC", "LOCAL").contains(z)) fail(s"incremental.clock_zone '$z' must be UTC or LOCAL")
+    }
+    if (upperBound == WatermarkUpperBound.SourceClock &&
+        watermarkType == WatermarkType.Timestamp && clockZone.isEmpty)
+      fail("incremental.upper_bound = SOURCE_CLOCK with a TIMESTAMP watermark requires " +
+        "incremental.clock_zone = UTC or LOCAL — declare the zone the watermark column stores " +
+        "(a UTC clock committed over a local-time column silently skips one offset of rows forever)")
+
     val store = ConfigUtils.optConfig(inc, "watermark_store")
     WatermarkConfig(
       watermarkType = watermarkType,
@@ -407,7 +433,8 @@ object JdbcSourceConfig {
       storeDatabase = store.flatMap(s => ConfigUtils.optString(s, "database")),
       storeTable = store.flatMap(s => ConfigUtils.optString(s, "table")).getOrElse("ingest_watermarks"),
       upperBound = upperBound,
-      allowNullWatermark = ConfigUtils.optBoolean(inc, "allow_null_watermark").getOrElse(false)
+      allowNullWatermark = ConfigUtils.optBoolean(inc, "allow_null_watermark").getOrElse(false),
+      clockZone = clockZone
     )
   }
 

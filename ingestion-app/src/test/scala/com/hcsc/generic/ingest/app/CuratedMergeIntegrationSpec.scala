@@ -220,6 +220,57 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   // ---------------------------------------------------------------------------
+  // 6b: drop_null_keys=false — distinct keyless records pass through unmerged
+  // ---------------------------------------------------------------------------
+
+  test("null-key rows pass through unmerged and never collapse when drop_null_keys=false") {
+    val passConf = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_pass
+        |format = parquet
+        |merge {
+        |  keys = ["member_id"]
+        |  freshness { column = "src_modified_ts", tie_breakers = ["src_seq"] }
+        |  null_handling { drop_null_keys = false }
+        |}
+        |""".stripMargin)
+    val svc = new CuratedService(spark, passConf)
+
+    // Two DISTINCT keyless records + one keyed record: PARTITION BY on a
+    // null key treats NULL = NULL as a match, so before the fix one of the
+    // keyless records was silently destroyed.
+    val first = batch(Seq(
+      ("P1", "keyed_v1", "2026-01-01 10:00:00", 1),
+      (null.asInstanceOf[String], "orphan_a", "2026-01-01 10:00:00", 1),
+      (null.asInstanceOf[String], "orphan_b", "2026-01-01 10:00:00", 1)
+    ))
+    val r1 = svc.process(first, "INCR", ctx("mrun-pass-1"), None, None).get
+    assert(r1.passthroughCount == 2)
+    assert(r1.nullKeyCount == 0)
+    val table1 = spark.table("m_curated.members_pass")
+    assert(table1.filter(col("member_id").isNull).count() == 2,
+      "both distinct keyless records must survive")
+
+    // Second run: keyless history accumulates append-only; keyed rows merge
+    val second = batch(Seq(
+      ("P1", "keyed_v2", "2026-01-01 11:00:00", 2),
+      (null.asInstanceOf[String], "orphan_c", "2026-01-01 10:00:00", 1)
+    ))
+    val r2 = svc.process(second, "INCR", ctx("mrun-pass-2"), None, None).get
+    assert(r2.passthroughCount == 1)
+    assert(r2.updateCount == 1)
+    val table2 = spark.table("m_curated.members_pass")
+    assert(table2.filter(col("member_id").isNull).count() == 3,
+      "keyless history is append-only, never merged or collapsed")
+    assert(table2.filter(col("member_id") === "P1").count() == 1)
+    assert(curatedRowIn("members_pass", "P1").getAs[String]("name") == "keyed_v2")
+  }
+
+  private def curatedRowIn(table: String, memberId: String): org.apache.spark.sql.Row =
+    spark.table(s"m_curated.$table").filter(col("member_id") === memberId).collect().head
+
+  // ---------------------------------------------------------------------------
   // 7: publish guardrails — business-key uniqueness and shrink protection
   // ---------------------------------------------------------------------------
 

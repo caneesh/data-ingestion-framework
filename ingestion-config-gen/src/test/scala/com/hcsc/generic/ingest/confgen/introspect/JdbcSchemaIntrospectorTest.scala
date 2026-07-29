@@ -143,6 +143,23 @@ class JdbcSchemaIntrospectorTest extends AnyFunSuite {
     assert(columns.map(_.getString("name")) == Seq("only_this"))
   }
 
+  test("underscores in table names are literals, not LIKE wildcards") {
+    // getColumns takes a LIKE pattern: unescaped, intro_a would also match
+    // introxa and silently merge both tables' columns into the contract.
+    h2(
+      "DROP TABLE IF EXISTS intro_a",
+      "DROP TABLE IF EXISTS introxa",
+      "CREATE TABLE intro_a (real_col VARCHAR(10))",
+      "CREATE TABLE introxa (impostor_col_1 INT, impostor_col_2 INT, impostor_col_3 INT)")
+
+    val (exit, console, dir) = generate("intro_a")
+    assert(exit == 0, console.output)
+    val main = ConfigFactory.parseFile(Paths.get(dir.toString, "wide_feed.conf").toFile)
+    val columns = main.getConfigList("feeds.wide_feed.schema.columns").asScala
+    assert(columns.map(_.getString("name").toLowerCase) == Seq("real_col"),
+      s"only intro_a's own column may appear, got: ${columns.map(_.getString("name"))}")
+  }
+
   test("SQL type mapping covers the SQL Server surface") {
     import JdbcSchemaIntrospector.sparkType
     assert(sparkType(Types.NVARCHAR, "nvarchar", 100, 0) == "string")

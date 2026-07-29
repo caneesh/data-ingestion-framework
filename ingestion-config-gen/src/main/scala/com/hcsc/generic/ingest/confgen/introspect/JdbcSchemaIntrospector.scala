@@ -89,19 +89,30 @@ object JdbcSchemaIntrospector {
     schemaName: Option[String],
     tableName: String
   ): Seq[IntrospectedColumn] = {
-    val rs = connection.getMetaData.getColumns(null, schemaName.orNull, tableName, null)
+    val metaData = connection.getMetaData
+    // getColumns takes LIKE patterns, not literal names: an unescaped '_'
+    // (ubiquitous in table names) is a single-character wildcard and would
+    // silently merge columns from every similarly-named table.
+    val esc = Option(metaData.getSearchStringEscape).filter(_.nonEmpty)
+    def literal(s: String): String = esc.fold(s) { e =>
+      s.replace(e, e + e).replace("_", e + "_").replace("%", e + "%")
+    }
+    val rs = metaData.getColumns(null, schemaName.map(literal).orNull, literal(tableName), null)
     val out = scala.collection.mutable.ArrayBuffer.empty[IntrospectedColumn]
     try {
       while (rs.next()) {
-        out += IntrospectedColumn(
-          name = rs.getString("COLUMN_NAME"),
-          sparkType = sparkType(
-            rs.getInt("DATA_TYPE"),
-            rs.getString("TYPE_NAME"),
-            rs.getInt("COLUMN_SIZE"),
-            rs.getInt("DECIMAL_DIGITS")),
-          nullable = rs.getInt("NULLABLE") != java.sql.DatabaseMetaData.columnNoNulls,
-          position = rs.getInt("ORDINAL_POSITION") - 1) // contract positions are 0-based
+        // Belt and braces: even with escaping, only accept rows from the
+        // exact table requested.
+        if (Option(rs.getString("TABLE_NAME")).exists(_.equalsIgnoreCase(tableName)))
+          out += IntrospectedColumn(
+            name = rs.getString("COLUMN_NAME"),
+            sparkType = sparkType(
+              rs.getInt("DATA_TYPE"),
+              rs.getString("TYPE_NAME"),
+              rs.getInt("COLUMN_SIZE"),
+              rs.getInt("DECIMAL_DIGITS")),
+            nullable = rs.getInt("NULLABLE") != java.sql.DatabaseMetaData.columnNoNulls,
+            position = rs.getInt("ORDINAL_POSITION") - 1) // contract positions are 0-based
       }
     } finally rs.close()
     out.sortBy(_.position).toSeq

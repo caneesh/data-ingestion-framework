@@ -135,6 +135,15 @@ object ConfigGeneratorMain {
       }
 
     val entity = feed.getString("entity")
+    // The wizard validates entity interactively, but answers/draft files
+    // bypass per-question validation — and entity becomes a file name and
+    // an include(...) string, so it must be re-checked unconditionally.
+    if (!entity.matches("[A-Za-z][A-Za-z0-9_-]*")) {
+      console.error(s"entity '$entity' is not a valid identifier " +
+        "(letters, digits, underscore, hyphen; must start with a letter) — " +
+        "fix it in the answers/draft file")
+      return 2
+    }
     val wrapped = ConfigAssembler.wrapAsFeeds(feed)
     Files.createDirectories(Paths.get(options.outputDir))
     val utf8 = java.nio.charset.StandardCharsets.UTF_8

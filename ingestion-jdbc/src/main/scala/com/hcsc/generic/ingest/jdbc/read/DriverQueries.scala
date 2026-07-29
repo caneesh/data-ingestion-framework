@@ -48,6 +48,13 @@ object DriverQueries {
       // excluded the captured-max row from its own bounded window.
       com.hcsc.generic.ingest.jdbc.watermark.Watermarks.formatOffset(odt)
     case bytes: Array[Byte] => bytes.map("%02X".format(_)).mkString
+    case dto if dto.getClass.getName == "microsoft.sql.DateTimeOffset" =>
+      // The Microsoft driver's untyped getObject returns its own class, not
+      // java.time.OffsetDateTime; its raw toString does not round-trip
+      // through the watermark parser. Extract the OffsetDateTime reflectively.
+      val odt = dto.getClass.getMethod("getOffsetDateTime").invoke(dto)
+        .asInstanceOf[java.time.OffsetDateTime]
+      com.hcsc.generic.ingest.jdbc.watermark.Watermarks.formatOffset(odt)
     case other => String.valueOf(other)
   }
 }

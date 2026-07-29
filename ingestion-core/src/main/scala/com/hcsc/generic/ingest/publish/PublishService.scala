@@ -103,12 +103,17 @@ final class PublishService(spark: SparkSession, logger: Logger) {
     }
 
     if (req.enforceUniqueKeys.nonEmpty) {
-      val keyList = req.enforceUniqueKeys.map { k =>
+      val quoted = req.enforceUniqueKeys.map { k =>
         require(k.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"merge key '$k' is not a safe SQL identifier")
         s"`$k`"
-      }.mkString(", ")
+      }
+      val keyList = quoted.mkString(", ")
+      // Null-key rows are keyless passthrough records (append-only by
+      // design, never merged) — uniqueness only applies to real keys.
+      val nonNull = quoted.map(k => s"$k IS NOT NULL").mkString(" AND ")
       val dupes = spark.sql(
-        s"SELECT $keyList, COUNT(*) AS dupe_count FROM $stagingTable GROUP BY $keyList HAVING COUNT(*) > 1 LIMIT 10"
+        s"SELECT $keyList, COUNT(*) AS dupe_count FROM $stagingTable WHERE $nonNull " +
+          s"GROUP BY $keyList HAVING COUNT(*) > 1 LIMIT 10"
       ).collect()
       if (dupes.nonEmpty) {
         val sample = dupes.map(_.toSeq.mkString("(", ", ", ")")).mkString("; ")

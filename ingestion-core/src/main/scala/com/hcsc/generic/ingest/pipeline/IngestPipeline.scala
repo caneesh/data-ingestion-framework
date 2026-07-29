@@ -203,7 +203,13 @@ final class IngestPipeline(
           val advanceAfter = ConfigUtils.optConfig(feedConf, "watermark")
             .flatMap(wm => ConfigUtils.optString(wm, "advance_after"))
             .getOrElse("CURATED").toUpperCase
-          val curatedResumedComplete = curatedOutcome.isEmpty &&
+          // A resume-skip only proves a REAL prior publish when curated is
+          // actually configured and enabled — runStage records SUCCESS even
+          // for the no-op stage of a curated-less feed (vacuous success),
+          // which must not unlock the watermark.
+          val curatedConfigured = curatedConf.exists(c =>
+            ConfigUtils.optBoolean(c, "enabled").getOrElse(true))
+          val curatedResumedComplete = curatedConfigured && curatedOutcome.isEmpty &&
             !cli.stage.equalsIgnoreCase("raw") && ctx.resume &&
             audit.stageStatus(ctx.runId, ctx.entity, Stages.Curated).contains(StageStatus.Success)
           if (curatedResult.isDefined || curatedResumedComplete || advanceAfter == "RAW")
@@ -500,7 +506,7 @@ final class IngestPipeline(
       val rawAccepted = raw.map(_.counts.acceptedCount).getOrElse(-1L)
       if (!ctx.dryRun && rawAccepted >= 0) {
         val accounted = r.insertCount + r.updateCount + r.ignoredCount +
-          r.nullKeyCount + r.dedupedCount
+          r.nullKeyCount + r.dedupedCount + r.passthroughCount
         checks += (("curated_accounts_for_accepted_rows",
           rawAccepted.toString, accounted.toString, accounted == rawAccepted))
       }

@@ -69,10 +69,29 @@ class LockServiceSpec extends AnyFunSuite with BeforeAndAfterAll {
     lock.release("orders", "run-2")
   }
 
+  test("lease is honored under a session timezone different from the JVM default") {
+    // Regression: a JVM-formatted timestamp literal parsed in a different
+    // session zone skews lease_until by the offset — on a non-UTC cluster
+    // that skew exceeded the lease and produced locks born expired.
+    // UTC+14: guaranteed to differ from any plausible JVM default zone.
+    val prev = spark.conf.get("spark.sql.session.timeZone")
+    spark.conf.set("spark.sql.session.timeZone", "Pacific/Kiritimati")
+    try {
+      val lock = service()
+      lock.acquire("tz_feed", "run-tz-1")
+      val e = intercept[PipelineLockException] {
+        lock.acquire("tz_feed", "run-tz-2")
+      }
+      assert(e.getMessage.contains("run-tz-1"))
+      lock.release("tz_feed", "run-tz-1")
+    } finally spark.conf.set("spark.sql.session.timeZone", prev)
+  }
+
   test("an expired lease can be taken over (crashed holder does not wedge the entity)") {
-    val shortLease = service(leaseMillis = 50L)
+    // Lease granularity is one second (timestampadd SECOND in SQL).
+    val shortLease = service(leaseMillis = 1000L)
     shortLease.acquire("expiry_feed", "crashed-run")
-    Thread.sleep(120)
+    Thread.sleep(1600)
     shortLease.acquire("expiry_feed", "takeover-run")
     shortLease.release("expiry_feed", "takeover-run")
   }

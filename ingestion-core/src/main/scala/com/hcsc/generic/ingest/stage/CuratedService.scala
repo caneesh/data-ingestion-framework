@@ -21,7 +21,8 @@ final case class CuratedResult(
   deleteCount: Long,
   ignoredCount: Long = 0L,
   nullKeyCount: Long = 0L,
-  dedupedCount: Long = 0L
+  dedupedCount: Long = 0L,
+  passthroughCount: Long = 0L
 )
 
 /** Source-freshness contract for the incremental merge: the column whose
@@ -101,42 +102,58 @@ final class CuratedService(spark: SparkSession, conf: Config) {
         .orElse(if (isIncremental) Some(CuratedService.DefaultIncrementalMaxShrinkPercent) else None)
     )
 
-    // Key hygiene (null-key quarantine + deterministic dedup) applies in
-    // EVERY mode with configured keys — FULL loads and the first run of an
-    // incremental feed must not seed curated with duplicate or null keys.
-    var hygienePersisted: Option[DataFrame] = None
+    // Key hygiene applies in EVERY mode with configured keys — FULL loads
+    // and the first run of an incremental feed must not seed curated with
+    // duplicate or null keys. Null-key rows are ALWAYS separated first:
+    // quarantined when drop_null_keys=true, or passed through UNMERGED when
+    // false — they must never enter the dedup/merge windows, where
+    // PARTITION BY treats NULL = NULL as a match and would collapse
+    // distinct keyless records into one arbitrary survivor.
+    val persistedFrames = scala.collection.mutable.ArrayBuffer.empty[DataFrame]
     try {
-      val (hygienic, nullKeyCount, inputCount) =
-        if (keys.isEmpty) (prepared, 0L, -1L)
+      val (hygienic, nullKeyCount, passthrough, passthroughCount, inputCount) =
+        if (keys.isEmpty) (prepared, 0L, None: Option[DataFrame], 0L, -1L)
         else {
           val missingKeys = keys.filterNot(k => prepared.columns.exists(_.equalsIgnoreCase(k)))
           require(missingKeys.isEmpty,
             s"curated.merge.keys missing from incoming data: ${missingKeys.mkString(",")}")
           val dropNull = mergeConf.flatMap(m => ConfigUtils.optBoolean(m, "null_handling.drop_null_keys")).getOrElse(true)
           val blanksAsNull = mergeConf.flatMap(m => ConfigUtils.optBoolean(m, "null_handling.treat_blank_as_null")).getOrElse(true)
-          val (valid, dropped) = transform.splitNullKeys(prepared, keys, dropNull, blanksAsNull)
-          val nullCount = if (dropNull) quarantineNullKeys(dropped, ctx, rejects) else 0L
+          val (valid, nullKeyed) = transform.splitNullKeys(prepared, keys, drop = true, blanksAsNull)
+          val (nullCount, pass, passCount) =
+            if (dropNull) (quarantineNullKeys(nullKeyed, ctx, rejects), None, 0L)
+            else {
+              val p = nullKeyed.persist()
+              persistedFrames += p
+              val c = p.count()
+              if (c > 0)
+                logger.info(s"[CuratedService] $c null-key row(s) pass through unmerged " +
+                  "(drop_null_keys=false); they are appended, never deduplicated")
+              (0L, if (c == 0) None else Some(p), c)
+            }
           val persisted = valid.persist()
-          hygienePersisted = Some(persisted)
+          persistedFrames += persisted
           val count = persisted.count()
-          (transform.deduplicate(persisted, keys, ordering), nullCount, count)
+          (transform.deduplicate(persisted, keys, ordering), nullCount, pass, passCount, count)
         }
 
       val result =
         if (!isIncremental)
-          publishFull(hygienic, nullKeyCount, inputCount, fullTable, request, ctx, contract)
-        else
-          publishIncremental(hygienic, nullKeyCount, inputCount, keys, freshness,
+          publishFull(hygienic, passthrough, nullKeyCount, passthroughCount, inputCount,
             fullTable, request, ctx, contract)
+        else
+          publishIncremental(hygienic, passthrough, nullKeyCount, passthroughCount, inputCount,
+            keys, freshness, fullTable, request, ctx, contract)
 
       logger.info(
         s"[CuratedService] published=${result.publishedCount} inserts=${result.insertCount} " +
           s"updates=${result.updateCount} deletes=${result.deleteCount} " +
-          s"ignoredStale=${result.ignoredCount} nullKeys=${result.nullKeyCount} deduped=${result.dedupedCount}"
+          s"ignoredStale=${result.ignoredCount} nullKeys=${result.nullKeyCount} " +
+          s"deduped=${result.dedupedCount} passthrough=${result.passthroughCount}"
       )
       Some(result)
     } finally {
-      hygienePersisted.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
+      persistedFrames.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
     }
   }
 
@@ -184,22 +201,28 @@ final class CuratedService(spark: SparkSession, conf: Config) {
 
   private def publishFull(
     df: DataFrame,
+    passthrough: Option[DataFrame],
     nullKeyCount: Long,
+    passthroughCount: Long,
     inputCount: Long,
     fullTable: String,
     request: PublishRequest,
     ctx: RunContext,
     contract: Option[SchemaContract]
   ): CuratedResult = {
+    val withPassthrough = passthrough.fold(df)(p => df.unionByName(p))
     val publishDf =
-      if (spark.catalog.tableExists(fullTable)) transform.align(df, spark.table(fullTable).schema, contract)
-      else df
+      if (spark.catalog.tableExists(fullTable))
+        transform.align(withPassthrough, spark.table(fullTable).schema, contract)
+      else withPassthrough
 
     val published = publisher.publish(publishDf, request, ctx)
-    val dedupedCount = if (inputCount >= 0) math.max(inputCount - published.publishedCount, 0L) else 0L
-    CuratedResult(published.publishedCount, insertCount = published.publishedCount,
+    val keyedPublished = published.publishedCount - passthroughCount
+    val dedupedCount = if (inputCount >= 0) math.max(inputCount - keyedPublished, 0L) else 0L
+    CuratedResult(published.publishedCount, insertCount = keyedPublished,
       updateCount = 0L, deleteCount = 0L,
-      ignoredCount = 0L, nullKeyCount = nullKeyCount, dedupedCount = dedupedCount)
+      ignoredCount = 0L, nullKeyCount = nullKeyCount, dedupedCount = dedupedCount,
+      passthroughCount = passthroughCount)
   }
 
   /**
@@ -239,7 +262,9 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     */
   private def publishIncremental(
     incoming: DataFrame,
+    passthrough: Option[DataFrame],
     nullKeyCount: Long,
+    passthroughCount: Long,
     inputCount: Long,
     keys: Seq[String],
     freshness: Option[FreshnessSpec],
@@ -262,9 +287,11 @@ final class CuratedService(spark: SparkSession, conf: Config) {
 
     // Distinct incoming keys under prefixed names: prefixing breaks the
     // shared-lineage ambiguity (alignedIncoming embeds target attributes
-    // via applyUpdateAudit) and lets the join be null-safe (<=>), so
-    // null-key target rows are matched and replaced rather than
-    // re-accumulated forever when drop_null_keys = false.
+    // via applyUpdateAudit). Incoming rows are guaranteed non-null-keyed
+    // here (null-key rows were quarantined or diverted to the passthrough
+    // upstream), so null-keyed TARGET rows never match the join and are
+    // retained verbatim in `unchanged` — keyless history is append-only,
+    // never merged or collapsed.
     val keyCols = keys.map(k => target.columns.find(_.equalsIgnoreCase(k)).getOrElse(k))
     val ik = alignedIncoming.select(keyCols.map(col): _*).distinct()
       .toDF(keyCols.map(k => s"__ik_$k"): _*).persist()
@@ -272,8 +299,9 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     try {
       val totalIncoming = ik.count()
       val dedupedCount = if (inputCount >= 0) math.max(inputCount - totalIncoming, 0L) else 0L
+      val alignedPassthrough = passthrough.map(p => transform.align(p, target.schema, contract))
 
-      if (totalIncoming == 0) {
+      if (totalIncoming == 0 && alignedPassthrough.isEmpty) {
         logger.info(s"[CuratedService] Zero incoming rows after key hygiene; $fullTable left untouched")
         return CuratedResult(0L, 0L, 0L, 0L,
           ignoredCount = 0L, nullKeyCount = nullKeyCount, dedupedCount = dedupedCount)
@@ -319,10 +347,12 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           (alignedIncoming, contestedKeyCount, 0L)
       }
 
-      val merged = unchanged.unionByName(replacement)
+      val merged0 = unchanged.unionByName(replacement)
+      val merged = alignedPassthrough.fold(merged0)(p => merged0.unionByName(p))
       val published = publisher.publish(merged, request, ctx)
       CuratedResult(published.publishedCount, insertCount, updateCount, deleteCount = 0L,
-        ignoredCount = ignoredCount, nullKeyCount = nullKeyCount, dedupedCount = dedupedCount)
+        ignoredCount = ignoredCount, nullKeyCount = nullKeyCount, dedupedCount = dedupedCount,
+        passthroughCount = passthroughCount)
     } finally {
       winnersPersisted.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
       ik.unpersist(false)

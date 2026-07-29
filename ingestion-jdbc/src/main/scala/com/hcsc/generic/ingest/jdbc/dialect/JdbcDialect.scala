@@ -86,10 +86,20 @@ trait JdbcDialect {
     * source clock over MAX(watermark_column) lets an idle source still
     * advance the watermark and gives zero-row windows a recordable
     * boundary; it also avoids Spark-driver clock skew entirely.
-    * LOCALTIMESTAMP (plain timestamp, session zone) round-trips through
-    * TIMESTAMP watermark parsing; the clock's zone must match the
-    * watermark column's zone. */
-  def currentTimestampSql(watermarkType: String): String = "SELECT LOCALTIMESTAMP"
+    *
+    * clockZone is the operator's declaration of the zone the watermark
+    * COLUMN stores (validated as required at parse for TIMESTAMP
+    * watermarks): committing a clock in a different zone than the column
+    * silently skips one offset-worth of rows forever. Engines without a
+    * known UTC clock expression reject clock_zone = UTC instead of
+    * guessing. */
+  def currentTimestampSql(watermarkType: String, clockZone: Option[String]): String =
+    clockZone.map(_.toUpperCase) match {
+      case Some("UTC") => throw new IllegalArgumentException(
+        s"JDBC_003 dialect '$name' has no verified UTC clock expression; use clock_zone = LOCAL " +
+          "(if the watermark column stores server-local time) or upper_bound = MAX_VALUE")
+      case _ => "SELECT LOCALTIMESTAMP"
+    }
 
   /** SELECT of one row ordered as given (SQL-standard FETCH FIRST default;
     * engine-specific overrides where needed). Used for composite upper
@@ -129,15 +139,23 @@ object SqlServerDialect extends JdbcDialect {
     s"SELECT TOP 1 $projection FROM $from ORDER BY $orderBy"
   override protected def booleanTrueLiteral: String = "1"
   override protected def booleanFalseLiteral: String = "0"
-  override def currentTimestampSql(watermarkType: String): String =
+  override def currentTimestampSql(watermarkType: String, clockZone: Option[String]): String =
     if (watermarkType.equalsIgnoreCase("DATETIMEOFFSET")) "SELECT SYSDATETIMEOFFSET()"
-    else "SELECT SYSUTCDATETIME()"
+    else clockZone.map(_.toUpperCase) match {
+      case Some("LOCAL") => "SELECT SYSDATETIME()"
+      case _ => "SELECT SYSUTCDATETIME()"
+    }
 }
 
 object PostgresDialect extends JdbcDialect {
   val name = "postgresql"
   val defaultDriver = "org.postgresql.Driver"
   val urlPrefix = "jdbc:postgresql://"
+  override def currentTimestampSql(watermarkType: String, clockZone: Option[String]): String =
+    clockZone.map(_.toUpperCase) match {
+      case Some("UTC") => "SELECT (now() AT TIME ZONE 'UTC')"
+      case _ => "SELECT LOCALTIMESTAMP"
+    }
 }
 
 object OracleDialect extends JdbcDialect {
@@ -145,8 +163,11 @@ object OracleDialect extends JdbcDialect {
   val defaultDriver = "oracle.jdbc.OracleDriver"
   val urlPrefix = "jdbc:oracle:"
   override def validationQuery: String = "SELECT 1 FROM DUAL"
-  override def currentTimestampSql(watermarkType: String): String =
-    "SELECT SYSTIMESTAMP FROM DUAL"
+  override def currentTimestampSql(watermarkType: String, clockZone: Option[String]): String =
+    clockZone.map(_.toUpperCase) match {
+      case Some("UTC") => "SELECT CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS TIMESTAMP) FROM DUAL"
+      case _ => "SELECT LOCALTIMESTAMP FROM DUAL"
+    }
 }
 
 object Db2Dialect extends JdbcDialect {
@@ -164,6 +185,11 @@ object MySqlDialect extends JdbcDialect {
     "`" + identifier.replace("`", "``") + "`"
   override def selectTopOne(projection: String, from: String, orderBy: String): String =
     s"SELECT $projection FROM $from ORDER BY $orderBy LIMIT 1"
+  override def currentTimestampSql(watermarkType: String, clockZone: Option[String]): String =
+    clockZone.map(_.toUpperCase) match {
+      case Some("UTC") => "SELECT UTC_TIMESTAMP()"
+      case _ => "SELECT LOCALTIMESTAMP"
+    }
 }
 
 /** Fallback for engines without a dedicated dialect (H2 in tests, etc.).

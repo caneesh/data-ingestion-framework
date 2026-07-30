@@ -97,6 +97,12 @@ feeds {
 }
 ```
 
+Two fully-commented reference configurations catalog every supported
+option — copy from them rather than memorizing keys:
+
+- [examples/feed-file-reference.conf](examples/feed-file-reference.conf) — file ingestion (managed folders, pre-read validation, contract, rejects, idempotency)
+- [examples/feed-jdbc-reference.conf](examples/feed-jdbc-reference.conf) — SQL ingestion (all four read modes, every secret provider, watermarks, partitioning)
+
 Optional blocks add production hardening as you need it:
 
 | Block | Purpose |

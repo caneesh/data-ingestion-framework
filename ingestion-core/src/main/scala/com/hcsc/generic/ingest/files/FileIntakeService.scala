@@ -6,7 +6,7 @@ import com.hcsc.generic.ingest.runtime.RunContext
 import com.hcsc.generic.ingest.schema.{BatchPolicy, HeaderFingerprint, HeaderResolution, PolicyAction, SchemaContract, SchemaContractViolationException, SchemaValidator, SchemaViolation, ViolationKind}
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
-import org.apache.spark.sql.{SaveMode, SparkSession}
+import org.apache.spark.sql.SparkSession
 
 import java.sql.Timestamp
 
@@ -92,7 +92,7 @@ final class FileIntakeService(
     val c = idempotencyConf.get
     val db = ConfigUtils.sqlIdentifier(c, "database")
     val table = ConfigUtils.optString(c, "registry_table").getOrElse("ingest_file_registry")
-    require(table.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"idempotency.registry_table '$table' is not a safe SQL identifier")
+    ConfigUtils.requireSqlIdentifier(table, "idempotency.registry_table")
     s"$db.$table"
   }
 
@@ -420,18 +420,10 @@ final class FileIntakeService(
       (f.checksum, ctx.entity, f.name, f.stagedPath, f.sizeBytes, ctx.runId, FileStatuses.Processed, ts)
     ).toDF("checksum", "entity", "file_name", "file_path", "size_bytes", "run_id", "status", "processed_ts")
 
-    // CREATE IF NOT EXISTS + append avoids the create/overwrite race between
-    // concurrent first runs sharing one registry.
-    spark.sql(s"CREATE DATABASE IF NOT EXISTS $db")
-    spark.sql(
-      s"""CREATE TABLE IF NOT EXISTS $registryTable (
-         |  checksum STRING, entity STRING, file_name STRING, file_path STRING,
-         |  size_bytes BIGINT, run_id STRING, status STRING, processed_ts TIMESTAMP
-         |) USING ORC""".stripMargin)
-    rows.write.mode(SaveMode.Append).insertInto(registryTable)
+    com.hcsc.generic.ingest.hive.HiveTables.appendEnsuringTable(
+      spark, db, registryTable,
+      "checksum STRING, entity STRING, file_name STRING, file_path STRING, " +
+        "size_bytes BIGINT, run_id STRING, status STRING, processed_ts TIMESTAMP",
+      rows)
   }
 }
-
-/** Raised when a managed feed finds no valid files to process; callers treat
-  * this as a graceful no-op run rather than a failure. */
-final class NoInputFilesException(message: String) extends RuntimeException(message)

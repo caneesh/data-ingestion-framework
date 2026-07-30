@@ -206,15 +206,20 @@ default. Four read modes: `FULL_TABLE`, `SELECT_QUERY` (projection + WHERE
 pushed into the database), `CUSTOM_SQL`, and `INCREMENTAL`.
 
 **Credentials** come from the secret-provider abstraction
-(`env` / `file` / `sysprop` / `inline` / `cyberark`); plaintext inline
-secrets log a warning. URLs are masked in every log line. The `cyberark`
-provider retrieves accounts from a CyberArk Central Credential Provider
-(CCP) — one vault object serves both the user id (`attribute = "UserName"`)
-and the password (`Content`, the default) from a single cached CCP call.
-Client-certificate authentication to CCP uses the standard JVM TLS keystore
-settings (`spark.driver.extraJavaOptions -Djavax.net.ssl.keyStore=...`);
-TLS verification is never disabled. `auth.user` accepts the same provider
-references as `auth.password`.
+(`env` / `file` / `sysprop` / `inline` / `cyberark` / `conjur` /
+`azure_keyvault`); plaintext inline secrets log a warning. URLs are masked
+in every log line. The `cyberark` provider retrieves accounts from a
+CyberArk Central Credential Provider (CCP) — one vault object serves both
+the user id (`attribute = "UserName"`) and the password (`Content`, the
+default) from a single cached CCP call. Client-certificate authentication
+to CCP uses the standard JVM TLS keystore settings
+(`spark.driver.extraJavaOptions -Djavax.net.ssl.keyStore=...`); TLS
+verification is never disabled, and every vault provider (`cyberark`,
+`conjur`) rejects plain-http URLs unless `allow_insecure_http = true` is
+set for isolated development. Provider caches are TTL-bounded
+(`cache_ttl_ms`, default 5 minutes; 0 disables) so long-lived JVMs pick up
+rotated secrets. `auth.user` accepts the same provider references as
+`auth.password`.
 
 **Incremental loading (bounded windows)**: `TIMESTAMP`, `NUMERIC`, or
 `COMPOSITE` (lexicographic multi-column) watermarks. Every incremental read

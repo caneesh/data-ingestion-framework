@@ -56,7 +56,7 @@ final class RejectService(
     val c = rejectConf.get
     val db = ConfigUtils.sqlIdentifier(c, "database")
     val table = ConfigUtils.optString(c, "table").getOrElse("ingest_rejects")
-    require(table.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"rejects.table '$table' is not a safe SQL identifier")
+    ConfigUtils.requireSqlIdentifier(table, "rejects.table")
     s"$db.$table"
   }
 
@@ -190,16 +190,11 @@ final class RejectService(
   private def persistGuarded(rejectRows: DataFrame, ctx: RunContext, guardCode: Option[String]): Long = {
     val count = rejectRows.count()
     if (count > 0) {
-      val db = rejectTable.split("\\.")(0)
-      // CREATE IF NOT EXISTS + append avoids the create/overwrite race
-      // between concurrent first runs sharing one reject table.
-      spark.sql(s"CREATE DATABASE IF NOT EXISTS $db")
-      spark.sql(
-        s"""CREATE TABLE IF NOT EXISTS $rejectTable (
-           |  run_id STRING, entity STRING, file_id STRING, source_file STRING,
-           |  row_idx BIGINT, raw_record STRING, error_code STRING,
-           |  error_message STRING, reject_category STRING, reject_ts TIMESTAMP
-           |) USING ORC""".stripMargin)
+      com.hcsc.generic.ingest.hive.HiveTables.ensure(
+        spark, rejectTable.split("\\.")(0), rejectTable,
+        "run_id STRING, entity STRING, file_id STRING, source_file STRING, " +
+          "row_idx BIGINT, raw_record STRING, error_code STRING, " +
+          "error_message STRING, reject_category STRING, reject_ts TIMESTAMP")
       // Idempotency guard (mirrors the RAW one): a run that failed after this
       // append and was resumed with the same --run-id must not append the same
       // reject rows a second time. Stage-specific rejects (guardCode) are

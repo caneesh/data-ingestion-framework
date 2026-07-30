@@ -1,5 +1,6 @@
 package com.hcsc.generic.ingest.publish
 
+import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.runtime.RunContext
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
@@ -38,8 +39,8 @@ final class PublishService(spark: SparkSession, logger: Logger) {
   private def stagingPrefix(table: String) = s"__stg_${table}_"
 
   def publish(df: DataFrame, req: PublishRequest, ctx: RunContext): PublishResult = {
-    require(req.database.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"database '${req.database}' is not a safe SQL identifier")
-    require(req.table.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"table '${req.table}' is not a safe SQL identifier")
+    ConfigUtils.requireSqlIdentifier(req.database, "database")
+    ConfigUtils.requireSqlIdentifier(req.table, "table")
 
     val fullTable = s"${req.database}.${req.table}"
     // Defense in depth: the CLI validates --run-id, but the run id also
@@ -154,7 +155,7 @@ final class PublishService(spark: SparkSession, logger: Logger) {
       .map(_.name)
       .filter(name =>
         name.startsWith(prefix) &&
-          name.matches("[a-zA-Z_][a-zA-Z0-9_]*") && // never interpolate an unvalidated name
+          ConfigUtils.isSqlIdentifier(name) && // never interpolate an unvalidated name
           s"$database.$name" != currentStaging)
     candidates.foreach { name =>
       if (isStale(database, name)) {

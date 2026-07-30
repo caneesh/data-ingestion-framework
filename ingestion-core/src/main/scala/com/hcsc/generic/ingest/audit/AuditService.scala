@@ -105,7 +105,7 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
 
   private def table(key: String, default: String): String = {
     val name = auditConf.flatMap(c => ConfigUtils.optString(c, key)).getOrElse(default)
-    require(name.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"audit.$key '$name' is not a safe SQL identifier")
+    ConfigUtils.requireSqlIdentifier(name, s"audit.$key")
     s"$database.$name"
   }
 
@@ -137,13 +137,8 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
       "positional_fallback_used BOOLEAN, error_code STRING, error_message STRING, " +
       "quarantine_path STRING, event_ts TIMESTAMP"
 
-  /** CREATE IF NOT EXISTS + append: concurrent first runs race safely at the
-    * metastore instead of one saveAsTable(Overwrite) wiping the other. */
-  private def append(rows: org.apache.spark.sql.DataFrame, fullTable: String, columnsDdl: String): Unit = {
-    spark.sql(s"CREATE DATABASE IF NOT EXISTS $database")
-    spark.sql(s"CREATE TABLE IF NOT EXISTS $fullTable ($columnsDdl) USING ORC")
-    rows.write.mode(SaveMode.Append).insertInto(fullTable)
-  }
+  private def append(rows: org.apache.spark.sql.DataFrame, fullTable: String, columnsDdl: String): Unit =
+    com.hcsc.generic.ingest.hive.HiveTables.appendEnsuringTable(spark, database, fullTable, columnsDdl, rows)
 
   def recordFile(
     ctx: com.hcsc.generic.ingest.runtime.RunContext,
@@ -227,18 +222,6 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
       .collect()
       .headOption
       .map(_.getString(0))
-  }
-
-  /** All file audit rows for a run (used by reconciliation and replay). */
-  def fileStatuses(runId: String, entity: String): Map[String, String] = {
-    if (!enabled || !spark.catalog.tableExists(fileTable)) return Map.empty
-    import org.apache.spark.sql.functions._
-    spark.table(fileTable)
-      .filter(col("run_id") === runId && col("entity") === entity)
-      .select("file_name", "status")
-      .collect()
-      .map(r => r.getString(0) -> r.getString(1))
-      .toMap
   }
 }
 

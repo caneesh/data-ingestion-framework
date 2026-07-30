@@ -53,6 +53,13 @@ final class IngestPipeline(
 
   private def track(df: DataFrame): DataFrame = { cached += df; df }
 
+  /** The feed-level schema block attached to a source config so connectors
+    * and intake validate against the contract. No-op when absent; idempotent
+    * when the config already carries it. */
+  private def withSchema(conf: Config): Config =
+    if (feedConf.hasPath("schema")) conf.withValue("schema", feedConf.getValue("schema"))
+    else conf
+
   def run(): Unit = {
     // Entity-level run lease: acquired BEFORE any extraction, held through
     // the watermark commit — two concurrent runs of one entity would extract
@@ -79,9 +86,7 @@ final class IngestPipeline(
     logger.info(s"==== VALIDATE-ONLY entity=${ctx.entity} runId=${ctx.runId} " +
       "(no writes, no file moves) ====")
 
-    var sourceWithSchema = feedConf.getConfig("source")
-    if (feedConf.hasPath("schema"))
-      sourceWithSchema = sourceWithSchema.withValue("schema", feedConf.getValue("schema"))
+    val sourceWithSchema = withSchema(feedConf.getConfig("source"))
 
     // A disabled AuditService makes the "no writes" promise structural: even
     // a future change inside inspectHeaders cannot write audit records here.
@@ -127,9 +132,7 @@ final class IngestPipeline(
     // ---- Stage: validate (file intake) --------------------------------------
     // The schema contract is attached before intake so per-file physical
     // header validation can run against it.
-    var sourceConf = feedConf.getConfig("source")
-    if (feedConf.hasPath("schema"))
-      sourceConf = sourceConf.withValue("schema", feedConf.getValue("schema"))
+    val sourceConf = withSchema(feedConf.getConfig("source"))
     val intake = new FileIntakeService(
       spark, sourceConf, ConfigUtils.optConfig(feedConf, "idempotency"), audit, logger)
 
@@ -260,32 +263,9 @@ final class IngestPipeline(
     // Attach the schema contract for connector-side header resolution, plus
     // the entity name and run id so stateful sources (JDBC watermarks,
     // RUN_ID query parameters) see the pipeline's execution context.
-    var effectiveSource = sourceConf
+    val effectiveSource = withSchema(sourceConf
       .withValue("entity", ConfigValueFactory.fromAnyRef(ctx.entity))
-      .withValue("run_id", ConfigValueFactory.fromAnyRef(ctx.runId))
-    if (feedConf.hasPath("schema"))
-      effectiveSource = effectiveSource.withValue("schema", feedConf.getValue("schema"))
-
-    val sourceType = ConfigUtils.optString(effectiveSource, "type").getOrElse("file")
-    val source = SourceRegistry.resolve(sourceType)
-
-    // Multi-file batch safety: staged files were validated per-file at
-    // intake; here alias-equivalent files (same canonical fingerprint) are
-    // grouped and each group is read separately, then unioned by canonical
-    // name so mixed header layouts can never contaminate one Spark read.
-    def readSource(): DataFrame = staged match {
-      case Some(files) if files.nonEmpty =>
-        val groups = files.groupBy(_.headerFingerprint).values.toSeq
-        if (groups.size > 1)
-          logger.info(s"[Pipeline] ${groups.size} header compatibility groups detected; reading separately")
-        groups.map { group =>
-          val conf = effectiveSource.withValue(
-            "paths", ConfigValueFactory.fromIterable(group.map(_.stagedPath).asJava))
-          source.read(spark, conf)
-        }.reduce((a, b) => a.unionByName(b, allowMissingColumns = true))
-      case _ =>
-        source.read(spark, effectiveSource)
-    }
+      .withValue("run_id", ConfigValueFactory.fromAnyRef(ctx.runId)))
 
     val rawDatabase = ConfigUtils.sqlIdentifier(rawConf, "database")
     val rawTable = ConfigUtils.sqlIdentifier(rawConf, "table")
@@ -296,29 +276,8 @@ final class IngestPipeline(
     // quarantined when configured) before the failure propagates.
     val df0 =
       try {
-        val df = readSource()
-        contract.foreach { c =>
-          // Hard guard: required canonical columns must exist before RAW.
-          // Connectors enforce this too; this covers every source type.
-          val missingRequired = c.requiredColumns.map(_.name)
-            .filterNot(n => df.columns.exists(_.equalsIgnoreCase(n)))
-          if (missingRequired.nonEmpty)
-            throw new SchemaContractViolationException(missingRequired.map(n =>
-              SchemaViolation(ViolationKind.MissingColumn,
-                s"Required column '$n' absent before RAW write")))
-
-          val contentViolations = ContentValidator.validate(df, c, logger)
-          if (contentViolations.nonEmpty)
-            throw new SchemaContractViolationException(contentViolations)
-
-          // Row-level nullability is diverted to the reject stage when
-          // configured; failing here would preempt record-level handling.
-          val violations = SchemaValidator.validateData(df, c).filterNot(v =>
-            rejectService.handlesContractNullability &&
-              v.kind == ViolationKind.NullabilityViolation) ++
-            SchemaValidator.versionMismatch(SchemaVersions.stored(spark, rawDatabase, rawTable), c)
-          SchemaValidator.enforce(violations, c.policies, logger)
-        }
+        val df = readGroupedSource(effectiveSource, staged)
+        validateContractBeforeRaw(df, rawDatabase, rawTable, rejectService)
         df
       } catch {
         case e: SchemaContractViolationException =>
@@ -328,7 +287,8 @@ final class IngestPipeline(
 
     // Lineage: source identity from config, extract window from the source's
     // read (JDBC records the bounded watermark window it actually used).
-    val window = source match {
+    val sourceType = ConfigUtils.optString(effectiveSource, "type").getOrElse("file")
+    val window = SourceRegistry.resolve(sourceType) match {
       case w: com.hcsc.generic.ingest.source.WatermarkAdvancing =>
         w.lastWindow(ctx.entity, Some(ctx.runId))
       case _ => None
@@ -370,22 +330,7 @@ final class IngestPipeline(
     val split = rejectService.split(withMeta, ctx)
     val accepted = track(split.accepted.persist(StorageLevel.MEMORY_AND_DISK))
 
-    if (!ctx.dryRun) {
-      // Idempotency guard: if a prior attempt committed this run's rows to
-      // RAW but died before recording stage SUCCESS, do not append twice.
-      val alreadyLoaded = spark.catalog.tableExists(rawFullTable) &&
-        spark.table(rawFullTable).columns.contains("run_id") &&
-        spark.table(rawFullTable).filter(col("run_id") === lit(ctx.runId)).limit(1).count() > 0
-      if (alreadyLoaded) {
-        logger.warn(s"[Pipeline] RAW already holds rows for run ${ctx.runId}; skipping write (idempotent replay)")
-      } else {
-        val sinkType = ConfigUtils.optString(rawConf, "type").getOrElse("hive")
-        SinkRegistry.resolve(sinkType).write(spark, accepted, rawConf)
-      }
-      contract.foreach(c => SchemaVersions.record(spark, rawDatabase, rawTable, c.version, logger))
-    } else {
-      logger.info("[Pipeline] DRY-RUN: skipping RAW write")
-    }
+    writeRawIdempotently(accepted, rawConf, rawFullTable, rawDatabase, rawTable)
 
     val acceptedCount = if (split.acceptedCount >= 0) split.acceptedCount else sourceCount
     // Measure rawCount from the table itself so the raw_equals_accepted
@@ -407,6 +352,85 @@ final class IngestPipeline(
     )
     RawOutcome(accepted, counts)
   }
+
+  /** Multi-file batch safety: staged files were validated per-file at
+    * intake; here alias-equivalent files (same canonical fingerprint) are
+    * grouped and each group is read separately, then unioned by canonical
+    * name so mixed header layouts can never contaminate one Spark read. */
+  private def readGroupedSource(effectiveSource: Config, staged: Option[Seq[StagedFile]]): DataFrame = {
+    val sourceType = ConfigUtils.optString(effectiveSource, "type").getOrElse("file")
+    val source = SourceRegistry.resolve(sourceType)
+    staged match {
+      case Some(files) if files.nonEmpty =>
+        val groups = files.groupBy(_.headerFingerprint).values.toSeq
+        if (groups.size > 1)
+          logger.info(s"[Pipeline] ${groups.size} header compatibility groups detected; reading separately")
+        groups.map { group =>
+          val conf = effectiveSource.withValue(
+            "paths", ConfigValueFactory.fromIterable(group.map(_.stagedPath).asJava))
+          source.read(spark, conf)
+        }.reduce((a, b) => a.unionByName(b, allowMissingColumns = true))
+      case _ =>
+        source.read(spark, effectiveSource)
+    }
+  }
+
+  /** Contract enforcement gate ahead of the RAW write: required-column hard
+    * guard, content validation, and data/version validation (with row-level
+    * nullability deferred to the reject stage when it owns that rule). */
+  private def validateContractBeforeRaw(
+    df: DataFrame,
+    rawDatabase: String,
+    rawTable: String,
+    rejectService: RejectService
+  ): Unit = contract.foreach { c =>
+    // Hard guard: required canonical columns must exist before RAW.
+    // Connectors enforce this too; this covers every source type.
+    val missingRequired = c.requiredColumns.map(_.name)
+      .filterNot(n => df.columns.exists(_.equalsIgnoreCase(n)))
+    if (missingRequired.nonEmpty)
+      throw new SchemaContractViolationException(missingRequired.map(n =>
+        SchemaViolation(ViolationKind.MissingColumn,
+          s"Required column '$n' absent before RAW write")))
+
+    val contentViolations = ContentValidator.validate(df, c, logger)
+    if (contentViolations.nonEmpty)
+      throw new SchemaContractViolationException(contentViolations)
+
+    // Row-level nullability is diverted to the reject stage when
+    // configured; failing here would preempt record-level handling.
+    val violations = SchemaValidator.validateData(df, c).filterNot(v =>
+      rejectService.handlesContractNullability &&
+        v.kind == ViolationKind.NullabilityViolation) ++
+      SchemaValidator.versionMismatch(SchemaVersions.stored(spark, rawDatabase, rawTable), c)
+    SchemaValidator.enforce(violations, c.policies, logger)
+  }
+
+  /** RAW write with the same-run idempotency guard, or the dry-run log line;
+    * the schema version property is recorded after a real write. */
+  private def writeRawIdempotently(
+    accepted: DataFrame,
+    rawConf: Config,
+    rawFullTable: String,
+    rawDatabase: String,
+    rawTable: String
+  ): Unit =
+    if (!ctx.dryRun) {
+      // Idempotency guard: if a prior attempt committed this run's rows to
+      // RAW but died before recording stage SUCCESS, do not append twice.
+      val alreadyLoaded = spark.catalog.tableExists(rawFullTable) &&
+        spark.table(rawFullTable).columns.contains("run_id") &&
+        spark.table(rawFullTable).filter(col("run_id") === lit(ctx.runId)).limit(1).count() > 0
+      if (alreadyLoaded) {
+        logger.warn(s"[Pipeline] RAW already holds rows for run ${ctx.runId}; skipping write (idempotent replay)")
+      } else {
+        val sinkType = ConfigUtils.optString(rawConf, "type").getOrElse("hive")
+        SinkRegistry.resolve(sinkType).write(spark, accepted, rawConf)
+      }
+      contract.foreach(c => SchemaVersions.record(spark, rawDatabase, rawTable, c.version, logger))
+    } else {
+      logger.info("[Pipeline] DRY-RUN: skipping RAW write")
+    }
 
   /** Audits a header/content contract failure and quarantines the staged
     * files when configured. The audit record is written BEFORE any file is

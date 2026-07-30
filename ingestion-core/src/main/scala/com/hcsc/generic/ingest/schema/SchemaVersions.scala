@@ -9,10 +9,8 @@ import org.apache.spark.sql.SparkSession
 object SchemaVersions {
   val Property = "ingest.schema.version"
 
-  private def validate(name: String, label: String): String = {
-    require(name.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"$label '$name' is not a safe SQL identifier")
-    name
-  }
+  private def validate(name: String, label: String): String =
+    com.hcsc.generic.ingest.config.ConfigUtils.requireSqlIdentifier(name, label)
 
   def stored(spark: SparkSession, database: String, table: String): Option[String] = {
     val fullTable = s"${validate(database, "database")}.${validate(table, "table")}"

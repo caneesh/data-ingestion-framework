@@ -44,14 +44,31 @@ object ConfigUtils {
   def configList(c: Config, path: String): Seq[Config] =
     if (c.hasPath(path)) c.getConfigList(path).asScala.toSeq else Seq.empty
 
+  /** The one definition of what may be interpolated into Spark SQL as a
+    * database/table identifier. */
+  def isSqlIdentifier(value: String): Boolean = value.matches("[a-zA-Z_][a-zA-Z0-9_]*")
+
+  /** Fails with the standard message when `value` is not a safe SQL
+    * identifier; `label` names the offending config surface. */
+  def requireSqlIdentifier(value: String, label: String): String = {
+    require(isSqlIdentifier(value), s"$label '$value' is not a safe SQL identifier")
+    value
+  }
+
   /** Validates a database/table name is a safe SQL identifier before it is
     * interpolated into Spark SQL statements. */
   def sqlIdentifier(c: Config, path: String): String = {
     val value = c.getString(path)
     require(
-      value.matches("[a-zA-Z_][a-zA-Z0-9_]*"),
+      isSqlIdentifier(value),
       s"Config '$path' value '$value' is not a safe SQL identifier (letters, digits, underscore only)"
     )
     value
   }
+
+  /** All entries of a config block as a string map. Keys are HOCON path
+    * expressions: plain keys come back verbatim; keys that needed quoting in
+    * the config (e.g. `"a.b"`) keep their quoted path-escaped form — the
+    * long-standing behavior of every call site this helper replaced. */
+  def flatStringMap(c: Config): Map[String, String] = stringMap(c.atKey("p"), "p")
 }

@@ -43,18 +43,10 @@ object ConjurSecretProvider extends SecretProvider {
       ConfigUtils.optString(conf, key).map(_.trim).filter(_.nonEmpty).getOrElse(
         throw new IllegalArgumentException(s"JDBC_003 conjur secret reference requires '$key'"))
 
-    val baseUrl = required("url").stripSuffix("/")
-    if (!baseUrl.startsWith("https://") && !baseUrl.startsWith("http://"))
-      throw new IllegalArgumentException(s"JDBC_003 conjur url '$baseUrl' must be an http(s) URL")
     // Authentication POSTs the host API key in the request body: plain http
-    // ships it in cleartext. Rejected unless explicitly approved for
-    // isolated development setups (mirrors the JDBC allow_insecure_tls gate).
-    if (baseUrl.startsWith("http://") &&
-        !ConfigUtils.optBoolean(conf, "allow_insecure_http").getOrElse(false))
-      throw new IllegalArgumentException(
-        s"JDBC_003 conjur url '$baseUrl' uses plain http, which transmits the host API key " +
-          "and secrets in cleartext; use https, or set allow_insecure_http = true only for " +
-          "isolated non-production environments")
+    // ships it in cleartext, hence the shared insecure-http gate.
+    val baseUrl = VaultHttp.requireSecureBase(conf, required("url"),
+      provider = "conjur", transmitted = "the host API key and secrets")
 
     val account = required("account")
     val hostId = required("host_id")

@@ -92,8 +92,16 @@ final class CuratedTransform(spark: SparkSession) {
           "refusing nondeterministic deduplication"
       )
     val existingOrder = orderBy.flatMap(o => df.columns.find(_.equalsIgnoreCase(o)))
+    // Rows tied on every order_by column previously produced an arbitrary
+    // winner (partition-layout dependent). row_idx — when present from RAW
+    // metadata — is a defined final tie-break, so one computed frame always
+    // yields one winner. Honest scope: row_idx itself is not stable across
+    // re-reads (see RawMetadata), so determinism holds within a run / over
+    // a persisted RAW slice, not across independent source re-extractions.
+    val tieBreak = df.columns.find(_.equalsIgnoreCase("row_idx"))
+      .map(c => col(c).desc_nulls_last).toSeq
     val w = Window.partitionBy(keys.map(col): _*)
-      .orderBy(existingOrder.map(c => col(c).desc_nulls_last): _*)
+      .orderBy(existingOrder.map(c => col(c).desc_nulls_last) ++ tieBreak: _*)
     df.withColumn("_rn", row_number().over(w))
       .filter(col("_rn") === 1)
       .drop("_rn")

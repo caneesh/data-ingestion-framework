@@ -169,4 +169,35 @@ class ConfigUtilsTest extends AnyFunSuite {
       ConfigUtils.sqlIdentifier(c, "table")
     }
   }
+
+  test("isSqlIdentifier accepts identifiers and rejects everything else") {
+    assert(ConfigUtils.isSqlIdentifier("my_table"))
+    assert(ConfigUtils.isSqlIdentifier("_t1"))
+    assert(!ConfigUtils.isSqlIdentifier("1table"))
+    assert(!ConfigUtils.isSqlIdentifier("my table"))
+    assert(!ConfigUtils.isSqlIdentifier("t;drop"))
+    assert(!ConfigUtils.isSqlIdentifier(""))
+  }
+
+  test("requireSqlIdentifier passes values through and reports the label on failure") {
+    assert(ConfigUtils.requireSqlIdentifier("member", "rejects.table") == "member")
+    val ex = intercept[IllegalArgumentException] {
+      ConfigUtils.requireSqlIdentifier("my table", "rejects.table")
+    }
+    assert(ex.getMessage.contains("rejects.table 'my table' is not a safe SQL identifier"))
+  }
+
+  test("flatStringMap returns plain keys verbatim and quoted dotted keys in path-escaped form") {
+    // Characterization: HOCON entrySet renders quoted keys with their quotes.
+    // This matches the historical behavior of the connection_properties /
+    // params call sites; plain keys (the overwhelmingly common case) are
+    // returned verbatim.
+    val c = ConfigFactory.parseString(
+      """props {
+        |  "kafka.security.protocol" = "SASL_SSL"
+        |  encrypt = "true"
+        |}""".stripMargin)
+    val m = ConfigUtils.flatStringMap(c.getConfig("props"))
+    assert(m == Map("\"kafka.security.protocol\"" -> "SASL_SSL", "encrypt" -> "true"))
+  }
 }

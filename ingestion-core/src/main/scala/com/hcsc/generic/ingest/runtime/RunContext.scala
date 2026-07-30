@@ -18,9 +18,6 @@ object Stages {
   val Validate = "validate"
   val Raw = "raw"
   val Curated = "curated"
-  val Publish = "publish"
-
-  val ordered: Seq[String] = Seq(Validate, Raw, Curated, Publish)
 }
 
 object StageStatus {

@@ -33,7 +33,10 @@ class Wizard(io: ConsoleIO, draftPath: Option[String] = None) {
               headerShown = true
             }
             ask(q, answers)
-            draftPath.foreach(Drafts.save(_, sourceType, answers))
+            // Drafts never persist secret answers: a resumed session re-asks
+            // them instead of storing credentials in a plaintext JSON file.
+            val secretIds = questions.filter(_.secret).map(_.id).toSet
+            draftPath.foreach(Drafts.save(_, sourceType, answers, excludeIds = secretIds))
           }
         }
       }

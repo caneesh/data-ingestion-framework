@@ -13,8 +13,23 @@ C1–C12, S1–S16, backlog items 1–21.
 > auto-enables when an `audit.database` exists rather than being universally
 > REQUIRED (feeds with neither block get a loud warning); `--force-unlock`
 > is a `LockService.forceRelease` API + manual RELEASE row, not yet a CLI
-> flag; per-column dedup sort direction remains all-DESC. Phase 2 (2.2–2.6)
-> and Phase 3 remain open, **except** item 3.3/backlog #18's tooling half
+> flag; per-column dedup sort direction remains all-DESC.
+>
+> **Phase 2 implemented (2026-07-29):** 2.2 (window-based JDBC replay guard,
+> `raw.idempotency_key` + `raw_duplicate_versions` check; watermark
+> continuity is structural — the lower bound is read from the store — and
+> per-run windows are now persisted in the ledger for audit), 2.3
+> (mandatory ledger with explicit `audit.enabled=false` opt-out, `--resume`
+> aborts without a ledger, `run_mode`/`window_start`/`window_end` persisted
+> with in-place ALTER migration, `reconciliation.on_mismatch` default
+> WARN→FAIL), 2.4 (CUR_002 cast-to-null guard with `curated.on_cast_error`,
+> dropped-column policy surfacing, BACKWARD compatibility enforced via the
+> `ingest.schema.required` snapshot), 2.5 (`--stage curated` reimplemented
+> as `IngestPipeline.curatedReplay` — governed, locked, audited, never the
+> watermark; synthetic-RunContext overloads deleted), 2.6
+> (`rejects.payload = FULL|HASHED|KEYS_ONLY` with a loud FULL warning;
+> drafts exclude secret answers and are written 0600). Phase 3 remains
+> open, **except** item 3.3/backlog #18's tooling half
 > (2026-07-29): the config generator now emits the schema contract as a
 > separate `<entity>-schema.conf` via HOCON `include required(...)`, the
 > JDBC flow gained the contract questions, and `JdbcSchemaIntrospector`

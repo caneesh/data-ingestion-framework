@@ -77,6 +77,67 @@ final class IngestPipeline(
   }
 
   /**
+    * --stage curated: rebuilds curated from an existing RAW slice — either
+    * one run's rows (--run-id) or a whole ingest_dt partition
+    * (--resume-ingest-dt). Runs under the SAME governance as a full run:
+    * real run context, entity lock, mandatory ledger, reject handling,
+    * contract validation — and NEVER touches the watermark (replay is not
+    * new-source progress). Replaces the audit-less legacy curated-only path.
+    */
+  def curatedReplay(): Unit = {
+    val lock = com.hcsc.generic.ingest.lock.LockService.fromConfig(spark, feedConf, logger)
+    val held = if (ctx.dryRun) None else lock.map { l => l.acquire(ctx.entity, ctx.runId); l }
+    try {
+      requireLedger()
+      val rawConf = feedConf.getConfig("raw")
+      val database = ConfigUtils.sqlIdentifier(rawConf, "database")
+      val table = ConfigUtils.sqlIdentifier(rawConf, "table")
+      val fullTable = s"$database.$table"
+      require(spark.catalog.tableExists(fullTable),
+        s"PIPE_003 curated replay requires the RAW table $fullTable to exist")
+
+      val slice = cli.runId match {
+        case Some(rid) =>
+          logger.info(s"[Pipeline] Curated replay from RAW slice run_id=$rid")
+          spark.table(fullTable).filter(col("run_id") === lit(rid))
+        case None =>
+          val dt = cli.resumeIngestDt.getOrElse(throw new IllegalArgumentException(
+            "PIPE_003 --stage curated requires --run-id (replay one run) or " +
+              "--resume-ingest-dt (replay a whole partition)"))
+          require(spark.table(fullTable).columns.exists(_.equalsIgnoreCase("ingest_dt")),
+            s"PIPE_003 $fullTable has no ingest_dt column; replay by --run-id instead")
+          logger.info(s"[Pipeline] Curated replay from RAW partition ingest_dt=$dt flag=${ctx.rawFlag}")
+          spark.table(fullTable)
+            .filter(col("ingest_dt") === lit(dt) && col("file_type") === lit(ctx.rawFlag))
+      }
+
+      val rejectService = new RejectService(
+        spark, ConfigUtils.optConfig(feedConf, "rejects"), contract, logger)
+      val curatedConf =
+        if (feedConf.hasPath("curated")) Some(feedConf.getConfig("curated")) else None
+
+      val result = runStage(Stages.Curated, skippable = false) {
+        val r = new CuratedStageRunner(spark, curatedConf, logger)
+          .run(slice, ctx.mode, ctx, contract, Some(rejectService))
+        val counts = r.map(x => StageCounts(
+          insertCount = x.insertCount, updateCount = x.updateCount, deleteCount = x.deleteCount
+        )).getOrElse(StageCounts())
+        (r, counts)
+      }.flatten
+
+      reconcile(None, result)
+      logger.info(s"==== Curated replay success entity=${ctx.entity} runId=${ctx.runId} " +
+        "(watermark intentionally untouched) ====")
+    } finally {
+      held.foreach(l =>
+        try l.release(ctx.entity, ctx.runId)
+        catch { case e: Exception => logger.warn(s"[Pipeline] Lock release failed: ${e.getMessage}") })
+      cached.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
+      cached.clear()
+    }
+  }
+
+  /**
     * --validate-only: discovers files, extracts and validates physical
     * headers, resolves canonical mappings and (optionally) prints a mapping
     * explanation. Performs NO RAW write, NO CURATED write, NO file moves and
@@ -121,9 +182,27 @@ final class IngestPipeline(
     }
   }
 
+  /** The run ledger is mandatory: without it --resume silently degrades to a
+    * full re-run, replay guards go blind and the spec's per-run count capture
+    * has nowhere to live. Feeds that truly want no ledger must say so. */
+  private def requireLedger(): Unit = {
+    val optedOut = ConfigUtils.optConfig(feedConf, "audit")
+      .flatMap(a => ConfigUtils.optBoolean(a, "enabled")).contains(false)
+    if (!audit.enabled && !optedOut)
+      throw new IllegalStateException(
+        "PIPE_002 The run ledger is required: configure audit { database = ... } or opt out " +
+          "explicitly with audit { enabled = false } (resume, replay guards and count capture " +
+          "are all degraded without it)")
+    if (ctx.resume && !audit.enabled)
+      throw new IllegalStateException(
+        "PIPE_002 --resume requires a functioning audit ledger: without stage history the " +
+          "resume silently degrades into a full re-run")
+  }
+
   private def runInternal(): Unit = {
     logger.info(s"==== Pipeline start entity=${ctx.entity} mode=${ctx.mode} runId=${ctx.runId} " +
       s"dryRun=${ctx.dryRun} resume=${ctx.resume} ====")
+    requireLedger()
 
     val rawConf = feedConf.getConfig("raw")
     val curatedConf =
@@ -229,7 +308,11 @@ final class IngestPipeline(
     logger.info(s"==== Pipeline success entity=${ctx.entity} runId=${ctx.runId} ====")
   }
 
-  private final case class RawOutcome(accepted: DataFrame, counts: StageCounts)
+  private final case class RawOutcome(
+    accepted: DataFrame,
+    counts: StageCounts,
+    window: Option[(String, Option[String])] = None,
+    duplicateVersions: Long = -1L)
 
   /** Runs a stage unless --resume finds it already SUCCESS; records audit
     * STARTED/SUCCESS/FAILED around the body. Returns None when skipped. */
@@ -293,6 +376,9 @@ final class IngestPipeline(
         w.lastWindow(ctx.entity, Some(ctx.runId))
       case _ => None
     }
+    // The extract window becomes part of the run ledger (spec: start/end
+    // watermark recorded per run).
+    audit.setExtractWindow(window.map(_._1), window.flatMap(_._2))
     // String-only reads: the pipeline attaches the schema CONTRACT as an
     // OBJECT under source.schema, so the schema NAME lives at
     // source.source_schema (with a string-typed source.schema still honored).
@@ -330,19 +416,45 @@ final class IngestPipeline(
     val split = rejectService.split(withMeta, ctx)
     val accepted = track(split.accepted.persist(StorageLevel.MEMORY_AND_DISK))
 
-    writeRawIdempotently(accepted, rawConf, rawFullTable, rawDatabase, rawTable)
+    val windowSkipped = writeRawIdempotently(accepted, rawConf, rawFullTable, rawDatabase, rawTable, window)
 
     val acceptedCount = if (split.acceptedCount >= 0) split.acceptedCount else sourceCount
     // Measure rawCount from the table itself so the raw_equals_accepted
     // reconciliation check verifies the write instead of restating its input.
+    // A window-skip (rerun of a failed run under a NEW run id) attributes by
+    // the extract window instead — the rows exist under the failed run's id.
     // Tables without a run_id column (legacy) cannot attribute rows to this
     // run, so the count stays unmeasured there.
     val rawCount =
       if (ctx.dryRun) 0L
+      else if (windowSkipped.isDefined)
+        spark.table(rawFullTable)
+          .filter(col("extract_start_ts") === lit(windowSkipped.get._1) &&
+            col("extract_end_ts") === lit(windowSkipped.get._2))
+          .count()
       else if (spark.catalog.tableExists(rawFullTable) &&
                spark.table(rawFullTable).columns.contains("run_id"))
         spark.table(rawFullTable).filter(col("run_id") === lit(ctx.runId)).count()
       else -1L
+
+    // Optional raw version-duplicate measurement: with raw.idempotency_key
+    // configured (e.g. source PK + freshness column), duplicate key-tuples
+    // among THIS run's written rows indicate a source or extraction defect.
+    val idempotencyKey = ConfigUtils.stringList(rawConf, "idempotency_key")
+    val duplicateVersions =
+      if (ctx.dryRun || idempotencyKey.isEmpty || windowSkipped.isDefined ||
+          !spark.catalog.tableExists(rawFullTable)) -1L
+      else {
+        val cols = spark.table(rawFullTable).columns.map(_.toLowerCase).toSet
+        if (!cols.contains("run_id") || !idempotencyKey.forall(k => cols.contains(k.toLowerCase))) -1L
+        else spark.table(rawFullTable)
+          .filter(col("run_id") === lit(ctx.runId))
+          .groupBy(idempotencyKey.map(col): _*)
+          .count()
+          .filter(col("count") > 1)
+          .count()
+      }
+
     val counts = StageCounts(
       sourceCount = sourceCount,
       rawCount = rawCount,
@@ -350,7 +462,7 @@ final class IngestPipeline(
       rejectedCount = split.rejectedCount,
       controlTotal = controlTotal(accepted)
     )
-    RawOutcome(accepted, counts)
+    RawOutcome(accepted, counts, window, duplicateVersions)
   }
 
   /** Multi-file batch safety: staged files were validated per-file at
@@ -402,35 +514,67 @@ final class IngestPipeline(
     val violations = SchemaValidator.validateData(df, c).filterNot(v =>
       rejectService.handlesContractNullability &&
         v.kind == ViolationKind.NullabilityViolation) ++
-      SchemaValidator.versionMismatch(SchemaVersions.stored(spark, rawDatabase, rawTable), c)
+      SchemaValidator.versionMismatch(
+        SchemaVersions.stored(spark, rawDatabase, rawTable),
+        SchemaVersions.storedRequired(spark, rawDatabase, rawTable), c)
     SchemaValidator.enforce(violations, c.policies, logger)
   }
 
-  /** RAW write with the same-run idempotency guard, or the dry-run log line;
-    * the schema version property is recorded after a real write. */
+  /** RAW write with two idempotency guards, or the dry-run log line; the
+    * schema version property is recorded after a real write. Returns the
+    * extract window that caused a window-skip, when one did.
+    *
+    * Guard 1 (same run id): a prior attempt of THIS run committed rows but
+    * died before recording SUCCESS.
+    * Guard 2 (same extract window, different run id): a failed run's rows
+    * are already in RAW and the operator reran WITHOUT --resume — a fresh
+    * run id re-extracting the identical bounded window must not append the
+    * same rows twice. Best-effort: SOURCE_CLOCK uppers differ per attempt,
+    * so only MAX_VALUE windows (or identical clocks) match. */
   private def writeRawIdempotently(
     accepted: DataFrame,
     rawConf: Config,
     rawFullTable: String,
     rawDatabase: String,
-    rawTable: String
-  ): Unit =
-    if (!ctx.dryRun) {
-      // Idempotency guard: if a prior attempt committed this run's rows to
-      // RAW but died before recording stage SUCCESS, do not append twice.
-      val alreadyLoaded = spark.catalog.tableExists(rawFullTable) &&
-        spark.table(rawFullTable).columns.contains("run_id") &&
-        spark.table(rawFullTable).filter(col("run_id") === lit(ctx.runId)).limit(1).count() > 0
-      if (alreadyLoaded) {
-        logger.warn(s"[Pipeline] RAW already holds rows for run ${ctx.runId}; skipping write (idempotent replay)")
-      } else {
-        val sinkType = ConfigUtils.optString(rawConf, "type").getOrElse("hive")
-        SinkRegistry.resolve(sinkType).write(spark, accepted, rawConf)
-      }
-      contract.foreach(c => SchemaVersions.record(spark, rawDatabase, rawTable, c.version, logger))
-    } else {
+    rawTable: String,
+    window: Option[(String, Option[String])]
+  ): Option[(String, String)] = {
+    if (ctx.dryRun) {
       logger.info("[Pipeline] DRY-RUN: skipping RAW write")
+      return None
     }
+    val runIdLoaded = spark.catalog.tableExists(rawFullTable) &&
+      spark.table(rawFullTable).columns.contains("run_id") &&
+      spark.table(rawFullTable).filter(col("run_id") === lit(ctx.runId)).limit(1).count() > 0
+
+    val windowLoaded: Option[(String, String)] =
+      if (runIdLoaded || ctx.forceReprocess) None
+      else window.flatMap { case (s, eOpt) =>
+        eOpt.filter { e =>
+          spark.catalog.tableExists(rawFullTable) && {
+            val cols = spark.table(rawFullTable).columns.map(_.toLowerCase)
+            cols.contains("extract_start_ts") && cols.contains("extract_end_ts") &&
+              spark.table(rawFullTable)
+                .filter(col("extract_start_ts") === lit(s) && col("extract_end_ts") === lit(e) &&
+                  col("run_id") =!= lit(ctx.runId))
+                .limit(1).count() > 0
+          }
+        }.map(e => (s, e))
+      }
+
+    if (runIdLoaded) {
+      logger.warn(s"[Pipeline] RAW already holds rows for run ${ctx.runId}; skipping write (idempotent replay)")
+    } else if (windowLoaded.isDefined) {
+      logger.warn(s"[Pipeline] RAW already holds rows for extract window ${windowLoaded.get} " +
+        "(written by a previous failed/incomplete run); skipping write (window idempotency). " +
+        "Use --force-reprocess to append anyway.")
+    } else {
+      val sinkType = ConfigUtils.optString(rawConf, "type").getOrElse("hive")
+      SinkRegistry.resolve(sinkType).write(spark, accepted, rawConf)
+    }
+    contract.foreach(c => SchemaVersions.record(spark, rawDatabase, rawTable, c.version, Some(c), logger))
+    windowLoaded
+  }
 
   /** Audits a header/content contract failure and quarantines the staged
     * files when configured. The audit record is written BEFORE any file is
@@ -512,7 +656,8 @@ final class IngestPipeline(
   private def reconcile(raw: Option[RawOutcome], curated: Option[CuratedResult]): Unit = {
     val checks = scala.collection.mutable.ArrayBuffer.empty[(String, String, String, Boolean)]
 
-    raw.map(_.counts).foreach { c =>
+    raw.foreach { o =>
+      val c = o.counts
       if (c.sourceCount >= 0 && c.acceptedCount >= 0 && c.rejectedCount >= 0) {
         val expected = c.sourceCount
         val actual = c.acceptedCount + c.rejectedCount
@@ -521,6 +666,11 @@ final class IngestPipeline(
       if (!ctx.dryRun && c.rawCount >= 0 && c.acceptedCount >= 0) {
         checks += (("raw_equals_accepted", c.acceptedCount.toString, c.rawCount.toString, c.rawCount == c.acceptedCount))
       }
+      // Raw version-duplicate check (raw.idempotency_key configured):
+      // duplicate key-tuples inside one run's write indicate a source or
+      // extraction defect, not the intentional overlap re-read.
+      if (o.duplicateVersions >= 0)
+        checks += (("raw_duplicate_versions", "0", o.duplicateVersions.toString, o.duplicateVersions == 0))
     }
     // Full accounting identity: every accepted RAW row must be explained by
     // the curated outcome — a distinct key that was inserted, updated or
@@ -541,9 +691,11 @@ final class IngestPipeline(
 
     val failed = checks.filterNot(_._4)
     if (failed.nonEmpty) {
+      // Default FAIL: the safety net must be ON unless a feed explicitly
+      // accepts inconsistent loads with on_mismatch = WARN.
       val onMismatch = ConfigUtils.optConfig(feedConf, "audit")
         .flatMap(a => ConfigUtils.optString(a, "reconciliation.on_mismatch"))
-        .getOrElse("WARN").toUpperCase
+        .getOrElse("FAIL").toUpperCase
       val summary = failed.map(f => s"${f._1}: expected=${f._2} actual=${f._3}").mkString("; ")
       if (onMismatch == "FAIL")
         throw new IllegalStateException(s"Reconciliation failed: $summary")

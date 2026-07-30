@@ -107,6 +107,22 @@ final class CuratedTransform(spark: SparkSession) {
       .drop("_rn")
   }
 
+  /**
+    * Counts values a cast would silently turn into NULL (Spark's cast never
+    * fails): per column, rows where the source is non-null but the casted
+    * value is null. One aggregate pass over all candidate columns.
+    */
+  def detectCastLoss(df: DataFrame, casts: Seq[(String, org.apache.spark.sql.types.DataType)]): Seq[(String, Long)] = {
+    if (casts.isEmpty) return Seq.empty
+    val aggs = casts.map { case (c, t) =>
+      sum(when(col(c).isNotNull && col(c).cast(t).isNull, 1).otherwise(0)).alias(c)
+    }
+    val row = df.agg(aggs.head, aggs.tail: _*).first()
+    casts.indices.flatMap { i =>
+      Option(row.get(i)).map(_.toString.toLong).filter(_ > 0).map(n => (casts(i)._1, n))
+    }
+  }
+
   def align(df: DataFrame, schema: StructType): DataFrame =
     align(df, schema, None)
 

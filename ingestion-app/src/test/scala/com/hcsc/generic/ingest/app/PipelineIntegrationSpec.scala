@@ -218,6 +218,8 @@ class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(rawSuccess.getAs[Long]("accepted_count") == 2L)
     assert(rawSuccess.getAs[Long]("rejected_count") == 1L)
     assert(rawSuccess.getAs[String]("control_total") == "2")
+    // The ledger records the run mode (spec: run type per run)
+    assert(rawSuccess.getAs[String]("run_mode") == "FULL")
 
     // Reconciliation recorded and passing (05)
     val recon = spark.table("p_audit.ingest_reconciliation")
@@ -400,5 +402,38 @@ class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       .map(r => (r.getString(0), r.getString(1))).toSet
     assert(stageStatuses.contains(("raw", "SUCCESS")))
     assert(stageStatuses.contains(("curated", "SKIPPED")))
+  }
+
+  test("--stage curated replays a run's RAW slice under full governance") {
+    import org.apache.spark.sql.functions.col
+
+    // Curated currently holds earlier runs' rows (run-rawonly-1 never
+    // published). Replaying run-rawonly-1's single-row RAW slice through the
+    // governed path (real run context, audit, lock — never the watermark)
+    // must rebuild curated to exactly that slice.
+    import org.apache.spark.sql.Encoders
+    val before = spark.table("p_curated.member").select("subscriber_id")
+      .as[String](Encoders.STRING).collect().toSet
+    assert(!before.contains("S600"), "precondition: run-rawonly-1 never published to curated")
+
+    new IngestPipeline(spark, feedConf(),
+      baseCli.copy(runId = Some("run-rawonly-1"), stage = "curated"), logger).curatedReplay()
+
+    assert(spark.table("p_curated.member").select("subscriber_id")
+      .as[String](Encoders.STRING).collect().toSet == Set("S600"),
+      "replay must rebuild curated from the requested RAW slice")
+
+    val replayAudit = spark.table("p_audit.ingest_run_audit")
+      .filter(col("run_id") === "run-rawonly-1" && col("stage") === "curated" &&
+        col("status") === "SUCCESS")
+    assert(replayAudit.count() >= 1, "the replay must be recorded in the run ledger")
+  }
+
+  test("--stage curated without --run-id or --resume-ingest-dt fails with guidance") {
+    val e = intercept[IllegalArgumentException] {
+      new IngestPipeline(spark, feedConf(),
+        baseCli.copy(stage = "curated"), logger).curatedReplay()
+    }
+    assert(e.getMessage.contains("PIPE_003"))
   }
 }

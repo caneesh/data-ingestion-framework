@@ -7,7 +7,6 @@ import com.hcsc.generic.ingest.kafka.KafkaSource
 import com.hcsc.generic.ingest.model.{Cli, CliParser}
 import com.hcsc.generic.ingest.pipeline.IngestPipeline
 import com.hcsc.generic.ingest.sink.HiveSink
-import com.hcsc.generic.ingest.stage.{CuratedStageRunner, RawStageRunner}
 import com.typesafe.config.{Config, ConfigFactory}
 import org.apache.log4j.Logger
 import org.apache.spark.sql.SparkSession
@@ -42,7 +41,9 @@ object IngestMain {
         new IngestPipeline(spark, feedConf, cli, logger).validateOnly(cli.explainMapping)
       } else cli.stage.toLowerCase match {
         case "curated" | "curated-only" | "c" =>
-          runCuratedOnly(spark, feedConf, cli)
+          // Governed replay path: real run context, entity lock, ledger,
+          // rejects and contract validation — never the watermark.
+          new IngestPipeline(spark, feedConf, cli, logger).curatedReplay()
         case _ =>
           new IngestPipeline(spark, feedConf, cli, logger).run()
       }
@@ -52,37 +53,6 @@ object IngestMain {
         throw error
     } finally {
       spark.stop()
-    }
-  }
-
-  /** Legacy replay path: rebuild curated from an existing RAW partition.
-    * Held under the same entity lock as full pipeline runs — this path
-    * INSERT OVERWRITEs the real curated table. */
-  private def runCuratedOnly(spark: SparkSession, feedConf: Config, cli: Cli): Unit = {
-    val curatedConf =
-      if (feedConf.hasPath("curated")) Some(feedConf.getConfig("curated")) else None
-    val rawFlag = cli.rawFlag.getOrElse(if (cli.mode == "FULL") "F" else "I")
-    val runId = cli.runId.getOrElse(java.util.UUID.randomUUID().toString)
-
-    val lock = com.hcsc.generic.ingest.lock.LockService.fromConfig(spark, feedConf, logger)
-    lock.foreach(_.acquire(cli.entity, runId))
-    try {
-      val rawDf = new RawStageRunner(
-        spark = spark,
-        feedConf = feedConf,
-        cli = cli,
-        rawFlag = rawFlag,
-        logger = logger
-      ).run()
-
-      new CuratedStageRunner(
-        spark = spark,
-        curatedConf = curatedConf,
-        logger = logger
-      ).run(rawDf, cli.mode)
-    } finally lock.foreach { l =>
-      try l.release(cli.entity, runId)
-      catch { case e: Exception => logger.warn(s"Lock release failed: ${e.getMessage}") }
     }
   }
 

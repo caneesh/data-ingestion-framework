@@ -12,7 +12,6 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions.{col, lit, row_number}
 
-import java.util.UUID
 
 final case class CuratedResult(
   publishedCount: Long,
@@ -38,13 +37,6 @@ final class CuratedService(spark: SparkSession, conf: Config) {
   val enabled: Boolean =
     ConfigUtils.optBoolean(conf, "enabled").getOrElse(true)
 
-  /** Legacy entry point; runs with a synthetic run context. */
-  def process(rawDf: DataFrame, runMode: String): Option[CuratedResult] =
-    process(rawDf, runMode, RunContext(UUID.randomUUID().toString, "unknown", runMode, "F"))
-
-  def process(rawDf: DataFrame, runMode: String, ctx: RunContext): Option[CuratedResult] =
-    process(rawDf, runMode, ctx, None)
-
   def process(rawDf: DataFrame, runMode: String, ctx: RunContext, contract: Option[SchemaContract]): Option[CuratedResult] =
     process(rawDf, runMode, ctx, contract, None)
 
@@ -62,6 +54,15 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     val fullTable = s"$database.$table"
     val path = ConfigUtils.optString(conf, "path")
     val format = ConfigUtils.optString(conf, "format").getOrElse("orc")
+
+    // Drift guard: configured column_types casts must not silently null out
+    // values (Spark cast never fails); checked BEFORE the cast is applied.
+    guardCasts(rawDf,
+      ConfigUtils.stringMap(conf, "column_types").toSeq.flatMap { case (name, ddl) =>
+        rawDf.columns.find(_.equalsIgnoreCase(name))
+          .map(actual => (actual, org.apache.spark.sql.types.DataType.fromDDL(ddl)))
+      },
+      where = "curated.column_types")
 
     val prepared0 = transform.castConfigured(rawDf, conf)
     val prepared1 = transform.applyTransforms(prepared0, conf)
@@ -182,6 +183,70 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     }
   }
 
+  /** The (actual column, target type) pairs align() will cast where the
+    * incoming type differs — same-type casts can never null a value and are
+    * excluded to keep the guard's aggregate narrow. */
+  private def alignmentCasts(
+    df: DataFrame,
+    targetSchema: org.apache.spark.sql.types.StructType
+  ): Seq[(String, org.apache.spark.sql.types.DataType)] =
+    targetSchema.fields.toSeq.flatMap { field =>
+      df.schema.fields.find(_.name.equalsIgnoreCase(field.name))
+        .filter(_.dataType != field.dataType)
+        .map(actual => (actual.name, field.dataType))
+    }
+
+  /** curated.on_cast_error = FAIL (default) | WARN. A cast that nulls real
+    * values is silent data corruption — at 350 columns a single type drift
+    * can null a column table-wide with no error. */
+  private def guardCasts(
+    df: DataFrame,
+    casts: Seq[(String, org.apache.spark.sql.types.DataType)],
+    where: String
+  ): Unit = {
+    if (casts.isEmpty) return
+    val losses = transform.detectCastLoss(df, casts)
+    if (losses.nonEmpty) {
+      val detail = losses.map { case (c, n) => s"$c ($n value(s))" }.mkString(", ")
+      val policy = ConfigUtils.optString(conf, "on_cast_error").getOrElse("FAIL").toUpperCase
+      if (policy == "WARN")
+        logger.warn(s"[CuratedService] CUR_002 cast would NULL non-null values in $where: $detail " +
+          "(on_cast_error=WARN — values are being lost)")
+      else
+        throw new IllegalStateException(
+          s"CUR_002 Cast would silently turn non-null values into NULL in $where: $detail. " +
+            "Fix the declared type or the source data, or set curated.on_cast_error = WARN " +
+            "to accept the loss.")
+    }
+  }
+
+  /** Incoming columns absent from the target schema would be silently
+    * discarded by align(); surface them through the contract's extra-column
+    * policy (default WARN) so schema evolution is never invisible. */
+  private def guardDroppedColumns(
+    df: DataFrame,
+    targetSchema: org.apache.spark.sql.types.StructType,
+    contract: Option[SchemaContract],
+    fullTable: String
+  ): Unit = {
+    val targetCols = targetSchema.fields.map(_.name.toLowerCase).toSet
+    val dropped = df.columns.filterNot(c =>
+      targetCols.contains(c.toLowerCase) ||
+        com.hcsc.generic.ingest.transform.RawMetadata.ColumnNames.contains(c.toLowerCase) ||
+        c.startsWith("__"))
+    if (dropped.nonEmpty) {
+      val violations = dropped.toSeq.map(c =>
+        com.hcsc.generic.ingest.schema.SchemaViolation(
+          com.hcsc.generic.ingest.schema.ViolationKind.ExtraColumn,
+          s"Incoming column '$c' is not in curated target $fullTable and will be dropped by alignment"))
+      contract match {
+        case Some(c) => com.hcsc.generic.ingest.schema.SchemaValidator
+          .enforce(violations, c.policies, logger)
+        case None => violations.foreach(v => logger.warn(s"[CuratedService] $v"))
+      }
+    }
+  }
+
   private def quarantineNullKeys(dropped: DataFrame, ctx: RunContext, rejects: Option[RejectService]): Long =
     rejects match {
       case Some(rs) =>
@@ -212,9 +277,12 @@ final class CuratedService(spark: SparkSession, conf: Config) {
   ): CuratedResult = {
     val withPassthrough = passthrough.fold(df)(p => df.unionByName(p))
     val publishDf =
-      if (spark.catalog.tableExists(fullTable))
-        transform.align(withPassthrough, spark.table(fullTable).schema, contract)
-      else withPassthrough
+      if (spark.catalog.tableExists(fullTable)) {
+        val schema = spark.table(fullTable).schema
+        guardDroppedColumns(withPassthrough, schema, contract, fullTable)
+        guardCasts(withPassthrough, alignmentCasts(withPassthrough, schema), s"alignment to $fullTable")
+        transform.align(withPassthrough, schema, contract)
+      } else withPassthrough
 
     val published = publisher.publish(publishDf, request, ctx)
     val keyedPublished = published.publishedCount - passthroughCount
@@ -279,6 +347,8 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     val missingKeys = keys.filterNot(key => target.columns.exists(_.equalsIgnoreCase(key)))
     require(missingKeys.isEmpty, s"Merge keys missing from target: ${missingKeys.mkString(",")}")
 
+    guardDroppedColumns(incoming, target.schema, contract, fullTable)
+    guardCasts(incoming, alignmentCasts(incoming, target.schema), s"alignment to $fullTable")
     val aligned0 = transform.align(incoming, target.schema, contract)
     // Update audit semantics: rows replacing an existing key keep the
     // ORIGINAL create_timestamp and are stamped operation 'U'; only truly

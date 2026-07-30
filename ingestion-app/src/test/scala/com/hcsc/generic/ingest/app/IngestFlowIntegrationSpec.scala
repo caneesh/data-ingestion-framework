@@ -153,7 +153,10 @@ class IngestFlowIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       spark       = spark,
       curatedConf = Some(curatedConf),
       logger      = logger
-    ).run(rawDf, "FULL")
+    ).run(rawDf, "FULL",
+      com.hcsc.generic.ingest.runtime.RunContext(
+        java.util.UUID.randomUUID().toString, "member", "FULL", "F"),
+      None)
 
     // ---- RAW assertions ----
     val rawTable = spark.table("test_raw.member")

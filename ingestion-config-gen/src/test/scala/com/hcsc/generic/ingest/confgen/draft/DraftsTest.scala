@@ -60,4 +60,21 @@ class DraftsTest extends AnyFunSuite {
     val ex = intercept[IllegalArgumentException] { Drafts.load("/no/such/draft.json") }
     assert(ex.getMessage.contains("not found"))
   }
+
+  test("secret answers are excluded from saved drafts") {
+    import com.hcsc.generic.ingest.confgen.model.{Answers, AnswerValue}
+    val answers = new Answers
+    answers.put("entity", AnswerValue.Scalar("orders"))
+    answers.put("_auth.secret.value", AnswerValue.Scalar("super-secret"))
+
+    val path = java.nio.file.Files.createTempFile("draft-secrets", ".json").toString
+    Drafts.save(path, "jdbc", answers, excludeIds = Set("_auth.secret.value"))
+
+    val content = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path)), "UTF-8")
+    assert(!content.contains("super-secret"), "drafts must never persist secret values")
+    val reloaded = Drafts.load(path)
+    assert(reloaded.answers.scalar("entity").contains("orders"))
+    assert(!reloaded.answers.contains("_auth.secret.value"),
+      "a resumed session must re-ask the secret")
+  }
 }

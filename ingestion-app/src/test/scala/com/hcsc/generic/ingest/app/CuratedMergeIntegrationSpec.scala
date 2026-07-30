@@ -308,6 +308,63 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   // ---------------------------------------------------------------------------
+  // 7b: drift hardening — casts must not silently null values (CUR_002)
+  // ---------------------------------------------------------------------------
+
+  test("a cast that would NULL non-null values fails fast (CUR_002)") {
+    val badCast = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = cast_guard
+        |format = parquet
+        |column_types { name = "int" }
+        |""".stripMargin)
+    val df = batch(Seq(("C1", "not_a_number", "2026-01-01 10:00:00", 1)))
+    val e = intercept[IllegalStateException] {
+      new CuratedService(spark, badCast).process(df, "FULL", ctx("mrun-cast-1"), None, None)
+    }
+    assert(e.getMessage.contains("CUR_002"))
+    assert(e.getMessage.contains("name"))
+  }
+
+  test("on_cast_error=WARN accepts the loss explicitly") {
+    val warnCast = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = cast_warn
+        |format = parquet
+        |column_types { name = "int" }
+        |on_cast_error = "WARN"
+        |""".stripMargin)
+    val df = batch(Seq(("C2", "not_a_number", "2026-01-01 10:00:00", 1)))
+    val result = new CuratedService(spark, warnCast).process(df, "FULL", ctx("mrun-cast-2"), None, None)
+    assert(result.get.publishedCount == 1)
+  }
+
+  // ---------------------------------------------------------------------------
+  // 7c: reject payload redaction — HASHED stores no plaintext values
+  // ---------------------------------------------------------------------------
+
+  test("rejects.payload=HASHED quarantines null-key rows without plaintext") {
+    val hashedRejects = new RejectService(spark,
+      Some(ConfigFactory.parseString(
+        """{ enabled = true, database = "m_audit", table = "ingest_rejects", payload = "HASHED" }""")),
+      None, logger)
+    val df = batch(Seq(
+      ("M8", "visible", "2026-01-01 10:00:00", 1),
+      (null.asInstanceOf[String], "secret_name", "2026-01-01 10:00:00", 1)
+    ))
+    val result = service.process(df, "INCR", ctx("mrun-hash-1"), None, Some(hashedRejects)).get
+    assert(result.nullKeyCount == 1)
+
+    val quarantined = spark.table("m_audit.ingest_rejects")
+      .filter(col("run_id") === "mrun-hash-1").collect().head
+    val payload = quarantined.getAs[String]("raw_record")
+    assert(!payload.contains("secret_name"), "HASHED payload must not carry plaintext values")
+    assert(payload.contains("name"), "HASHED payload keeps the column structure")
+  }
+
+  // ---------------------------------------------------------------------------
   // 8: freshness column colliding with framework audit columns is rejected
   // ---------------------------------------------------------------------------
 

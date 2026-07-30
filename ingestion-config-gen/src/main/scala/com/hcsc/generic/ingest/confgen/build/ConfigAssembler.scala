@@ -28,6 +28,10 @@ object ConfigAssembler {
     }
 
     config = config.withValue("source.type", ConfigValueFactory.fromAnyRef(flow.sourceType))
+    // The pipeline requires the run ledger unless a feed opts out EXPLICITLY;
+    // a wizard session that declined audit must therefore say so in config.
+    if (!answers.isTrue("_audit.enabled") && !config.hasPath("audit"))
+      config = config.withValue("audit.enabled", ConfigValueFactory.fromAnyRef(false))
     config = derivePartitionKeys(config)
     config = flow.sourceType match {
       case "jdbc" => jdbcPostProcess(config, answers)

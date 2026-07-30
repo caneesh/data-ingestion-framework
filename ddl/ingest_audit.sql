@@ -29,8 +29,15 @@ CREATE TABLE IF NOT EXISTS ingest_audit.ingest_run_audit (
   delete_count   BIGINT,
   control_total  STRING,
   message        STRING,
-  event_ts       TIMESTAMP
+  event_ts       TIMESTAMP,
+  run_mode       STRING,   -- FULL | INCR
+  window_start   STRING,   -- serialized extract window (incremental sources)
+  window_end     STRING
 ) STORED AS ORC;
+-- Pre-existing tables migrate in place (the framework also does this
+-- automatically on first write):
+--   ALTER TABLE ingest_audit.ingest_run_audit
+--     ADD COLUMNS (run_mode STRING, window_start STRING, window_end STRING);
 
 CREATE TABLE IF NOT EXISTS ingest_audit.ingest_reconciliation (
   run_id     STRING,

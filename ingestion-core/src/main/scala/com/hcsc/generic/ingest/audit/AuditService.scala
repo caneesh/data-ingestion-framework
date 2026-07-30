@@ -45,7 +45,12 @@ final case class RunAuditRecord(
   delete_count: Long,
   control_total: String,
   message: String,
-  event_ts: Timestamp
+  event_ts: Timestamp,
+  // Appended at the END so pre-existing tables migrate via ALTER TABLE
+  // ADD COLUMNS without breaking positional insertInto.
+  run_mode: String,
+  window_start: String,
+  window_end: String
 )
 
 final case class ReconciliationRecord(
@@ -123,7 +128,33 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
   private val runTableDdl =
     "run_id STRING, entity STRING, stage STRING, status STRING, source_count BIGINT, " +
       "raw_count BIGINT, accepted_count BIGINT, rejected_count BIGINT, insert_count BIGINT, " +
-      "update_count BIGINT, delete_count BIGINT, control_total STRING, message STRING, event_ts TIMESTAMP"
+      "update_count BIGINT, delete_count BIGINT, control_total STRING, message STRING, " +
+      "event_ts TIMESTAMP, run_mode STRING, window_start STRING, window_end STRING"
+
+  /** Columns added after the original run-audit DDL; pre-existing tables are
+    * migrated in place (Hive appends ADD COLUMNS at the end, matching the
+    * record's field order). */
+  private val runTableAddedColumns = Seq(
+    "run_mode" -> "STRING", "window_start" -> "STRING", "window_end" -> "STRING")
+
+  private def ensureRunTableColumns(): Unit =
+    if (spark.catalog.tableExists(runTable)) {
+      val existing = spark.table(runTable).columns.map(_.toLowerCase).toSet
+      val missing = runTableAddedColumns.filterNot { case (n, _) => existing.contains(n) }
+      if (missing.nonEmpty) {
+        val ddl = missing.map { case (n, t) => s"$n $t" }.mkString(", ")
+        logger.warn(s"[Audit] Migrating $runTable: ADD COLUMNS ($ddl)")
+        spark.sql(s"ALTER TABLE $runTable ADD COLUMNS ($ddl)")
+      }
+    }
+
+  /** The extract window observed by this run's source read; stamped onto
+    * subsequent run-audit rows so the ledger records the incremental
+    * boundaries (spec: start/end watermark per run). */
+  @volatile private var extractWindow: (String, String) = ("", "")
+
+  def setExtractWindow(start: Option[String], end: Option[String]): Unit =
+    extractWindow = (start.getOrElse(""), end.getOrElse(""))
 
   private val reconciliationTableDdl =
     "run_id STRING, entity STRING, check_name STRING, expected STRING, actual STRING, " +
@@ -175,8 +206,10 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
       ctx.runId, ctx.entity, stage, status,
       counts.sourceCount, counts.rawCount, counts.acceptedCount, counts.rejectedCount,
       counts.insertCount, counts.updateCount, counts.deleteCount,
-      counts.controlTotal.orNull, message, now()
+      counts.controlTotal.orNull, message, now(),
+      ctx.mode, extractWindow._1, extractWindow._2
     )
+    ensureRunTableColumns()
     append(Seq(record).toDF(), runTable, runTableDdl)
     logger.info(s"[Audit] stage=$stage status=$status counts=$counts")
   }

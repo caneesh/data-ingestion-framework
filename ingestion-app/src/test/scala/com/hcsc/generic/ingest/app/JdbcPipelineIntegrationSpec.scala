@@ -103,6 +103,7 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
        |    watermark_store { type = "memory" }
        |  }
        |}
+       |audit { enabled = false } # explicit opt-out (the ledger is mandatory otherwise)
        |raw {
        |  database = j_raw
        |  table = claims
@@ -165,6 +166,22 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     new IngestPipeline(spark, feedConf(), Cli(entity = entity, mode = "FULL", runId = Some("jrun-4")), logger).run()
     assert(InMemoryWatermarkStore.latest(entity).get.values.head.startsWith("2026-01-04 09:00:00"))
     assert(spark.table("j_curated.claims").count() == 1)
+
+    // Window idempotency: jrun-3 already appended C004 to RAW before its
+    // publish failed; jrun-4 (a NEW run id, no --resume) re-extracts the
+    // identical bounded window and must NOT append the same rows twice.
+    import org.apache.spark.sql.functions.col
+    assert(spark.table("j_raw.claims").filter(col("claim_id") === "C004").count() == 1,
+      "rerunning a failed window under a new run id must not duplicate RAW")
+  }
+
+  test("the run ledger is mandatory unless a feed opts out explicitly") {
+    val noAudit = feedConf().withoutPath("audit")
+    val e = intercept[IllegalStateException] {
+      new IngestPipeline(spark, noAudit,
+        Cli(entity = entity, mode = "FULL", runId = Some("jrun-ledger")), logger).run()
+    }
+    assert(e.getMessage.contains("PIPE_002"))
   }
 
   test("--stage raw does not advance the watermark; advance_after=RAW opts in") {

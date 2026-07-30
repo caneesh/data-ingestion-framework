@@ -16,18 +16,20 @@ object Drafts {
 
   case class Draft(sourceType: String, answers: Answers)
 
-  def save(path: String, sourceType: String, answers: Answers): Unit = {
-    val entries: java.util.List[Object] = answers.ordered.map { case (id, value) =>
-      val entry = new java.util.LinkedHashMap[String, Object]()
-      entry.put("id", id)
-      value match {
-        case AnswerValue.Scalar(v) => entry.put("scalar", v)
-        case AnswerValue.Items(v) => entry.put("items", v.asJava)
-        case AnswerValue.Blocks(v) =>
-          entry.put("blocks", v.map(_.root().unwrapped()).asJava)
-      }
-      entry: Object
-    }.asJava
+  def save(path: String, sourceType: String, answers: Answers, excludeIds: Set[String] = Set.empty): Unit = {
+    val entries: java.util.List[Object] = answers.ordered
+      .filterNot { case (id, _) => excludeIds.contains(id) }
+      .map { case (id, value) =>
+        val entry = new java.util.LinkedHashMap[String, Object]()
+        entry.put("id", id)
+        value match {
+          case AnswerValue.Scalar(v) => entry.put("scalar", v)
+          case AnswerValue.Items(v) => entry.put("items", v.asJava)
+          case AnswerValue.Blocks(v) =>
+            entry.put("blocks", v.map(_.root().unwrapped()).asJava)
+        }
+        entry: Object
+      }.asJava
 
     val root = ConfigFactory.empty()
       .withValue("source_type", ConfigValueFactory.fromAnyRef(sourceType))
@@ -41,6 +43,11 @@ object Drafts {
       Option(target.getParent).getOrElse(Paths.get(".")), ".draft", ".tmp")
     Files.write(tmp, rendered.getBytes(java.nio.charset.StandardCharsets.UTF_8))
     Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING)
+    // Drafts/answers files can carry connection details: owner-only access.
+    try {
+      import java.nio.file.attribute.PosixFilePermissions
+      Files.setPosixFilePermissions(target, PosixFilePermissions.fromString("rw-------"))
+    } catch { case _: UnsupportedOperationException => () } // non-POSIX filesystems
   }
 
   def load(path: String): Draft = {

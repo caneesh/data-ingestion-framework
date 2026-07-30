@@ -273,7 +273,22 @@ object SchemaValidator {
   }
 
   def versionMismatch(storedVersion: Option[String], contract: SchemaContract): Seq[SchemaViolation] =
-    storedVersion match {
+    versionMismatch(storedVersion, None, contract)
+
+  /**
+    * Version drift plus real BACKWARD-compatibility enforcement: with the
+    * previous contract's required-column snapshot available, a new contract
+    * that REMOVES a previously required column or CHANGES its type breaks
+    * consumers of already-written data and is reported as a violation
+    * (policy on_version_mismatch decides warn/fail). compatibility=NONE
+    * skips the structural check.
+    */
+  def versionMismatch(
+    storedVersion: Option[String],
+    storedRequired: Option[Map[String, String]],
+    contract: SchemaContract
+  ): Seq[SchemaViolation] = {
+    val versionDrift = storedVersion match {
       case Some(stored) if stored != contract.version =>
         Seq(SchemaViolation(
           ViolationKind.VersionMismatch,
@@ -282,6 +297,27 @@ object SchemaValidator {
         ))
       case _ => Seq.empty
     }
+
+    val structural =
+      if (contract.compatibility.equalsIgnoreCase("NONE")) Seq.empty
+      else storedRequired.toSeq.flatMap { previous =>
+        val current = contract.requiredColumns.map(c => c.name.toLowerCase -> c.dataType).toMap
+        previous.toSeq.flatMap { case (name, prevType) =>
+          current.get(name.toLowerCase) match {
+            case None => Some(SchemaViolation(ViolationKind.VersionMismatch,
+              s"BACKWARD compatibility broken: previously required column '$name' was removed " +
+                "from the contract; existing raw data still carries it"))
+            case Some(newType) if !newType.equalsIgnoreCase(prevType) =>
+              Some(SchemaViolation(ViolationKind.VersionMismatch,
+                s"BACKWARD compatibility broken: required column '$name' changed type " +
+                  s"'$prevType' -> '$newType'"))
+            case _ => None
+          }
+        }
+      }
+
+    versionDrift ++ structural
+  }
 
   /**
     * Applies the feed's policies to the violations found: WARN violations are

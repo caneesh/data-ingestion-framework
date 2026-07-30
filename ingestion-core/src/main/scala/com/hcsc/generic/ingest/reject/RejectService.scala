@@ -52,6 +52,34 @@ final class RejectService(
   val handlesContractNullability: Boolean =
     enabled && rejectConf.exists(c => ConfigUtils.optBoolean(c, "use_contract_nullability").getOrElse(false))
 
+  /** rejects.payload = FULL | HASHED | KEYS_ONLY. The reject table can hold
+    * PHI: FULL stores the record verbatim (loud warning), HASHED preserves
+    * the structure but SHA-256s every value (joinable, irreversible),
+    * KEYS_ONLY stores only rejects.payload_columns. */
+  private val payloadMode: String = {
+    val mode = rejectConf.flatMap(c => ConfigUtils.optString(c, "payload"))
+      .getOrElse("FULL").toUpperCase
+    require(Seq("FULL", "HASHED", "KEYS_ONLY").contains(mode),
+      s"rejects.payload '$mode' must be FULL, HASHED or KEYS_ONLY")
+    if (enabled && mode == "FULL")
+      logger.warn("[RejectService] rejects.payload=FULL: rejected records are stored UNREDACTED " +
+        "in the reject table — for sensitive feeds set payload = HASHED or KEYS_ONLY and " +
+        "restrict access to the reject table like the RAW layer")
+    mode
+  }
+
+  private def payloadJson(df: DataFrame, businessCols: Seq[String]): Column = payloadMode match {
+    case "HASHED" =>
+      to_json(struct(businessCols.map(c => sha2(col(c).cast("string"), 256).as(c)): _*))
+    case "KEYS_ONLY" =>
+      val keep = rejectConf.map(c => ConfigUtils.stringList(c, "payload_columns")).getOrElse(Seq.empty)
+      require(keep.nonEmpty, "rejects.payload = KEYS_ONLY requires rejects.payload_columns")
+      val present = keep.flatMap(k => df.columns.find(_.equalsIgnoreCase(k)))
+      to_json(struct(present.map(col): _*))
+    case _ =>
+      to_json(struct(businessCols.map(col): _*))
+  }
+
   private lazy val rejectTable: String = {
     val c = rejectConf.get
     val db = ConfigUtils.sqlIdentifier(c, "database")
@@ -129,7 +157,7 @@ final class RejectService(
       col("file_id"),
       col("source_file"),
       col("row_idx"),
-      to_json(struct(businessCols.map(col): _*)).as("raw_record"),
+      payloadJson(df, businessCols).as("raw_record"),
       firstMatch(_.errorCode).as("error_code"),
       firstMatch(_.message).as("error_message"),
       firstMatch(_.category).as("reject_category"),
@@ -177,7 +205,7 @@ final class RejectService(
       lineage("file_id", "string").as("file_id"),
       lineage("source_file", "string").as("source_file"),
       lineage("row_idx", "bigint").as("row_idx"),
-      to_json(struct(businessCols.map(col): _*)).as("raw_record"),
+      payloadJson(df, businessCols).as("raw_record"),
       lit(errorCode).as("error_code"),
       lit(message).as("error_message"),
       lit(category).as("reject_category"),

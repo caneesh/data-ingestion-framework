@@ -7,19 +7,12 @@ import com.typesafe.config.Config
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SparkSession}
 
-import java.util.UUID
 
 final class CuratedStageRunner(
   spark: SparkSession,
   curatedConf: Option[Config],
   logger: Logger
 ) {
-
-  def run(rawDf: DataFrame, mode: String): Option[CuratedResult] =
-    run(rawDf, mode, RunContext(UUID.randomUUID().toString, "unknown", mode, "F"))
-
-  def run(rawDf: DataFrame, mode: String, ctx: RunContext): Option[CuratedResult] =
-    run(rawDf, mode, ctx, None)
 
   def run(rawDf: DataFrame, mode: String, ctx: RunContext, contract: Option[SchemaContract]): Option[CuratedResult] =
     run(rawDf, mode, ctx, contract, None)

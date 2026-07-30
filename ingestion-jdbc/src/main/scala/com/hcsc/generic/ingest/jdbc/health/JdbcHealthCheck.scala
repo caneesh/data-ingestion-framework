@@ -29,15 +29,18 @@ object JdbcHealthCheck {
         } finally statement.close()
       } finally connection.close()
     } catch {
+      // Exception text is sanitized too: driver messages can echo the FULL
+      // connection URL (e.g. the JDK's "No suitable driver found for <url>"),
+      // credentials included.
       case e: ClassNotFoundException =>
         com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_connection_failure_total")
-        Left(s"JDBC_001 Driver class '${cfg.driver}' not found on classpath: ${e.getMessage}")
+        Left(s"JDBC_001 Driver class '${cfg.driver}' not found on classpath: ${sanitizedMessage(e)}")
       case e: java.sql.SQLInvalidAuthorizationSpecException =>
         com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_connection_failure_total")
-        Left(s"JDBC_002 Authentication failed for ${sanitized(cfg.url)}: ${e.getMessage}")
+        Left(s"JDBC_002 Authentication failed for ${sanitized(cfg.url)}: ${sanitizedMessage(e)}")
       case e: Exception =>
         com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_connection_failure_total")
-        Left(s"JDBC_001 Connection to ${sanitized(cfg.url)} failed: ${e.getMessage}")
+        Left(s"JDBC_001 Connection to ${sanitized(cfg.url)} failed: ${sanitizedMessage(e)}")
     }
   }
 
@@ -71,7 +74,14 @@ object JdbcHealthCheck {
     }
   }
 
-  /** URL with any embedded credentials masked for logs. */
+  /** URL (or any driver-produced text) with embedded credentials masked for
+    * logs. Handles the SQL Server brace-escaping convention
+    * (password={value;with;specials}) — a naive [^;&]* stops at the first
+    * embedded ';' and leaks the credential's tail. */
   def sanitized(url: String): String =
-    url.replaceAll("(?i)(password|pwd)=[^;&]*", "$1=***")
+    url.replaceAll("(?i)(password|pwd)=(\\{[^}]*\\}?|[^;&]*)", "$1=***")
+
+  /** Exception message with the same masking; null-safe. */
+  def sanitizedMessage(e: Throwable): String =
+    sanitized(Option(e.getMessage).getOrElse(e.getClass.getSimpleName))
 }

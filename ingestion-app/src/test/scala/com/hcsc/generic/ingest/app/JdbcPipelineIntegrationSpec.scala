@@ -224,4 +224,34 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       Cli(entity = entity, mode = "FULL", runId = Some("jrun-6"), stage = "raw"), logger).run()
     assert(InMemoryWatermarkStore.latest(entity).get.values.head.startsWith("2026-01-05 09:00:00"))
   }
+
+  test("a drifted retry window appends (documented duplicate) rather than losing the delta") {
+    // Fix 5 semantics: when the captured upper DRIFTS between a failed
+    // attempt and its un-resumed retry (new source rows arrived), the
+    // window guard cannot match — the retry must append the full window
+    // (duplicating the failed attempt's overlap in RAW, deduplicated by the
+    // curated merge) instead of skipping and permanently losing the delta.
+    import org.apache.spark.sql.functions.col
+    h2("INSERT INTO claims VALUES ('C006', 600, '2026-01-06 09:00:00')")
+    val failing = feedConf(
+      """publish { validation_query = "SELECT * FROM {table} WHERE claim_id = 'C006'" }""")
+    intercept[PublishValidationException] {
+      new IngestPipeline(spark, failing,
+        Cli(entity = entity, mode = "FULL", runId = Some("jrun-7")), logger).run()
+    }
+    assert(spark.table("j_raw.claims").filter(col("claim_id") === "C006").count() == 1)
+
+    // New row lands between the failed attempt and the retry: upper drifts
+    h2("INSERT INTO claims VALUES ('C007', 700, '2026-01-07 09:00:00')")
+    new IngestPipeline(spark, feedConf(),
+      Cli(entity = entity, mode = "FULL", runId = Some("jrun-8")), logger).run()
+
+    assert(spark.table("j_raw.claims").filter(col("claim_id") === "C007").count() == 1,
+      "the drift delta must be captured")
+    assert(spark.table("j_raw.claims").filter(col("claim_id") === "C006").count() == 2,
+      "the overlap range duplicates in RAW by design (curated dedups by key)")
+    assert(spark.table("j_curated.claims").filter(col("claim_id").isin("C006", "C007")).count() == 2,
+      "curated holds exactly one row per key despite the RAW duplicate")
+    assert(InMemoryWatermarkStore.latest(entity).get.values.head.startsWith("2026-01-07 09:00:00"))
+  }
 }

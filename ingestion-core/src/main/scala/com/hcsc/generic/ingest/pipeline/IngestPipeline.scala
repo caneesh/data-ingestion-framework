@@ -589,6 +589,28 @@ final class IngestPipeline(
         "(written by a previous failed/incomplete run); skipping write (window idempotency). " +
         "Use --force-reprocess to append anyway.")
     } else {
+      // Drift detection: a prior failed attempt with the SAME window start
+      // but a DIFFERENT end means new source rows arrived between attempts —
+      // the exact-window guard cannot match, and this append will duplicate
+      // the previously written overlap range in RAW. Curated dedup/merge
+      // absorbs the duplicates; raw-level cleanup needs raw.idempotency_key
+      // or manual intervention. Detection only — skipping instead would
+      // permanently lose the delta between the two captured uppers.
+      window.foreach { case (s, eOpt) =>
+        if (!ctx.forceReprocess && eOpt.isDefined && spark.catalog.tableExists(rawFullTable)) {
+          val cols = spark.table(rawFullTable).columns.map(_.toLowerCase)
+          if (cols.contains("extract_start_ts") && cols.contains("extract_end_ts") &&
+              spark.table(rawFullTable)
+                .filter(col("extract_start_ts") === lit(s) &&
+                  col("extract_end_ts") =!= lit(eOpt.get) &&
+                  col("run_id") =!= lit(ctx.runId))
+                .limit(1).count() > 0)
+            logger.warn(s"[Pipeline] A previous failed attempt already wrote RAW rows for window " +
+              s"start $s with a different end than ${eOpt.get} (the captured upper drifted between " +
+              "attempts). Appending will DUPLICATE the overlapping range in RAW; the curated merge " +
+              "deduplicates by key, and raw.idempotency_key monitoring can quantify the overlap.")
+        }
+      }
       val sinkType = ConfigUtils.optString(rawConf, "type").getOrElse("hive")
       SinkRegistry.resolve(sinkType).write(spark, accepted, rawConf)
     }

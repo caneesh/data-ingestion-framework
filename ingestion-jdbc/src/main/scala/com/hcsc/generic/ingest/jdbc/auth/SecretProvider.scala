@@ -46,10 +46,22 @@ object SysPropSecretProvider extends SecretProvider {
 
 object FileSecretProvider extends SecretProvider {
   val name = "file"
+  private val logger = org.apache.log4j.Logger.getLogger(getClass.getName)
+
   def resolve(conf: Config): String = {
     val path = java.nio.file.Paths.get(conf.getString("path"))
     if (!java.nio.file.Files.isReadable(path))
       throw new IllegalArgumentException(s"JDBC_002 Secret file '$path' is not readable")
+    // A default-umask secret file (0644) hands the credential to every local
+    // user on a shared edge node — warn, matching the inline-secret warning
+    // severity. Warn-only: non-POSIX filesystems cannot be inspected.
+    try {
+      import java.nio.file.attribute.PosixFilePermission._
+      val perms = java.nio.file.Files.getPosixFilePermissions(path)
+      if (Seq(GROUP_READ, OTHERS_READ).exists(perms.contains))
+        logger.warn(s"[FileSecretProvider] Secret file '$path' is group- or world-readable; " +
+          "restrict it to the running user (chmod 600)")
+    } catch { case _: UnsupportedOperationException => () }
     new String(java.nio.file.Files.readAllBytes(path), "UTF-8").trim
   }
 }

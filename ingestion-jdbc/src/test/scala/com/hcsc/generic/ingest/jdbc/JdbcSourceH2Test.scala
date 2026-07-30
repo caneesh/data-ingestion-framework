@@ -360,6 +360,131 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
     assert(ex.getMessage.contains("clock_zone"))
   }
 
+  test("connection_properties may not override auth-controlled credentials") {
+    // Fix: a plaintext password in connection_properties would silently win
+    // over the vault-resolved credential (properties are applied last).
+    val ex = intercept[IllegalArgumentException] {
+      JdbcSourceConfig.parse(conf(
+        """
+          |table = "members"
+          |connection_properties { password = "plaintext-override" }
+        """.stripMargin))
+    }
+    assert(ex.getMessage.contains("connection_properties may not set"))
+    assert(ex.getMessage.contains("password"))
+
+    val ex2 = intercept[IllegalArgumentException] {
+      JdbcSourceConfig.parse(conf(
+        """
+          |table = "members"
+          |connection_properties { authentication = "ActiveDirectoryPassword" }
+        """.stripMargin))
+    }
+    assert(ex2.getMessage.contains("authentication"))
+  }
+
+  test("parameters blocks under modes that never render them are rejected") {
+    val ex = intercept[IllegalArgumentException] {
+      JdbcSourceConfig.parse(conf(
+        """
+          |mode = "CUSTOM_SQL"
+          |sql = "SELECT * FROM members"
+          |parameters = [ { name = "run_date", type = "DATE", source = "CONFIG", value = "2026-01-01" } ]
+        """.stripMargin))
+    }
+    assert(ex.getMessage.contains("parameters"))
+
+    val ex2 = intercept[IllegalArgumentException] {
+      JdbcSourceConfig.parse(conf(
+        """
+          |mode = "INCREMENTAL"
+          |table = "members"
+          |parameters = [ { name = "run_date", type = "DATE", source = "CONFIG", value = "2026-01-01" } ]
+          |incremental {
+          |  watermark_type = "TIMESTAMP"
+          |  watermark_columns = ["modified_ts"]
+          |  initial_value = "1900-01-01 00:00:00"
+          |}
+        """.stripMargin))
+    }
+    assert(ex2.getMessage.contains("parameters"))
+  }
+
+  test("INCREMENTAL with both table and sql configured is rejected as ambiguous") {
+    val ex = intercept[IllegalArgumentException] {
+      JdbcSourceConfig.parse(conf(
+        """
+          |mode = "INCREMENTAL"
+          |table = "members"
+          |sql = "SELECT * FROM members"
+          |incremental {
+          |  watermark_type = "TIMESTAMP"
+          |  watermark_columns = ["modified_ts"]
+          |  initial_value = "1900-01-01 00:00:00"
+          |}
+        """.stripMargin))
+    }
+    assert(ex.getMessage.contains("not both"))
+  }
+
+  test("parameterized INCREMENTAL sql base renders :name parameters end to end") {
+    // Fix: companion queries (upper capture, NULL probe) previously executed
+    // the RAW base with unrendered :name tokens — a native SQL error on the
+    // very first run of the documented parameterized-incremental feature.
+    val incremental = conf(
+      """
+        |mode = "INCREMENTAL"
+        |sql = "SELECT * FROM members WHERE amount >= :floor"
+        |entity = "param_feed"
+        |parameters = [ { name = "floor", type = "NUMBER", source = "CONFIG", value = "20" } ]
+        |incremental {
+        |  watermark_type = "TIMESTAMP"
+        |  watermark_columns = ["modified_ts"]
+        |  initial_value = "1900-01-01 00:00:00"
+        |  watermark_store { type = "memory" }
+        |}
+      """.stripMargin)
+
+    val df = JdbcSource.read(spark, incremental)
+    val amounts = df.selectExpr("amount").collect().map(_.getInt(0))
+    assert(amounts.nonEmpty && amounts.forall(_ >= 20),
+      s"the :floor parameter must be rendered into base and companion queries (got ${amounts.mkString(",")})")
+    JdbcSource.advanceWatermark(spark, incremental, "param_feed", "run-p1", df)
+    assert(InMemoryWatermarkStore.latest("param_feed").isDefined)
+  }
+
+  test("composite watermark with NULL trailing tie-breakers fails fast (JDBC_006)") {
+    // Fix: at an exact leading-column tie, three-valued logic silently and
+    // PERMANENTLY skips rows whose tie-breaker is NULL — trailing NULLs are
+    // now fatal, not a warning.
+    H2TestDatabase.execute(
+      "DROP TABLE IF EXISTS comp_null",
+      "CREATE TABLE comp_null (id VARCHAR(10), modified_ts TIMESTAMP, seq INT)",
+      "INSERT INTO comp_null VALUES ('R1', '2026-01-01 10:00:00', 1)",
+      "INSERT INTO comp_null VALUES ('R2', '2026-01-01 10:00:00', NULL)"
+    )
+    val composite = conf(
+      """
+        |mode = "INCREMENTAL"
+        |table = "comp_null"
+        |entity = "comp_null_feed"
+        |incremental {
+        |  watermark_type = "COMPOSITE"
+        |  watermark_columns = ["modified_ts", "seq"]
+        |  column_types = ["TIMESTAMP", "NUMERIC"]
+        |  initial_value = "1900-01-01 00:00:00|0"
+        |  watermark_store { type = "memory" }
+        |}
+      """.stripMargin)
+
+    val ex = intercept[IllegalStateException] {
+      JdbcSource.read(spark, composite)
+    }
+    assert(ex.getMessage.contains("JDBC_006"))
+    assert(ex.getMessage.contains("tie-breaker"))
+    H2TestDatabase.execute("DROP TABLE IF EXISTS comp_null")
+  }
+
   test("a stray incremental block under SELECT_QUERY is rejected, not silently ignored") {
     val ex = intercept[IllegalArgumentException] {
       JdbcSourceConfig.parse(conf(

@@ -31,11 +31,14 @@ object RetryPolicy {
         return body
       } catch {
         case NonFatal(e) =>
+          // Driver exception text can echo the raw connection URL,
+          // credentials included — mask before logging.
+          val message = com.hcsc.generic.ingest.jdbc.health.JdbcHealthCheck.sanitizedMessage(e)
           val category = SqlFailureClassifier.classify(e)
           if (!category.retryable) {
             com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_permanent_failure_total")
             logger.error(s"[RetryPolicy] $operation failed with permanent error " +
-              s"(category=$category); not retrying: ${e.getMessage}")
+              s"(category=$category); not retrying: $message")
             throw e
           }
           com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_transient_failure_total")
@@ -44,7 +47,7 @@ object RetryPolicy {
             com.hcsc.generic.ingest.jdbc.JdbcMetrics.increment("jdbc_retry_total")
             val sleepMs = backoffWithJitter(retry.backoffMs, attempt)
             logger.warn(s"[RetryPolicy] $operation attempt $attempt/$maxAttempts failed " +
-              s"(category=$category, ${e.getClass.getSimpleName}: ${e.getMessage}); " +
+              s"(category=$category, ${e.getClass.getSimpleName}: $message); " +
               s"retrying in ${sleepMs}ms")
             Thread.sleep(sleepMs)
           }
@@ -52,7 +55,8 @@ object RetryPolicy {
       }
     }
     throw new RuntimeException(
-      s"JDBC_001 $operation failed after $maxAttempts attempt(s): ${lastError.getMessage}", lastError)
+      s"JDBC_001 $operation failed after $maxAttempts attempt(s): " +
+        com.hcsc.generic.ingest.jdbc.health.JdbcHealthCheck.sanitizedMessage(lastError), lastError)
   }
 
   /** Exponential backoff (base * 2^(attempt-1)) with 50-100% jitter, capped

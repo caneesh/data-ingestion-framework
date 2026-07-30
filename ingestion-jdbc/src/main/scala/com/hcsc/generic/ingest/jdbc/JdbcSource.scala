@@ -68,14 +68,27 @@ object JdbcSource extends Source with WatermarkAdvancing {
       val lower = versioned.map(_.value).getOrElse(WatermarkValue.deserialize(wm.initialValue))
       val version = versioned.map(_.version).getOrElse(0L)
 
+      // Companion queries against a sql base need :name parameters rendered.
+      // The lower bound is known here; UPPER_WATERMARK cannot be (it is what
+      // capture computes) — a base parameterized on it is self-referential
+      // and fails resolution with the parameter's own error.
+      val companionParams =
+        if (cfg.parameters.isEmpty) Seq.empty
+        else cfg.parameters.map(_.resolve(com.hcsc.generic.ingest.jdbc.query.ParameterContext(
+          runId = runId,
+          processingDate = Some(java.time.LocalDate.now.toString),
+          lastWatermark = Some(lower.serialized),
+          upperWatermark = None,
+          pipelineParameters = cfg.pipelineParameters)))
+
       if (cfg.mode == JdbcMode.Incremental) {
         // First run for this entity: verify no rows carry NULL watermark
         // values — such rows are invisible to `col > lower` forever.
-        if (versioned.isEmpty && !wm.allowNullWatermark) validateNoNullWatermarks(cfg, wm)
+        if (versioned.isEmpty && !wm.allowNullWatermark) validateNoNullWatermarks(cfg, wm, companionParams)
 
         // Bounded window: capture the source's upper bound BEFORE the read
         // (MAX of the watermark column, or the source clock for SOURCE_CLOCK).
-        val upper = captureUpper(cfg, wm)
+        val upper = captureUpper(cfg, wm, companionParams)
         readWindows.put(windowKey(entity, runId), ReadWindow(lower, upper, version))
         contextLower = Some(lower.serialized)
         contextUpper = upper.map(_.serialized)
@@ -104,8 +117,8 @@ object JdbcSource extends Source with WatermarkAdvancing {
         // FULL_TABLE with an incremental block and an EMPTY store: unfiltered
         // read, but the captured cutoff SEEDS the watermark on success (the
         // one-time FULL -> INCR handoff).
-        if (!wm.allowNullWatermark) validateNoNullWatermarks(cfg, wm)
-        val upper = captureUpper(cfg, wm)
+        if (!wm.allowNullWatermark) validateNoNullWatermarks(cfg, wm, companionParams)
+        val upper = captureUpper(cfg, wm, companionParams)
         readWindows.put(windowKey(entity, runId), ReadWindow(lower, upper, version))
         contextLower = Some(lower.serialized)
         contextUpper = upper.map(_.serialized)
@@ -140,7 +153,7 @@ object JdbcSource extends Source with WatermarkAdvancing {
     // task retry; whole-run failures are handled by pipeline restart (the
     // watermark never advanced, so replay re-extracts the same window).
     val df = RetryPolicy.withRetries(s"JDBC schema fetch (${cfg.dialect.name})", cfg.retry, logger) {
-      buildReader(spark, cfg, dbtable)
+      buildReader(spark, cfg, dbtable, resolvedParameters)
     }
 
     JdbcMetrics.increment("jdbc_partitions_total", df.rdd.getNumPartitions)
@@ -149,7 +162,12 @@ object JdbcSource extends Source with WatermarkAdvancing {
     applyContract(df, sourceConf)
   }
 
-  private def buildReader(spark: SparkSession, cfg: JdbcSourceConfig, dbtable: String): DataFrame = {
+  private def buildReader(
+    spark: SparkSession,
+    cfg: JdbcSourceConfig,
+    dbtable: String,
+    resolvedParameters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameter]
+  ): DataFrame = {
     cfg.partitioning.strategy match {
       case PartitionStrategy.Predicates =>
         // Explicit per-partition predicates via the spark.read.jdbc API —
@@ -175,7 +193,7 @@ object JdbcSource extends Source with WatermarkAdvancing {
 
         val bounds: Option[(Long, Long)] = strategy match {
           case PartitionStrategy.MinMaxQuery =>
-            discoverBounds(cfg) // stale static bounds problem: discover per run
+            discoverBounds(cfg, resolvedParameters) // stale static bounds problem: discover per run
           case _ =>
             for (lo <- cfg.partitioning.lowerBound; hi <- cfg.partitioning.upperBound) yield (lo, hi)
         }
@@ -195,12 +213,14 @@ object JdbcSource extends Source with WatermarkAdvancing {
 
   /** MIN_MAX_QUERY strategy: driver-side bound discovery so partition
     * strides track the actual key range instead of stale static config. */
-  private def discoverBounds(cfg: JdbcSourceConfig): Option[(Long, Long)] = {
+  private def discoverBounds(
+    cfg: JdbcSourceConfig,
+    resolvedParameters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameter]
+  ): Option[(Long, Long)] = {
     val column = cfg.partitioning.partitionColumn.get
-    val baseFrom = (cfg.table, cfg.sql) match {
-      case (Some(t), _)    => t
-      case (None, Some(s)) => s"($s) base"
-      case _ => return None
+    val baseFrom = QueryBuilder.validatedBase(cfg, resolvedParameters) match {
+      case Some(base) => base
+      case None => return None
     }
     // Same filter scope as the extraction query, so discovered strides track
     // the rows that will actually be read (not the whole table).
@@ -208,7 +228,9 @@ object JdbcSource extends Source with WatermarkAdvancing {
     val quoted = cfg.dialect.quoteQualified(column)
     val sql = s"SELECT MIN($quoted), MAX($quoted) FROM $baseFrom$whereClause"
 
-    DriverQueries.firstRow(cfg, sql, logger) match {
+    // withRetry=false: this runs inside buildReader's outer retry wrapper —
+    // its own retry loop would multiply attempts to maxAttempts squared.
+    DriverQueries.firstRow(cfg, sql, logger, withRetry = false) match {
       case Some(Seq(Some(lo), Some(hi))) =>
         val (l, h) = (BigDecimal(lo).toLong, BigDecimal(hi).toLong)
         if (l < h) {
@@ -247,11 +269,14 @@ object JdbcSource extends Source with WatermarkAdvancing {
     * silently and permanently. Verified once per entity, before the first
     * window is established, via COUNT(1) vs COUNT(column) (COUNT(col)
     * excludes NULLs), scoped to the same filters as the extraction query. */
-  private def validateNoNullWatermarks(cfg: JdbcSourceConfig, wm: WatermarkConfig): Unit = {
-    val baseFrom = (cfg.table, cfg.sql) match {
-      case (Some(t), _)    => t
-      case (None, Some(s)) => s"($s) base"
-      case _ => return
+  private def validateNoNullWatermarks(
+    cfg: JdbcSourceConfig,
+    wm: WatermarkConfig,
+    companionParams: Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameter]
+  ): Unit = {
+    val baseFrom = QueryBuilder.validatedBase(cfg, companionParams) match {
+      case Some(base) => base
+      case None => return
     }
     val whereClause = QueryBuilder.filterWhereClause(cfg)
     val perColumn = wm.columns.map(c => s"COUNT(${cfg.dialect.quoteIdentifier(c)})").mkString(", ")
@@ -260,10 +285,13 @@ object JdbcSource extends Source with WatermarkAdvancing {
     DriverQueries.firstRow(cfg, sql, logger).foreach { row =>
       val counts = row.map(_.map(v => BigDecimal(v).toLong).getOrElse(0L))
       val total = counts.head
-      // Lexicographic composite predicates extract any row whose LEADING
-      // column is populated (the first disjunct is `c1 > v1` alone), so
-      // only leading-column NULLs cause silent loss; NULLs in trailing
-      // tie-breakers merely weaken tie-breaking and warrant a warning.
+      // NULL in ANY watermark column is fatal, trailing tie-breakers
+      // included: at an exact leading-column tie, SQL three-valued logic
+      // turns `(c1 > v1) OR (c1 = v1 AND c2 > v2)` into NULL for a row with
+      // NULL c2 — the row is excluded from that window, and once the
+      // watermark advances past the tied value it becomes unreachable
+      // FOREVER. The tie case is precisely what a tie-breaker exists for,
+      // so "extractable via the leading column" does not hold there.
       val leadingNulls = total - counts(1)
       val trailingNulls = if (counts.size > 2) counts.drop(2).map(total - _).max else 0L
       if (leadingNulls > 0)
@@ -273,9 +301,12 @@ object JdbcSource extends Source with WatermarkAdvancing {
             "(silent permanent data loss). Fix the source data, filter NULL rows explicitly, " +
             "or set incremental.allow_null_watermark = true to accept the loss.")
       if (trailingNulls > 0)
-        logger.warn(s"[JdbcSource] $trailingNulls row(s) have NULL in trailing watermark " +
-          s"tie-breaker column(s) [${wm.columns.tail.mkString(",")}]; rows stay extractable via " +
-          "the leading column, but equal-timestamp tie-breaking is weakened for them")
+        throw new IllegalStateException(
+          s"JDBC_006 $trailingNulls row(s) in scope have NULL in trailing watermark tie-breaker " +
+            s"column(s) [${wm.columns.tail.mkString(",")}]; at an exact leading-column tie such " +
+            "rows are silently and PERMANENTLY skipped by the composite predicate. Fix the " +
+            "source data, filter NULL rows explicitly, or set " +
+            "incremental.allow_null_watermark = true to accept the loss.")
     }
   }
 
@@ -290,12 +321,13 @@ object JdbcSource extends Source with WatermarkAdvancing {
     * rows present means the watermark column carries NULLs — those rows can
     * never be extracted by `col > lower`, so this fails loudly (JDBC_006)
     * instead of silently degrading to an unbounded, non-reproducible window. */
-  private def captureUpper(cfg: JdbcSourceConfig, wm: WatermarkConfig): Option[WatermarkValue] = {
-    val baseFrom = (cfg.table, cfg.sql) match {
-      case (Some(t), _)   => t
-      case (None, Some(s)) => s"($s) base"
-      case _ => throw new IllegalArgumentException("JDBC_003 INCREMENTAL requires table or sql")
-    }
+  private def captureUpper(
+    cfg: JdbcSourceConfig,
+    wm: WatermarkConfig,
+    companionParams: Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameter]
+  ): Option[WatermarkValue] = {
+    val baseFrom = QueryBuilder.validatedBase(cfg, companionParams).getOrElse(
+      throw new IllegalArgumentException("JDBC_003 INCREMENTAL requires table or sql"))
     // Must match the extraction query's filters (structured + legacy where):
     // capturing MAX over unfiltered rows advances the watermark past rows the
     // filtered read never extracts — permanent silent data loss.

@@ -202,19 +202,40 @@ object JdbcSourceConfig {
         if (table.isEmpty) fail(s"source.table is required for mode $mode")
         if (source.hasPath("columns") || where.isDefined || source.hasPath("filters"))
           fail("FULL_TABLE mode does not apply columns/where/filters; use SELECT_QUERY or INCREMENTAL")
+        rejectDeadParameters(mode, source)
       case JdbcMode.SelectQuery =>
         if (table.isEmpty) fail(s"source.table is required for mode $mode")
         rejectStrayIncremental(mode, source)
+        rejectDeadParameters(mode, source)
       case JdbcMode.CustomSql =>
         if (sql.isEmpty) fail("source.sql is required for mode CUSTOM_SQL")
         rejectStrayIncremental(mode, source)
+        rejectDeadParameters(mode, source)
       case JdbcMode.SqlTemplate =>
         if (sql.isEmpty) fail("source.sql (the template) is required for mode SQL_TEMPLATE")
         rejectStrayIncremental(mode, source)
       case JdbcMode.Incremental =>
         if (table.isEmpty && sql.isEmpty) fail("source.table or source.sql is required for mode INCREMENTAL")
+        // Both configured is ambiguous: every consumer silently prefers
+        // table, and the sql (with its parameters) would be dead intent.
+        if (table.isDefined && sql.isDefined)
+          fail("INCREMENTAL accepts source.table OR source.sql, not both — the sql would be " +
+            "silently ignored in favor of the table")
+        if (table.isDefined && source.hasPath("parameters"))
+          fail("source.parameters are only rendered for SQL_TEMPLATE and INCREMENTAL sql bases; " +
+            "a table-based INCREMENTAL feed never substitutes them — remove the block or switch " +
+            "to a sql base")
     }
   }
+
+  /** Parameters are rendered only where a template is rendered (SQL_TEMPLATE
+    * and INCREMENTAL sql bases); anywhere else they would be parsed,
+    * validated, and then silently dropped — dead configuration masquerading
+    * as behavior. */
+  private def rejectDeadParameters(mode: String, source: Config): Unit =
+    if (source.hasPath("parameters"))
+      fail(s"source.parameters are not rendered under mode $mode (only SQL_TEMPLATE and " +
+        "INCREMENTAL sql bases substitute :name placeholders); remove the block or change mode")
 
   /** An incremental block is only consumed by INCREMENTAL (and FULL_TABLE,
     * for one-time watermark seeding); anywhere else it is leftover intent
@@ -297,9 +318,24 @@ object JdbcSourceConfig {
     * rejected unless the feed explicitly opts in with
     * `allow_insecure_tls = true` — and even then they are logged loudly.
     */
+  /** Connection-property keys owned by source.auth: allowing them here would
+    * let a plaintext value in connection_properties silently override the
+    * vault-resolved credential (or re-attach a static credential to a
+    * passwordless MSI/Entra mode) — the properties are applied LAST at every
+    * consumer, so the override would win with no warning. */
+  private val AuthReservedProperties =
+    Set("user", "password", "accesstoken", "authentication", "msiclientid")
+
   private def userConnectionProperties(source: Config): Map[String, String] = {
     val props = ConfigUtils.optConfig(source, "connection_properties")
       .map(ConfigUtils.flatStringMap).getOrElse(Map.empty)
+
+    val reservedCollisions = props.keys
+      .filter(k => AuthReservedProperties.contains(k.toLowerCase)).toSeq.sorted
+    if (reservedCollisions.nonEmpty)
+      fail(s"connection_properties may not set ${reservedCollisions.mkString(", ")}; these are " +
+        "controlled by source.auth and a value here would silently override the resolved " +
+        "credential. Configure them through source.auth / a secret provider instead")
 
     def truthy(v: String) = {
       val t = v.trim.toLowerCase

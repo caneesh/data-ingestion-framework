@@ -5,13 +5,36 @@ import com.hcsc.generic.ingest.jdbc.dialect.JdbcDialect
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.functions.col
 
-/** A watermark value; composite watermarks carry one value per column. */
+/** A watermark value; composite watermarks carry one value per column.
+  *
+  * Serialization escapes the '|' delimiter (and '\'): STRING tie-break
+  * values come from live source rows, and an unescaped pipe would poison
+  * the stored watermark permanently (arity mismatch JDBC_004 on every
+  * later run). Legacy stored values without escapes deserialize
+  * identically. Same scheme as extraction.Boundary.BoundaryValue. */
 final case class WatermarkValue(values: Seq[String]) {
-  def serialized: String = values.mkString("|")
+  def serialized: String =
+    values.map(v => v.replace("\\", "\\\\").replace("|", "\\|")).mkString("|")
 }
 
 object WatermarkValue {
-  def deserialize(s: String): WatermarkValue = WatermarkValue(s.split("\\|", -1).toSeq)
+  def deserialize(s: String): WatermarkValue = {
+    val parts = scala.collection.mutable.ArrayBuffer.empty[String]
+    val current = new StringBuilder
+    var i = 0
+    while (i < s.length) {
+      s.charAt(i) match {
+        case '\\' if i + 1 < s.length =>
+          current.append(s.charAt(i + 1)); i += 2
+        case '|' =>
+          parts += current.toString; current.clear(); i += 1
+        case c =>
+          current.append(c); i += 1
+      }
+    }
+    parts += current.toString
+    WatermarkValue(parts.toSeq)
+  }
 }
 
 /**
@@ -113,7 +136,7 @@ object Watermarks {
 
   /** Overlap semantics per type: TIMESTAMP/DATETIMEOFFSET seconds, DATE
     * days, NUMERIC/ROWVERSION subtraction. */
-  private def applyOverlap(columnType: String, value: String, overlap: Option[BigDecimal]): String =
+  private[watermark] def applyOverlap(columnType: String, value: String, overlap: Option[BigDecimal]): String =
     overlap match {
       case None => value
       case Some(amount) => columnType match {
@@ -130,10 +153,27 @@ object Watermarks {
           throw new IllegalArgumentException(
             "JDBC_004 overlap is not supported for STRING watermarks (no arithmetic ordering)")
         case _ =>
-          val ts = parseTimestamp(value)
-          new java.sql.Timestamp(ts.getTime - (amount * 1000).toLong).toString
+          // Zone-naive arithmetic (like the DATE branch): epoch-millis math
+          // through java.sql.Timestamp re-renders wall-clock fields in the
+          // JVM default zone and can shift by an hour when the overlap
+          // window straddles a DST transition. Rendered directly from the
+          // LocalDateTime — a Timestamp round-trip would reintroduce the
+          // zone dependency for wall times skipped by a transition.
+          formatLocal(parseTimestamp(value).toLocalDateTime
+            .minusNanos((amount * 1000000000L).toLongExact))
       }
     }
+
+  /** Timestamp-toString-compatible rendering of a LocalDateTime (zone-free):
+    * 'yyyy-MM-dd HH:mm:ss[.fraction]' with trailing zeros trimmed. */
+  private[watermark] def formatLocal(ldt: java.time.LocalDateTime): String = {
+    val base = ldt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+    if (ldt.getNano == 0) s"$base.0"
+    else {
+      val fraction = f"${ldt.getNano}%09d".reverse.dropWhile(_ == '0').reverse
+      s"$base.$fraction"
+    }
+  }
 
   /** SQL literal with parse validation — the value round-trips through a
     * typed representation, so stored garbage cannot become SQL. */

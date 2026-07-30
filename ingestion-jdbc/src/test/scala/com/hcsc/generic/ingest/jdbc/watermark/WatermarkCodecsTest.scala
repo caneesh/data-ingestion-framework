@@ -85,4 +85,42 @@ class WatermarkCodecsTest extends AnyFunSuite {
       WatermarkValue(Seq("2026-01-01", "FF")))
     assert(p == "(([d] > '2026-01-01') OR ([d] = '2026-01-01' AND [rv] > 0x00000000000000FF))")
   }
+
+  test("WatermarkValue round-trips values containing the delimiter and backslashes") {
+    // Fix: an unescaped '|' in a composite STRING value corrupted the stored
+    // arity and jammed the entity with JDBC_004 on every later run.
+    val tricky = Seq(
+      WatermarkValue(Seq("2026-01-01 10:00:00.0", "REGION|042")),
+      WatermarkValue(Seq("a\\b", "c|d", "trailing\\")),
+      WatermarkValue(Seq("", "|", "\\|"))
+    )
+    tricky.foreach { v =>
+      val roundTripped = WatermarkValue.deserialize(v.serialized)
+      assert(roundTripped == v, s"round-trip failed for $v via '${v.serialized}'")
+    }
+
+    // Legacy stored values without escapes deserialize identically
+    assert(WatermarkValue.deserialize("2026-01-01 10:00:00.0|42") ==
+      WatermarkValue(Seq("2026-01-01 10:00:00.0", "42")))
+  }
+
+  test("TIMESTAMP overlap arithmetic is zone-naive across DST transitions") {
+    // Fix: epoch-millis subtraction through java.sql.Timestamp re-rendered
+    // wall-clock fields in the JVM default zone — an overlap spanning the
+    // spring-forward gap shifted by an hour.
+    val prevTz = java.util.TimeZone.getDefault
+    java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("America/Chicago"))
+    try {
+      // 2026-03-08 02:00 does not exist in America/Chicago (spring forward);
+      // zone-naive subtraction must still produce exactly 03:30 - 3600s = 02:30.
+      val result = Watermarks.applyOverlap(
+        WatermarkType.Timestamp, "2026-03-08 03:30:00.5", Some(BigDecimal(3600)))
+      assert(result == "2026-03-08 02:30:00.5", s"got $result")
+
+      // Fractional seconds survive; no DST involvement either
+      val plain = Watermarks.applyOverlap(
+        WatermarkType.Timestamp, "2026-06-15 10:00:00.123", Some(BigDecimal(90)))
+      assert(plain == "2026-06-15 09:58:30.123", s"got $plain")
+    } finally java.util.TimeZone.setDefault(prevTz)
+  }
 }

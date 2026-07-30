@@ -86,4 +86,33 @@ class JdbcLogSanitizationTest extends AnyFunSuite with SharedSparkSession {
     assert(logs.contains("DIAGNOSTIC"))
     assert(logs.contains(SensitiveMarker), "diagnostic mode logs the full dbtable")
   }
+
+  test("URL masking covers brace-escaped passwords (SQL Server convention)") {
+    import com.hcsc.generic.ingest.jdbc.health.JdbcHealthCheck.sanitized
+    // Fix: [^;&]* stopped at the first embedded ';' and leaked the tail.
+    val braced = "jdbc:sqlserver://host;databaseName=db;password={my;secret&tail};encrypt=true"
+    val masked = sanitized(braced)
+    assert(!masked.contains("my;secret"), masked)
+    assert(!masked.contains("secret&tail"), masked)
+    assert(masked.contains("password=***"))
+    assert(masked.contains("encrypt=true"), "non-secret properties stay readable")
+
+    val plain = sanitized("jdbc:mysql://host/db?user=x&pwd=topsecret&ssl=true")
+    assert(!plain.contains("topsecret"), plain)
+    assert(plain.contains("ssl=true"))
+  }
+
+  test("driver exception messages are masked before logging") {
+    import com.hcsc.generic.ingest.jdbc.health.JdbcHealthCheck.sanitizedMessage
+    // Fix: the JDK's 'No suitable driver found for <url>' echoes the raw URL,
+    // credentials included, and previously reached logs unsanitized.
+    val e = new java.sql.SQLException(
+      "No suitable driver found for jdbc:weird://h;password=hunter2;x=1")
+    val masked = sanitizedMessage(e)
+    assert(!masked.contains("hunter2"), masked)
+    assert(masked.contains("password=***"))
+
+    assert(sanitizedMessage(new RuntimeException(null: String)) == "RuntimeException",
+      "null messages must not NPE")
+  }
 }

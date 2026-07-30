@@ -78,6 +78,31 @@ object QueryBuilder {
     */
   def filterWhereClause(cfg: JdbcSourceConfig): String = whereClause(cfg, None)
 
+  /**
+    * Validated (and, for sql bases, parameter-rendered) base relation for
+    * driver-side companion queries — upper watermark capture, NULL-watermark
+    * probes, MIN/MAX bound discovery. Companion queries MUST pass through
+    * the same guardrails as the extraction query itself: table-name
+    * validation, single-statement SQL validation, and :name template
+    * rendering — a raw base with unrendered :parameters is not executable
+    * SQL, and an unvalidated one bypasses the module's injection guards.
+    */
+  def validatedBase(cfg: JdbcSourceConfig, resolvedParameters: Seq[QueryParameter]): Option[String] =
+    (cfg.table, cfg.sql) match {
+      case (Some(t), _) =>
+        validateTableName(t)
+        Some(t)
+      case (None, Some(s)) =>
+        val params =
+          if (resolvedParameters.nonEmpty) resolvedParameters
+          else cfg.parameters.map(_.resolveStatic())
+        val rendered =
+          if (cfg.parameters.isEmpty) s
+          else QueryTemplate.render(s, params, cfg.dialect)
+        Some(s"(${SqlStatementValidator.validate(rendered)}) base")
+      case _ => None
+    }
+
   /** SELECT_QUERY keeps the historical plain rendering for a lone legacy
     * where; anything structured (or multiple predicates) renders each
     * predicate parenthesized and AND-combined. */

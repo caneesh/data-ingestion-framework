@@ -13,9 +13,24 @@ object DriverQueries {
 
   /** Executes sql and returns the first row's values as strings (None when
     * no row / all-null). java.sql temporal and numeric types are converted
-    * through their canonical toString so watermark parsing round-trips. */
-  def firstRow(cfg: JdbcSourceConfig, sql: String, logger: Logger): Option[Seq[Option[String]]] =
-    RetryPolicy.withRetries("driver query", cfg.retry, logger) {
+    * through their canonical toString so watermark parsing round-trips.
+    *
+    * withRetry=false for calls made from an ALREADY-retried context (e.g.
+    * bound discovery inside the outer schema-fetch retry) — nesting two
+    * retry loops multiplies attempts to maxAttempts squared. */
+  def firstRow(
+    cfg: JdbcSourceConfig,
+    sql: String,
+    logger: Logger,
+    withRetry: Boolean = true
+  ): Option[Seq[Option[String]]] = {
+    def once(): Option[Seq[Option[String]]] = execute(cfg, sql)
+    if (withRetry) RetryPolicy.withRetries("driver query", cfg.retry, logger)(once())
+    else once()
+  }
+
+  private def execute(cfg: JdbcSourceConfig, sql: String): Option[Seq[Option[String]]] =
+    {
       Class.forName(cfg.driver)
       val props = new Properties()
       cfg.user.foreach(props.setProperty("user", _))

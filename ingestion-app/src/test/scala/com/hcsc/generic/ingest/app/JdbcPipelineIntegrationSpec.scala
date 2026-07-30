@@ -109,6 +109,7 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
        |  table = claims
        |  path = "${tempDir.resolve("raw_claims").toAbsolutePath}"
        |  format = parquet
+       |  record_hash = true
        |}
        |curated {
        |  enabled = true
@@ -116,7 +117,7 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
        |  table = claims
        |  path = "${tempDir.resolve("curated_claims").toAbsolutePath}"
        |  format = parquet
-       |  merge { keys = [] }
+       |  merge { keys = ["claim_id"] }
        |  $extraCurated
        |}
     """.stripMargin)
@@ -145,6 +146,22 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(meta.getString(0).startsWith("2026-01-02 09:00:00"), "extract_start_ts = previous watermark")
     assert(meta.getString(1).startsWith("2026-01-03 09:00:00"), "extract_end_ts = captured upper")
     assert(meta.getString(2) == "claims")
+
+    // raw.record_hash = true: every RAW row carries the business fingerprint
+    val hash = spark.table("j_raw.claims").select("record_hash").collect().map(_.getString(0))
+    assert(hash.forall(h => h != null && h.length == 64), "record_hash must be a SHA-256 hex string")
+  }
+
+  test("configuration compatibility (CFG) failures stop the run before extraction") {
+    // Incremental JDBC into a keyless state-deriving curated layer would
+    // keep only the latest window (CFG_009).
+    val keyless = feedConf().withValue("curated.merge.keys",
+      com.typesafe.config.ConfigValueFactory.fromIterable(java.util.Collections.emptyList[String]()))
+    val e = intercept[IllegalStateException] {
+      new IngestPipeline(spark, keyless,
+        Cli(entity = entity, mode = "FULL", runId = Some("jrun-cfg")), logger).run()
+    }
+    assert(e.getMessage.contains("CFG_009"))
   }
 
   test("failed publish does not advance the watermark; replay picks the rows up again") {

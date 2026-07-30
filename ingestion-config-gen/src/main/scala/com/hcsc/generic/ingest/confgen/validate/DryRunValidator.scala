@@ -50,7 +50,10 @@ object DryRunValidator {
     def missing(path: String) =
       if (feed.hasPath(path)) None else Some(s"$path is required")
     Seq(missing("entity"), missing("source.type"), missing("raw.database"),
-      missing("raw.table"), missing("raw.path")).flatten
+      missing("raw.table"), missing("raw.path")).flatten ++
+      // Same cross-section rules the pipeline enforces at startup
+      // (CFG_001..CFG_009): a generated feed must never fail there.
+      com.hcsc.generic.ingest.config.FeedCompatibilityValidator.validate(feed)
   }
 
   // ---------------------------------------------------------------------------

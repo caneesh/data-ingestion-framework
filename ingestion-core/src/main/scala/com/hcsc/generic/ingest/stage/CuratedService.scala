@@ -396,8 +396,24 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           val src = CuratedService.MergeProvenanceColumn
           require(!target.columns.exists(_.equalsIgnoreCase(src)),
             s"Target $fullTable contains reserved column '$src'")
+          // record_hash no-change pre-filter: identical business content must
+          // not churn curated rows (or restamp their audit columns) just
+          // because the source touched a timestamp. Filtered challengers
+          // leave only the target row in the contest, so the key lands in
+          // ignoredCount through the normal winner arithmetic.
+          val hashCol = target.columns
+            .find(_.equalsIgnoreCase(com.hcsc.generic.ingest.transform.RecordHash.Column))
+          val challengers = hashCol match {
+            case Some(h) =>
+              val kh = keyCols :+ h
+              val tgtKeyHash = contested.select(kh.map(col): _*).distinct()
+                .toDF(kh.map(k => s"__th_$k"): _*)
+              val sameContent = kh.map(k => col(k) <=> col(s"__th_$k")).reduce(_ && _)
+              alignedIncoming.join(tgtKeyHash, sameContent, "left_anti")
+            case None => alignedIncoming
+          }
           val union = contested.withColumn(src, lit("T"))
-            .unionByName(alignedIncoming.withColumn(src, lit("I")))
+            .unionByName(challengers.withColumn(src, lit("I")))
           val orderCols = (f.column +: f.tieBreakers)
             .flatMap(o => union.columns.find(_.equalsIgnoreCase(o)))
             .map(c => col(c).desc_nulls_last) :+ col(src).desc // 'T' > 'I': exact ties keep the target

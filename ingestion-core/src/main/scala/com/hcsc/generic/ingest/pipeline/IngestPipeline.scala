@@ -89,6 +89,7 @@ final class IngestPipeline(
     val held = if (ctx.dryRun) None else lock.map { l => l.acquire(ctx.entity, ctx.runId); l }
     try {
       requireLedger()
+      validateFeedCompatibility()
       val rawConf = feedConf.getConfig("raw")
       val database = ConfigUtils.sqlIdentifier(rawConf, "database")
       val table = ConfigUtils.sqlIdentifier(rawConf, "table")
@@ -199,10 +200,22 @@ final class IngestPipeline(
           "resume silently degrades into a full re-run")
   }
 
+  /** Startup cross-section validation (CFG_001..CFG_009): configuration
+    * combinations that are individually valid but jointly wrong fail here,
+    * before any extraction, instead of corrupting data mid-pipeline. */
+  private def validateFeedCompatibility(): Unit = {
+    val problems = com.hcsc.generic.ingest.config.FeedCompatibilityValidator.validate(feedConf)
+    if (problems.nonEmpty)
+      throw new IllegalStateException(
+        s"Feed configuration for '${ctx.entity}' failed compatibility validation:\n" +
+          problems.map(p => s"  - $p").mkString("\n"))
+  }
+
   private def runInternal(): Unit = {
     logger.info(s"==== Pipeline start entity=${ctx.entity} mode=${ctx.mode} runId=${ctx.runId} " +
       s"dryRun=${ctx.dryRun} resume=${ctx.resume} ====")
     requireLedger()
+    validateFeedCompatibility()
 
     val rawConf = feedConf.getConfig("raw")
     val curatedConf =
@@ -396,7 +409,14 @@ final class IngestPipeline(
       extractStart = window.map(_._1),
       extractEnd = window.flatMap(_._2)
     )
-    val withMeta0 = RawMetadata.add(df0, ctx.rawFlag, lineage)
+    val withMetaBase = RawMetadata.add(df0, ctx.rawFlag, lineage)
+    // Change-detection fingerprint (opt-in raw.record_hash = true): stamped
+    // after the metadata columns so only business content is hashed; the
+    // curated merge uses it to skip no-change rewrites.
+    val withMeta0 =
+      if (ConfigUtils.optBoolean(rawConf, "record_hash").getOrElse(false))
+        com.hcsc.generic.ingest.transform.RecordHash.stamp(withMetaBase, contract)
+      else withMetaBase
     val withMeta1 = ctx.fileIdFilter match {
       case Some(fileId) if staged.isEmpty => withMeta0.filter(col("file_id") === lit(fileId))
       case _ => withMeta0

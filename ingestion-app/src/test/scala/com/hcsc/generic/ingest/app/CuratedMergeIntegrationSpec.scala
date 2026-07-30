@@ -308,6 +308,45 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   // ---------------------------------------------------------------------------
+  // 6c: record_hash change detection — no-change rows never churn curated
+  // ---------------------------------------------------------------------------
+
+  test("identical record_hash skips the rewrite even when freshness advanced") {
+    val hashConf = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_hash
+        |format = parquet
+        |merge {
+        |  keys = ["member_id"]
+        |  freshness { column = "src_modified_ts", tie_breakers = ["src_seq"] }
+        |}
+        |""".stripMargin)
+    val svc = new CuratedService(spark, hashConf)
+    def hashed(rows: Seq[(String, String, String, Int)], hash: String) =
+      batch(rows).withColumn("record_hash", org.apache.spark.sql.functions.lit(hash))
+
+    // Seed
+    svc.process(hashed(Seq(("H1", "original", "2026-01-01 10:00:00", 1)), "hashA"),
+      "INCR", ctx("mrun-rh-1"), None, None)
+
+    // Same content (same hash), newer freshness: the source touched the
+    // timestamp without changing data — curated must not churn.
+    val r2 = svc.process(hashed(Seq(("H1", "original", "2026-01-01 12:00:00", 2)), "hashA"),
+      "INCR", ctx("mrun-rh-2"), None, None).get
+    assert(r2.ignoredCount == 1)
+    assert(r2.updateCount == 0)
+    assert(curatedRowIn("members_hash", "H1").getAs[String]("last_modified_op") == "I",
+      "a no-change row must not be restamped as updated")
+
+    // Different content (new hash), newer freshness: real update
+    val r3 = svc.process(hashed(Seq(("H1", "changed", "2026-01-01 13:00:00", 3)), "hashB"),
+      "INCR", ctx("mrun-rh-3"), None, None).get
+    assert(r3.updateCount == 1)
+    assert(curatedRowIn("members_hash", "H1").getAs[String]("name") == "changed")
+  }
+
+  // ---------------------------------------------------------------------------
   // 7b: drift hardening — casts must not silently null values (CUR_002)
   // ---------------------------------------------------------------------------
 

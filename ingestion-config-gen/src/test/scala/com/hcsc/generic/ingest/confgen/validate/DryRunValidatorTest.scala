@@ -123,4 +123,22 @@ class DryRunValidatorTest extends AnyFunSuite {
     assert(sql.contains("\"claim_id\" > 100"), sql)
     assert(sql.contains("first window"), sql)
   }
+
+  test("cross-section compatibility rules (CFG) surface in the dry run") {
+    // A JDBC incremental block on a FILE source is silently ignored at
+    // runtime — the generator must reject it (CFG_008).
+    val feed = com.typesafe.config.ConfigFactory.parseString(
+      """
+        |entity = "member"
+        |source {
+        |  type = "file"
+        |  path = "/data/in/*.csv"
+        |  incremental { watermark_type = "TIMESTAMP" }
+        |}
+        |raw { database = "raw_db", table = "member", path = "/tmp/raw" }
+        |""".stripMargin)
+    val report = DryRunValidator.validate(feed)
+    assert(!report.ok)
+    assert(report.errors.exists(_.contains("CFG_008")), report.errors.mkString("; "))
+  }
 }

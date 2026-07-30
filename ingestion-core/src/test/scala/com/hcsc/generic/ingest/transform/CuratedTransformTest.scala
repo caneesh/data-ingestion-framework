@@ -265,6 +265,37 @@ class CuratedTransformTest extends AnyFunSuite with SharedSparkSession {
     assert(e.getMessage.contains("nonexistent_col"))
   }
 
+  test("record_hash is stable across column order and distinguishes null from empty") {
+    import spark.implicits._
+    val a = Seq(("x", "y")).toDF("c1", "c2")
+    val b = Seq(("y", "x")).toDF("c2", "c1") // same content, different column order
+    val hashOf = (df: org.apache.spark.sql.DataFrame) =>
+      RecordHash.stamp(df, None).select("record_hash").as[String].collect().head
+    assert(hashOf(a) == hashOf(b), "column order must not shift the hash")
+
+    val nullRow = Seq((Option.empty[String], "y")).toDF("c1", "c2")
+    val emptyRow = Seq((Some(""), "y")).toDF("c1", "c2")
+    assert(hashOf(nullRow) != hashOf(emptyRow), "null and empty string must hash differently")
+  }
+
+  test("record_hash with a contract fingerprints business columns only") {
+    import spark.implicits._
+    val contract = com.hcsc.generic.ingest.schema.SchemaContract.parse(
+      com.typesafe.config.ConfigFactory.parseString(
+        """schema {
+          |  version = "1.0"
+          |  columns = [
+          |    { name = "member_id", type = "string" },
+          |    { name = "audit_note", type = "string", category = "audit", required = false }
+          |  ]
+          |}""".stripMargin)).get
+    val df1 = Seq(("M1", "noteA")).toDF("member_id", "audit_note")
+    val df2 = Seq(("M1", "noteB")).toDF("member_id", "audit_note")
+    val hashOf = (df: org.apache.spark.sql.DataFrame) =>
+      RecordHash.stamp(df, Some(contract)).select("record_hash").as[String].collect().head
+    assert(hashOf(df1) == hashOf(df2), "non-business columns must not shift the hash")
+  }
+
   test("splitNullKeys returns dropped rows separately for quarantine") {
     import spark.implicits._
     val df = Seq(Some("Alice"), None, Some("  ")).toDF("name")

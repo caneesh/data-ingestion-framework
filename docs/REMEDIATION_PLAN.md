@@ -28,8 +28,17 @@ C1–C12, S1–S16, backlog items 1–21.
 > as `IngestPipeline.curatedReplay` — governed, locked, audited, never the
 > watermark; synthetic-RunContext overloads deleted), 2.6
 > (`rejects.payload = FULL|HASHED|KEYS_ONLY` with a loud FULL warning;
-> drafts exclude secret answers and are written 0600). Phase 3 remains
-> open, **except** item 3.3/backlog #18's tooling half
+> drafts exclude secret answers and are written 0600).
+>
+> **Remote-framework adoption (2026-07-29):** `FeedCompatibilityValidator`
+> (CFG_001..009) is wired into pipeline startup (runInternal and
+> curatedReplay) and the config generator's dry run; and Phase 3 item #17
+> is implemented — `RecordHash` (hash recipe identical to
+> `raw.RawMetadataStamper`: case-insensitively sorted business columns,
+> U+0001 separator, U+0000 null marker, SHA-256) stamps RAW rows when
+> `raw.record_hash = true` and the freshness merge skips rewriting (and
+> restamping) rows whose key+hash already match the target. Phase 3
+> otherwise remains open, **except** item 3.3/backlog #18's tooling half
 > (2026-07-29): the config generator now emits the schema contract as a
 > separate `<entity>-schema.conf` via HOCON `include required(...)`, the
 > JDBC flow gained the contract questions, and `JdbcSchemaIntrospector`

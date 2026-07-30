@@ -34,7 +34,8 @@ object RawMetadata {
     "source_schema" -> "string",
     "source_table" -> "string",
     "extract_start_ts" -> "string",
-    "extract_end_ts" -> "string"
+    "extract_end_ts" -> "string",
+    "record_hash" -> "string" // stamped only when raw.record_hash = true
   )
 
   val ColumnNames: Set[String] = ColumnTypes.map(_._1).toSet

@@ -4,6 +4,7 @@ A configuration-driven, multi-source data ingestion framework built with Scala 2
 
 ## Documentation
 
+- [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) — step-by-step guide to using the framework: build, feed definition, schema contracts, sources, RAW/CURATED, validation, local runs, cluster submit, operations.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — module map, data flow, extension points, and enforced invariants.
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — build/assembly, spark-submit examples, JDBC driver and secret-provider deployment, Azure SQL notes.
 - [docs/OPERATIONS_RUNBOOK.md](docs/OPERATIONS_RUNBOOK.md) — production support: HDR/JDBC error catalog, watermark and quarantine recovery, restart/resume, stale-state cleanup.

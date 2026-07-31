@@ -25,6 +25,7 @@ object RecordHash {
   private val NullMarker = "\u0000"
 
   def stamp(df: DataFrame, contract: Option[SchemaContract]): DataFrame = {
+    RawMetadata.requireNoCollisions(df, Seq(Column), "record_hash stamping")
     val candidates = contract match {
       case Some(c) =>
         c.columns.filter(_.category.equalsIgnoreCase("business"))

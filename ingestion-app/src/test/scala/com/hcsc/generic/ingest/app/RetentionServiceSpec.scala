@@ -115,6 +115,26 @@ class RetentionServiceSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(versions.toSeq == Seq(4L, 5L), "only the newest 2 versions survive")
   }
 
+  test("multi-key partitioned raw tables are skipped loudly, never silently") {
+    spark.sql(
+      """CREATE TABLE r_raw.member_mk (id STRING)
+        |PARTITIONED BY (ingest_dt STRING, region STRING) STORED AS ORC""".stripMargin)
+    spark.sql(
+      "INSERT INTO r_raw.member_mk PARTITION (ingest_dt='2020-01-01', region='east') VALUES ('old')")
+
+    val conf = ConfigFactory.parseString(
+      """
+        |raw { database = r_raw, table = member_mk }
+        |retention { raw = "365d" }
+        |""".stripMargin)
+    val results = new RetentionService(spark, conf, logger).run(dryRun = false)
+    assert(results.exists { case (t, action, n) =>
+      t == "r_raw.member_mk" && action.contains("multi-key") && n == 0L },
+      s"multi-key layout must be reported as skipped, got $results")
+    assert(spark.sql("SHOW PARTITIONS r_raw.member_mk").count() == 1,
+      "no partition may be dropped from an unsupported layout")
+  }
+
   test("a retention run without a retention block fails with guidance") {
     val e = intercept[IllegalArgumentException] {
       new RetentionService(spark, ConfigFactory.parseString("{}"), logger).run(dryRun = false)

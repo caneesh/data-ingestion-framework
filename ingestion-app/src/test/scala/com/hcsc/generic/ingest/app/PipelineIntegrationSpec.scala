@@ -263,6 +263,28 @@ class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(listNames("quarantine").contains("member_copy2.csv"))
   }
 
+  test("an inprogress leftover with a registered checksum is recovered, not re-punished") {
+    // Simulate a crash between complete()'s checksum registration and its
+    // file move: the file sits in INPROGRESS while its content is already
+    // registered as processed. Under REJECT the old behavior quarantined a
+    // fully-processed file; under REPROCESS_WITH_APPROVAL it was stranded in
+    // inprogress forever. Recovery must finish the interrupted move instead.
+    val content = "subscriber id,plan_hios_id\nS001,H1\nS002,H2\n,H3\n" // registered in run-full-1
+    Files.write(tempDir.resolve("inprogress").resolve("member_crashleft.csv"),
+      content.getBytes(StandardCharsets.UTF_8))
+
+    val conf = ConfigFactory.parseString("""idempotency.duplicate_policy = "REJECT" """)
+      .withFallback(feedConf())
+    run(conf, baseCli.copy(runId = Some("run-recover-1")))
+
+    assert(listNames("processed").contains("member_crashleft.csv"),
+      "the interrupted complete() move must be finished")
+    assert(!listNames("quarantine").contains("member_crashleft.csv"),
+      "a crash leftover must not be quarantined as a duplicate")
+    assert(!listNames("inprogress").contains("member_crashleft.csv"),
+      "the leftover must not be stranded in inprogress")
+  }
+
   // ---------------------------------------------------------------------------
   // 07: dry-run
   // ---------------------------------------------------------------------------
@@ -427,6 +449,21 @@ class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       .filter(col("run_id") === "run-rawonly-1" && col("stage") === "curated" &&
         col("status") === "SUCCESS")
     assert(replayAudit.count() >= 1, "the replay must be recorded in the run ledger")
+  }
+
+  test("--stage curated refuses to replay a run whose raw stage never succeeded") {
+    // A FAILED raw stage means the RAW slice may be partial: publishing it
+    // as curated (and stamping SUCCESS) would poison later --resume.
+    spark.sql(
+      "INSERT INTO p_audit.ingest_run_audit VALUES " +
+        "('run-rawfailed-1', 'member', 'raw', 'FAILED', -1, -1, -1, -1, -1, -1, -1, " +
+        "null, 'boom', current_timestamp(), 'FULL', '', '')")
+    val e = intercept[IllegalArgumentException] {
+      new IngestPipeline(spark, feedConf(),
+        baseCli.copy(runId = Some("run-rawfailed-1"), stage = "curated"), logger).curatedReplay()
+    }
+    assert(e.getMessage.contains("PIPE_003"))
+    assert(e.getMessage.contains("FAILED"))
   }
 
   test("--stage curated without --run-id or --resume-ingest-dt fails with guidance") {

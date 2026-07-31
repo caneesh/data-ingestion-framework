@@ -57,6 +57,21 @@ class ContentValidatorTest extends AnyFunSuite with SharedSparkSession {
     assert(ContentValidator.validate(mostlyBad, c, logger).nonEmpty)
   }
 
+  test("SAMPLE mode draws from the whole frame, not just the first rows") {
+    val c = contract(
+      """schema { version = "1.0",
+        |  columns = [{ name = "code", regex = "^[0-9]+$" }]
+        |  content_validation { enabled = true, mode = "SAMPLE", sample_rows = 10 }
+        |}""".stripMargin)
+    // First 10 rows valid, the following 990 all invalid: a limit(10)
+    // "sample" would see only clean rows and pass the batch.
+    val df = ((1 to 10).map(_.toString) ++ (1 to 990).map(i => s"bad_$i"))
+      .toDF("code").repartition(4)
+    val violations = ContentValidator.validate(df, c, logger)
+    assert(violations.nonEmpty,
+      "a 99%-invalid frame must fail content validation even in SAMPLE mode")
+  }
+
   test("min/max length, allowed values and nonblank rules are enforced") {
     val c = contract(
       """schema { version = "1.0", columns = [

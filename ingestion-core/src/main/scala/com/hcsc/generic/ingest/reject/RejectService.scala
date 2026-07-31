@@ -86,7 +86,13 @@ final class RejectService(
       val keep = rejectConf.map(c => ConfigUtils.stringList(c, "payload_columns")).getOrElse(Seq.empty)
       require(keep.nonEmpty, "rejects.payload = KEYS_ONLY requires rejects.payload_columns")
       val present = keep.flatMap(k => df.columns.find(_.equalsIgnoreCase(k)))
-      to_json(struct(present.map(col): _*))
+      // Sensitivity classification applies to EVERY payload mode: a business
+      // key tagged PII/PHI must not land verbatim just because it is a key.
+      val sensitiveKeys = contract.map(_.sensitiveColumns.map(_.toLowerCase).toSet).getOrElse(Set.empty)
+      to_json(struct(present.map { c =>
+        if (sensitiveKeys.contains(c.toLowerCase)) sha2(col(c).cast("string"), 256).as(c)
+        else col(c)
+      }: _*))
     case _ =>
       to_json(struct(businessCols.map(col): _*))
   }
@@ -226,28 +232,71 @@ final class RejectService(
     else persistGuarded(rejectRows, ctx, guardCode = Some(errorCode))
   }
 
+  /** Columns compared to decide whether a replay reproduced the same reject
+    * set; reject_ts is excluded (it is stamped per attempt). */
+  private val ComparableColumns = Seq("run_id", "entity", "file_id", "source_file",
+    "row_idx", "raw_record", "error_code", "error_message", "reject_category")
+
   private def persistGuarded(rejectRows: DataFrame, ctx: RunContext, guardCode: Option[String]): Long = {
     val count = rejectRows.count()
-    if (count > 0) {
+    if (count > 0)
       com.hcsc.generic.ingest.hive.HiveTables.ensure(
         spark, rejectTable.split("\\.")(0), rejectTable,
         "run_id STRING, entity STRING, file_id STRING, source_file STRING, " +
           "row_idx BIGINT, raw_record STRING, error_code STRING, " +
           "error_message STRING, reject_category STRING, reject_ts TIMESTAMP")
-      // Idempotency guard (mirrors the RAW one): a run that failed after this
-      // append and was resumed with the same --run-id must not append the same
-      // reject rows a second time. Stage-specific rejects (guardCode) are
-      // guarded per error code so raw-stage rejects do not mask them.
-      val guard = spark.table(rejectTable)
-        .filter(col("run_id") === ctx.runId && col("entity") === ctx.entity)
-      val alreadyPersisted = guardCode
-        .fold(guard)(code => guard.filter(col("error_code") === code))
-        .limit(1).count() > 0
-      if (alreadyPersisted)
-        logger.warn(s"[RejectService] Reject table already holds rows for run ${ctx.runId}" +
-          guardCode.fold("")(c => s" code=$c") + "; skipping append (idempotent replay)")
-      else
-        rejectRows.write.mode(SaveMode.Append).insertInto(rejectTable)
+
+    guardCode match {
+      case None =>
+        // Idempotency guard (mirrors the RAW one): a run that failed after
+        // this append and was resumed with the same --run-id must not append
+        // the same reject rows a second time.
+        if (count > 0) {
+          val alreadyPersisted = spark.table(rejectTable)
+            .filter(col("run_id") === ctx.runId && col("entity") === ctx.entity)
+            .limit(1).count() > 0
+          if (alreadyPersisted)
+            logger.warn(s"[RejectService] Reject table already holds rows for run ${ctx.runId}; " +
+              "skipping append (idempotent replay)")
+          else
+            rejectRows.write.mode(SaveMode.Append).insertInto(rejectTable)
+        }
+
+      case Some(code) =>
+        // Stage-specific rejects REPLACE their (run_id, entity, error_code)
+        // slice on replay: a resumed run whose reject set changed (config
+        // drift, rewritten raw) must not leave the previous attempt's rows
+        // standing — the audit trail would silently diverge from the
+        // reconciliation counts of the attempt that actually published.
+        if (!spark.catalog.tableExists(rejectTable)) return count
+        val existing = spark.table(rejectTable).filter(
+          col("run_id") === ctx.runId && col("entity") === ctx.entity && col("error_code") === code)
+        val hasPrior = existing.limit(1).count() > 0
+        if (!hasPrior) {
+          if (count > 0) rejectRows.write.mode(SaveMode.Append).insertInto(rejectTable)
+        } else {
+          val prior = existing.select(ComparableColumns.map(col): _*)
+          val fresh = rejectRows.select(ComparableColumns.map(col): _*)
+          val unchanged = count > 0 &&
+            fresh.exceptAll(prior).limit(1).count() == 0 &&
+            prior.exceptAll(fresh).limit(1).count() == 0
+          if (unchanged)
+            logger.warn(s"[RejectService] Reject table already holds the identical rows for " +
+              s"run ${ctx.runId} code=$code; skipping append (idempotent replay)")
+          else {
+            logger.warn(s"[RejectService] Replay of run ${ctx.runId} produced a different " +
+              s"$code reject set; replacing the previous attempt's rows")
+            // null-safe negation: a NULL in any guard column must keep the row
+            val survivors = spark.table(rejectTable).filter(
+              !(col("run_id") <=> ctx.runId && col("entity") <=> ctx.entity && col("error_code") <=> code))
+            val staging = s"${rejectTable}_replay_stg"
+            survivors.write.mode(SaveMode.Overwrite).format("orc").saveAsTable(staging)
+            try {
+              spark.sql(s"INSERT OVERWRITE TABLE $rejectTable SELECT * FROM $staging")
+              if (count > 0) rejectRows.write.mode(SaveMode.Append).insertInto(rejectTable)
+            } finally spark.sql(s"DROP TABLE IF EXISTS $staging")
+          }
+        }
     }
     count
   }

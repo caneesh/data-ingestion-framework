@@ -99,6 +99,11 @@ class CliParserTest extends AnyFunSuite {
     assert(cli.stage == "c")
   }
 
+  test("--stage retention is accepted") {
+    val cli = CliParser.parse(Array("--entity", "e", "--stage", "retention"))
+    assert(cli.stage == "retention")
+  }
+
   test("invalid --stage value throws IllegalArgumentException") {
     intercept[IllegalArgumentException] {
       CliParser.parse(Array("--entity", "e", "--stage", "invalid"))

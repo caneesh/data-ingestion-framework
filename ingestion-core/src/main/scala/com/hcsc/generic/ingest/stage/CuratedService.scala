@@ -10,7 +10,7 @@ import com.typesafe.config.Config
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.expressions.Window
-import org.apache.spark.sql.functions.{col, lit, lower, row_number, trim, when}
+import org.apache.spark.sql.functions.{coalesce, col, lit, lower, row_number, trim, when}
 
 
 final case class CuratedResult(
@@ -74,18 +74,20 @@ final class CuratedService(spark: SparkSession, conf: Config) {
         "and never enables dynamic partitioning. Remove the block (RAW partitioning lives " +
         "under raw.partitioning); curated partitioning arrives with the Delta/Iceberg publish.")
 
+    // Contract-declared per-column transforms run FIRST (trim/case/date
+    // rules from the mapping spec), then the curated-block config transforms.
+    val transformed = transform.applyContractTransforms(rawDf, contract)
+
     // Drift guard: configured column_types casts must not silently null out
-    // values (Spark cast never fails); checked BEFORE the cast is applied.
-    guardCasts(rawDf,
+    // values (Spark cast never fails); checked on the SAME frame the cast
+    // runs against — after contract transforms, immediately before the cast.
+    guardCasts(transformed,
       ConfigUtils.stringMap(conf, "column_types").toSeq.flatMap { case (name, ddl) =>
-        rawDf.columns.find(_.equalsIgnoreCase(name))
+        transformed.columns.find(_.equalsIgnoreCase(name))
           .map(actual => (actual, org.apache.spark.sql.types.DataType.fromDDL(ddl)))
       },
       where = "curated.column_types")
 
-    // Contract-declared per-column transforms run FIRST (trim/case/date
-    // rules from the mapping spec), then the curated-block config transforms.
-    val transformed = transform.applyContractTransforms(rawDf, contract)
     val prepared0 = transform.castConfigured(transformed, conf)
     val prepared1 = transform.applyTransforms(prepared0, conf)
     val prepared2 = transform.ensureAudit(prepared1)
@@ -192,17 +194,26 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     * sources of truth silently disagreeing about the business key is exactly
     * the ambiguity the mapping spec forbids. */
   private def resolveMergeKeys(mergeConf: Option[Config], contract: Option[SchemaContract]): Seq[String] = {
-    val configured = mergeConf.map(m => ConfigUtils.stringList(m, "keys")).getOrElse(Seq.empty)
+    // An EXPLICIT empty list is an opt-out, not an omission: `merge.keys = []`
+    // says "publish this feed keyless even though the contract declares a
+    // business_key" (e.g. an append-only FULL snapshot of a keyed source).
+    val configured: Option[Seq[String]] =
+      mergeConf.filter(_.hasPath("keys")).map(m => ConfigUtils.stringList(m, "keys"))
     val declared = contract.map(_.businessKeyColumns).getOrElse(Seq.empty)
     (configured, declared) match {
-      case (c, d) if c.nonEmpty && d.nonEmpty =>
+      case (Some(Nil), d) =>
+        if (d.nonEmpty)
+          logger.info(s"[CuratedService] merge.keys = [] explicitly disables merge semantics; " +
+            s"contract business_key [${d.mkString(",")}] is NOT applied to this feed")
+        Seq.empty
+      case (Some(c), d) if d.nonEmpty =>
         if (c.map(_.toLowerCase).toSet != d.map(_.toLowerCase).toSet)
           throw new IllegalArgumentException(
             s"HDR_017 curated.merge.keys [${c.mkString(",")}] contradicts the contract's " +
               s"business_key declaration [${d.mkString(",")}]; align them or remove one")
         c
-      case (c, _) if c.nonEmpty => c
-      case (_, d) if d.nonEmpty =>
+      case (Some(c), _) => c
+      case (None, d) if d.nonEmpty =>
         logger.info(s"[CuratedService] merge keys derived from contract business_key columns: ${d.mkString(",")}")
         d
       case _ => Seq.empty
@@ -345,18 +356,29 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     * alignment could not mark anything. */
   private def applyDeleteMarking(df: DataFrame, deletes: Option[DeleteSpec], fullTable: String): DataFrame =
     deletes match {
-      case Some(DeleteSpec.Soft(indicator, values)) =>
-        val actual = df.columns.find(_.equalsIgnoreCase(indicator)).getOrElse(
+      case Some(DeleteSpec.Soft(indicator, _)) =>
+        df.columns.find(_.equalsIgnoreCase(indicator)).getOrElse(
           throw new IllegalArgumentException(
             s"curated.merge.deletes.indicator_column '$indicator' is not present in the curated " +
               s"frame for $fullTable; soft deletes require the indicator in the curated schema"))
-        val isDelete = lower(trim(col(actual).cast("string"))).isin(values: _*)
+        val isDelete = softDeletePredicate(df, deletes).get
         val withOp = df.columns.find(_.equalsIgnoreCase("last_modified_op"))
           .fold(df)(op => df.withColumn(op, when(isDelete, lit("D")).otherwise(col(op))))
         df.columns.find(_.equalsIgnoreCase("is_deleted"))
           .fold(withOp)(flag => withOp.withColumn(flag,
             when(isDelete, lit(true)).otherwise(col(flag).cast("boolean"))))
       case _ => df
+    }
+
+  /** The row-level "this is a tombstone" predicate, shared by the marking
+    * step and the record_hash pre-filter exemption. None when deletes are
+    * not SOFT or the indicator is absent from the frame. */
+  private def softDeletePredicate(df: DataFrame, deletes: Option[DeleteSpec]): Option[org.apache.spark.sql.Column] =
+    deletes match {
+      case Some(DeleteSpec.Soft(indicator, values)) =>
+        df.columns.find(_.equalsIgnoreCase(indicator))
+          .map(actual => lower(trim(col(actual).cast("string"))).isin(values: _*))
+      case _ => None
     }
 
   private def deleteMarkCount(df: DataFrame, deletes: Option[DeleteSpec]): Long =
@@ -379,21 +401,33 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     ctx: RunContext,
     contract: Option[SchemaContract]
   ): CuratedResult = {
-    val withPassthrough = passthrough.fold(df)(p => df.unionByName(p))
-    val aligned =
-      if (spark.catalog.tableExists(fullTable)) {
-        val schema = spark.table(fullTable).schema
-        guardDroppedColumns(withPassthrough, schema, contract, fullTable)
-        guardCasts(withPassthrough, alignmentCasts(withPassthrough, schema), s"alignment to $fullTable")
-        transform.align(withPassthrough, schema, contract)
-      } else withPassthrough
-    val publishDf = applyDeleteMarking(aligned, deletes, fullTable)
+    val schemaOpt =
+      if (spark.catalog.tableExists(fullTable)) Some(spark.table(fullTable).schema) else None
+    schemaOpt.foreach { schema =>
+      val withPassthrough = passthrough.fold(df)(p => df.unionByName(p))
+      guardDroppedColumns(withPassthrough, schema, contract, fullTable)
+      guardCasts(withPassthrough, alignmentCasts(withPassthrough, schema), s"alignment to $fullTable")
+    }
+    def alignTo(d: DataFrame): DataFrame = schemaOpt.fold(d)(s => transform.align(d, s, contract))
+    // Keyed rows and passthrough rows are marked SEPARATELY so deleteCount
+    // stays disjoint from passthroughCount: a keyed tombstone lands in
+    // deleteCount, a keyless one stays a passthrough row (marked, but
+    // counted once). Marking is column-wise, so marking the parts equals
+    // marking the union.
+    val keyedMarked = applyDeleteMarking(alignTo(df), deletes, fullTable)
+    val publishDf = passthrough
+      .map(p => applyDeleteMarking(alignTo(p), deletes, fullTable))
+      .fold(keyedMarked)(p => keyedMarked.unionByName(p))
 
     val published = publisher.publish(publishDf, request, ctx)
     val keyedPublished = published.publishedCount - passthroughCount
+    val deleteCount = deleteMarkCount(keyedMarked, deletes)
     val dedupedCount = if (inputCount >= 0) math.max(inputCount - keyedPublished, 0L) else 0L
-    CuratedResult(published.publishedCount, insertCount = keyedPublished,
-      updateCount = 0L, deleteCount = deleteMarkCount(publishDf, deletes),
+    // Disjoint accounting: a published keyed row is EITHER an insert or a
+    // tombstone, never both — insert+update+delete+ignored+nullKey+deduped+
+    // passthrough must total the accepted rows.
+    CuratedResult(published.publishedCount, insertCount = keyedPublished - deleteCount,
+      updateCount = 0L, deleteCount = deleteCount,
       ignoredCount = 0L, nullKeyCount = nullKeyCount, dedupedCount = dedupedCount,
       passthroughCount = passthroughCount)
   }
@@ -475,10 +509,19 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     val ik = alignedIncoming.select(keyCols.map(col): _*).distinct()
       .toDF(keyCols.map(k => s"__ik_$k"): _*).persist()
     var winnersPersisted: Option[DataFrame] = None
+    var persistedContested: Option[DataFrame] = None
     try {
       val totalIncoming = ik.count()
       val dedupedCount = if (inputCount >= 0) math.max(inputCount - totalIncoming, 0L) else 0L
-      val alignedPassthrough = passthrough.map(p => transform.align(p, target.schema, contract))
+      // Passthrough rows reach the SAME published table: they get the same
+      // alignment guards (value-level cast loss is per-row, so a clean keyed
+      // frame proves nothing about the keyless one) and the same tombstone
+      // marking as the FULL path applies.
+      val alignedPassthrough = passthrough.map { p =>
+        guardDroppedColumns(p, target.schema, contract, fullTable)
+        guardCasts(p, alignmentCasts(p, target.schema), s"alignment to $fullTable")
+        applyDeleteMarking(transform.align(p, target.schema, contract), deletes, fullTable)
+      }
 
       if (totalIncoming == 0 && alignedPassthrough.isEmpty) {
         logger.info(s"[CuratedService] Zero incoming rows after key hygiene; $fullTable left untouched")
@@ -489,7 +532,11 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       val joinCond = keyCols.map(k => col(k) <=> col(s"__ik_$k")).reduce(_ && _)
       val contested = target.join(ik, joinCond, "left_semi")
       val unchanged = target.join(ik, joinCond, "left_anti")
-      val contestedKeyCount = contested.select(keyCols.map(col): _*).distinct().count()
+      val contestedKeys = contested.select(keyCols.map(col): _*).distinct()
+        .toDF(keyCols.map(k => s"__ck_$k"): _*).persist()
+      persistedContested = Some(contestedKeys)
+      val ckCond = keyCols.map(k => col(k) <=> col(s"__ck_$k")).reduce(_ && _)
+      val contestedKeyCount = contestedKeys.count()
       val insertCount = totalIncoming - contestedKeyCount
 
       val freshnessUsable = freshness.filter { f =>
@@ -500,7 +547,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
         present
       }
 
-      val (replacement, updateCount, ignoredCount, deleteCount) = freshnessUsable match {
+      val (replacement, updateCount, ignoredCount, deletesNewKeys, deletesContested) = freshnessUsable match {
         case Some(f) =>
           val src = CuratedService.MergeProvenanceColumn
           require(!target.columns.exists(_.equalsIgnoreCase(src)),
@@ -518,7 +565,18 @@ final class CuratedService(spark: SparkSession, conf: Config) {
               val tgtKeyHash = contested.select(kh.map(col): _*).distinct()
                 .toDF(kh.map(k => s"__th_$k"): _*)
               val sameContent = kh.map(k => col(k) <=> col(s"__th_$k")).reduce(_ && _)
-              alignedIncoming.join(tgtKeyHash, sameContent, "left_anti")
+              // Tombstones are EXEMPT from the no-change filter: the delete
+              // indicator is not a business column, so a tombstone hashes
+              // identically to the live target row it deletes — filtering it
+              // would silently swallow the delete.
+              softDeletePredicate(alignedIncoming, deletes) match {
+                case Some(isDel) =>
+                  val del = coalesce(isDel, lit(false))
+                  alignedIncoming.filter(!del).join(tgtKeyHash, sameContent, "left_anti")
+                    .unionByName(alignedIncoming.filter(del))
+                case None =>
+                  alignedIncoming.join(tgtKeyHash, sameContent, "left_anti")
+              }
             case None => alignedIncoming
           }
           val union = contested.withColumn(src, lit("T"))
@@ -530,30 +588,44 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           val winners = union.withColumn("_rn", row_number().over(w))
             .filter(col("_rn") === 1).drop("_rn").persist()
           winnersPersisted = Some(winners)
-          val incomingWinners = winners.filter(col(src) === "I").count()
+          val winnersI = winners.filter(col(src) === "I")
+          val incomingWinners = winnersI.count()
           val updates = incomingWinners - insertCount
           val ignored = totalIncoming - incomingWinners
           // Soft deletes that WON their key's contest — INCOMING winners
           // only, so a target row tombstoned in an earlier run (or an
           // incoming tombstone outrun by fresher data) is not recounted.
-          val deletesWon = deleteMarkCount(winners.filter(col(src) === "I"), deletes)
-          (winners.drop(src), updates, ignored, deletesWon)
+          // Split by contested membership so the counts stay disjoint: a
+          // tombstone for a brand-new key comes out of insertCount, one for
+          // an existing key out of updateCount.
+          val deletesWon = deleteMarkCount(winnersI, deletes)
+          val deletesNew = deleteMarkCount(winnersI.join(contestedKeys, ckCond, "left_anti"), deletes)
+          (winners.drop(src), updates, ignored, deletesNew, deletesWon - deletesNew)
         case None =>
           if (freshness.isEmpty)
             logger.warn("[CuratedService] No curated.merge.freshness configured: the incremental " +
               "merge is last-write-wins by run order — a late-arriving OLDER record will overwrite " +
               "a newer curated row. Configure merge.freshness.column to enable freshness comparison.")
-          (alignedIncoming, contestedKeyCount, 0L, deleteMarkCount(alignedIncoming, deletes))
+          val deletesAll = deleteMarkCount(alignedIncoming, deletes)
+          val deletesNew = deleteMarkCount(
+            alignedIncoming.join(contestedKeys, ckCond, "left_anti"), deletes)
+          (alignedIncoming, contestedKeyCount, 0L, deletesNew, deletesAll - deletesNew)
       }
 
       val merged0 = unchanged.unionByName(replacement)
       val merged = alignedPassthrough.fold(merged0)(p => merged0.unionByName(p))
       val published = publisher.publish(merged, request, ctx)
-      CuratedResult(published.publishedCount, insertCount, updateCount, deleteCount = deleteCount,
+      // Disjoint accounting: every incoming key is EXACTLY one of insert,
+      // update, delete or ignored — the four plus nullKey/deduped/passthrough
+      // total the accepted rows.
+      CuratedResult(published.publishedCount,
+        insertCount - deletesNewKeys, updateCount - deletesContested,
+        deleteCount = deletesNewKeys + deletesContested,
         ignoredCount = ignoredCount, nullKeyCount = nullKeyCount, dedupedCount = dedupedCount,
         passthroughCount = passthroughCount)
     } finally {
       winnersPersisted.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
+      persistedContested.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
       ik.unpersist(false)
       alignedIncoming.unpersist(false)
     }

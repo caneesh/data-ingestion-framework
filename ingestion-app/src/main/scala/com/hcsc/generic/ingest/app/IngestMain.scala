@@ -46,9 +46,11 @@ object IngestMain {
           new IngestPipeline(spark, feedConf, cli, logger).curatedReplay()
         case "retention" =>
           // Config-driven purge of raw partitions, reject/audit rows and
-          // watermark history; honors --dry-run.
-          new com.hcsc.generic.ingest.retention.RetentionService(spark, feedConf, logger)
-            .run(dryRun = cli.dryRun)
+          // watermark history; honors --dry-run. Runs under the entity lock
+          // (a staged rewrite racing a live run's appends would discard
+          // them) and records its outcome in the run ledger AFTER purging,
+          // so the record of the purge survives it.
+          runRetention(spark, feedConf, cli)
         case _ =>
           new IngestPipeline(spark, feedConf, cli, logger).run()
       }
@@ -58,6 +60,32 @@ object IngestMain {
         throw error
     } finally {
       spark.stop()
+    }
+  }
+
+  private def runRetention(spark: SparkSession, feedConf: Config, cli: Cli): Unit = {
+    import com.hcsc.generic.ingest.runtime.{RunContext, StageStatus}
+    val ctx = RunContext(
+      runId = cli.runId.getOrElse(java.util.UUID.randomUUID().toString),
+      entity = cli.entity, mode = cli.mode,
+      rawFlag = cli.rawFlag.getOrElse(""), dryRun = cli.dryRun)
+    val audit = com.hcsc.generic.ingest.audit.AuditService(spark, feedConf)
+    val lock = com.hcsc.generic.ingest.lock.LockService.fromConfig(spark, feedConf, logger)
+    val held = if (cli.dryRun) None else lock.map { l => l.acquire(ctx.entity, ctx.runId); l }
+    try {
+      val results = new com.hcsc.generic.ingest.retention.RetentionService(spark, feedConf, logger)
+        .run(dryRun = cli.dryRun)
+      audit.recordStage(ctx, "retention", StageStatus.Success,
+        message = (if (cli.dryRun) "dry-run: " else "") +
+          results.map { case (t, action, n) => s"$t $action count=$n" }.mkString("; "))
+    } catch {
+      case e: Throwable =>
+        audit.recordStage(ctx, "retention", StageStatus.Failed, message = String.valueOf(e.getMessage))
+        throw e
+    } finally {
+      held.foreach(l =>
+        try l.release(ctx.entity, ctx.runId)
+        catch { case e: Exception => logger.warn(s"[Retention] Lock release failed: ${e.getMessage}") })
     }
   }
 

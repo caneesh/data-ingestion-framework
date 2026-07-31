@@ -137,16 +137,34 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
   private val runTableAddedColumns = Seq(
     "run_mode" -> "STRING", "window_start" -> "STRING", "window_end" -> "STRING")
 
-  private def ensureRunTableColumns(): Unit =
+  /** The migration check runs ONCE per service instance, not on every
+    * recordStage — repeated metadata reads and racing ALTERs from concurrent
+    * stages were pure overhead. A lost cross-process ALTER race is absorbed
+    * by re-checking: if another writer added the columns first, that is
+    * success, not failure. */
+  @volatile private var runTableColumnsEnsured = false
+
+  private def ensureRunTableColumns(): Unit = {
+    if (runTableColumnsEnsured) return
     if (spark.catalog.tableExists(runTable)) {
       val existing = spark.table(runTable).columns.map(_.toLowerCase).toSet
       val missing = runTableAddedColumns.filterNot { case (n, _) => existing.contains(n) }
       if (missing.nonEmpty) {
         val ddl = missing.map { case (n, t) => s"$n $t" }.mkString(", ")
         logger.warn(s"[Audit] Migrating $runTable: ADD COLUMNS ($ddl)")
-        spark.sql(s"ALTER TABLE $runTable ADD COLUMNS ($ddl)")
+        try spark.sql(s"ALTER TABLE $runTable ADD COLUMNS ($ddl)")
+        catch {
+          case e: Exception =>
+            spark.catalog.refreshTable(runTable)
+            val after = spark.table(runTable).columns.map(_.toLowerCase).toSet
+            val stillMissing = runTableAddedColumns.filterNot { case (n, _) => after.contains(n) }
+            if (stillMissing.nonEmpty) throw e
+            logger.info(s"[Audit] $runTable columns added concurrently by another writer")
+        }
       }
     }
+    runTableColumnsEnsured = true
+  }
 
   /** The extract window observed by this run's source read; stamped onto
     * subsequent run-audit rows so the ledger records the incremental
@@ -185,7 +203,8 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
       return
     }
     import spark.implicits._
-    val record = FileAuditRecord(ctx.runId, ctx.entity, fileName, filePath, checksum, sizeBytes, status, reason, now())
+    val record = FileAuditRecord(ctx.runId, ctx.entity, fileName, filePath, checksum, sizeBytes,
+      status, AuditService.sanitizeMessage(reason), now())
     append(Seq(record).toDF(), fileTable, fileTableDdl)
     logger.info(s"[Audit] file=$fileName status=$status reason=$reason")
   }
@@ -206,7 +225,7 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
       ctx.runId, ctx.entity, stage, status,
       counts.sourceCount, counts.rawCount, counts.acceptedCount, counts.rejectedCount,
       counts.insertCount, counts.updateCount, counts.deleteCount,
-      counts.controlTotal.orNull, message, now(),
+      counts.controlTotal.orNull, AuditService.sanitizeMessage(message), now(),
       ctx.mode, extractWindow._1, extractWindow._2
     )
     ensureRunTableColumns()
@@ -261,4 +280,16 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
 object AuditService {
   def apply(spark: SparkSession, feedConf: Config): AuditService =
     new AuditService(spark, ConfigUtils.optConfig(feedConf, "audit"))
+
+  private val CredentialPattern =
+    "(?i)(password|passwd|pwd|secret|token|accesskey|access_key|credential)\\s*=\\s*[^;,&\\s]+".r
+
+  /** Raw exception messages flow into the ledger: JDBC drivers embed the
+    * connection URL (which can carry credentials) and messages can be
+    * arbitrarily long. Redact credential-shaped pairs and bound the size. */
+  private[ingest] def sanitizeMessage(message: String): String = {
+    if (message == null) return ""
+    val redacted = CredentialPattern.replaceAllIn(message, m => s"${m.group(1)}=***")
+    if (redacted.length > 4000) redacted.take(4000) + "...(truncated)" else redacted
+  }
 }

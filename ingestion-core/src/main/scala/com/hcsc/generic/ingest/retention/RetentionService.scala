@@ -27,9 +27,11 @@ import java.time.LocalDate
   * - Watermark history: keep-last-N versions per entity, same rewrite.
   * - dry-run: reports what WOULD be purged, touches nothing.
   *
-  * Invoked via `--stage retention`; each purge is logged and, when the
-  * ledger is configured, recorded as a run-audit row AFTER purging (so the
-  * record of the purge itself survives it).
+  * Invoked via `--stage retention` (IngestMain.runRetention), which holds
+  * the entity lock for the duration — a staged rewrite racing a live run's
+  * watermark/audit appends would silently discard them — and records the
+  * outcome as a run-audit row AFTER purging (so the record of the purge
+  * itself survives it). This class performs only the purges.
   */
 final class RetentionService(spark: SparkSession, feedConf: Config, logger: Logger) {
 
@@ -77,7 +79,16 @@ final class RetentionService(spark: SparkSession, feedConf: Config, logger: Logg
     m.group(1).toInt
   }
 
-  private def cutoffDate(days: Int): LocalDate = LocalDate.now.minusDays(days.toLong)
+  /** Cutoffs are computed in the SPARK SESSION time zone — the zone the
+    * pipeline writes its timestamps and ingest_dt values in (the app pins it
+    * to UTC) — never the JVM default, which on a non-UTC edge node would
+    * shift every cutoff by the offset. */
+  private def sessionZone: java.time.ZoneId =
+    java.time.ZoneId.of(
+      spark.conf.get("spark.sql.session.timeZone", java.time.ZoneId.systemDefault().getId))
+
+  private[retention] def cutoffDate(days: Int): LocalDate =
+    LocalDate.now(sessionZone).minusDays(days.toLong)
 
   private def rawTable: Option[String] =
     ConfigUtils.optConfig(feedConf, "raw").map { r =>
@@ -125,11 +136,22 @@ final class RetentionService(spark: SparkSession, feedConf: Config, logger: Logg
                 "ingest_dt partitioning (row-level raw purges require an ACID table format)")
               return Seq((table, "skipped (unpartitioned)", 0L))
           }
+        // Multi-key layouts ("ingest_dt=.../region=...") would make every
+        // ingest_dt value unparseable and turn retention into a silent
+        // no-op run after run — skip LOUDLY instead.
+        if (partitions.exists(_.contains("/"))) {
+          logger.warn(s"[Retention] $table uses multi-key partitioning; RAW retention " +
+            "supports single-key ingest_dt partitions only — nothing dropped")
+          return Seq((table, "skipped (multi-key partitioning unsupported)", 0L))
+        }
         val expired = partitions.flatMap { p =>
-          // "ingest_dt=2026-01-01" (single-key partitions only)
+          // "ingest_dt=2026-01-01"
           p.split("=", 2) match {
             case Array(k, v) if k.equalsIgnoreCase("ingest_dt") =>
-              scala.util.Try(LocalDate.parse(v)).toOption.filter(_.isBefore(cutoff)).map(_ => (k, v))
+              val parsed = scala.util.Try(LocalDate.parse(v)).toOption
+              if (parsed.isEmpty)
+                logger.warn(s"[Retention] $table partition '$p' has an unparseable ingest_dt; retained")
+              parsed.filter(_.isBefore(cutoff)).map(_ => (k, v))
             case _ => None
           }
         }
@@ -143,7 +165,7 @@ final class RetentionService(spark: SparkSession, feedConf: Config, logger: Logg
   /** Append-only table purge: staged rewrite keeping rows >= cutoff. */
   private def purgeByTimestamp(table: String, tsColumn: String, days: Int, dryRun: Boolean): (String, String, Long) = {
     if (!spark.catalog.tableExists(table)) return (table, "skipped (absent)", 0L)
-    val cutoffTs = java.sql.Timestamp.valueOf(cutoffDate(days).atStartOfDay())
+    val cutoffTs = java.sql.Timestamp.from(cutoffDate(days).atStartOfDay(sessionZone).toInstant)
     val cutoffLit = org.apache.spark.sql.functions.lit(cutoffTs)
     val expired = spark.table(table)
       .filter(col(tsColumn).isNotNull && col(tsColumn) < cutoffLit).count()

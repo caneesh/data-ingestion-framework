@@ -27,22 +27,33 @@ object SchemaVersions {
     else property(spark, fullTable, Property)
   }
 
+  /** The ';' and ':' separators are part of the wire format, so column
+    * names/types containing them must be escaped — an unescaped ';' in a
+    * name would shear the snapshot and manufacture false BACKWARD breaks.
+    * Percent-encoding keeps legacy snapshots (no '%') parsing unchanged. */
+  private def escapeField(v: String): String =
+    v.replace("%", "%25").replace(";", "%3B").replace(":", "%3A")
+
+  private def unescapeField(v: String): String =
+    v.replace("%3A", ":").replace("%3B", ";").replace("%25", "%")
+
+  private[schema] def parseRequiredSnapshot(s: String): Map[String, String] =
+    s.split(";").filter(_.nonEmpty).flatMap { entry =>
+      entry.split(":", 2) match {
+        case Array(n, t) => Some(unescapeField(n) -> unescapeField(t))
+        case _ => None
+      }
+    }.toMap
+
   /** The previously recorded required-column snapshot: name -> declared type. */
   def storedRequired(spark: SparkSession, database: String, table: String): Option[Map[String, String]] = {
     val fullTable = s"${validate(database, "database")}.${validate(table, "table")}"
     if (!spark.catalog.tableExists(fullTable)) None
-    else property(spark, fullTable, RequiredProperty).map { s =>
-      s.split(";").filter(_.nonEmpty).flatMap { entry =>
-        entry.split(":", 2) match {
-          case Array(n, t) => Some(n -> t)
-          case _ => None
-        }
-      }.toMap
-    }
+    else property(spark, fullTable, RequiredProperty).map(parseRequiredSnapshot)
   }
 
   def requiredSnapshot(contract: SchemaContract): String =
-    contract.requiredColumns.map(c => s"${c.name}:${c.dataType}").mkString(";")
+    contract.requiredColumns.map(c => s"${escapeField(c.name)}:${escapeField(c.dataType)}").mkString(";")
 
   /** Best-effort: the version property is metadata, so a failure here must
     * not fail a run whose data write already committed. */

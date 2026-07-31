@@ -380,6 +380,53 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(result.get.publishedCount == 1)
   }
 
+  test("CUR_002 guard sees contract-transformed values, not raw ones") {
+    // Raw value casts cleanly to int, but the contract transform mangles it
+    // first — the guard must validate the frame the cast actually runs on.
+    val contract = com.hcsc.generic.ingest.schema.SchemaContract.parse(
+      ConfigFactory.parseString(
+        """schema {
+          |  version = "1.0"
+          |  columns = [ { name = "name", type = "string", transform = "concat({col}, 'x')" } ]
+          |}""".stripMargin))
+    val cfg = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = cast_guard_xform
+        |format = parquet
+        |column_types { name = "int" }
+        |""".stripMargin)
+    val df = batch(Seq(("C3", "42", "2026-01-01 10:00:00", 1)))
+    val e = intercept[IllegalStateException] {
+      new CuratedService(spark, cfg).process(df, "FULL", ctx("mrun-cast-3"), contract, None)
+    }
+    assert(e.getMessage.contains("CUR_002"))
+    assert(e.getMessage.contains("name"))
+  }
+
+  test("CUR_002 guard does not false-positive when the transform repairs the value") {
+    // Raw value would NOT cast ("1,234"), but the contract transform strips
+    // the separator before the cast — guarding the raw frame would wrongly
+    // block a publish that loses nothing.
+    val contract = com.hcsc.generic.ingest.schema.SchemaContract.parse(
+      ConfigFactory.parseString(
+        """schema {
+          |  version = "1.0"
+          |  columns = [ { name = "name", type = "string", transform = "regexp_replace({col}, ',', '')" } ]
+          |}""".stripMargin))
+    val cfg = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = cast_relief
+        |format = parquet
+        |column_types { name = "int" }
+        |""".stripMargin)
+    val df = batch(Seq(("C4", "1,234", "2026-01-01 10:00:00", 1)))
+    val result = new CuratedService(spark, cfg).process(df, "FULL", ctx("mrun-cast-4"), contract, None)
+    assert(result.get.publishedCount == 1)
+    assert(spark.table("m_curated.cast_relief").collect().head.getAs[Int]("name") == 1234)
+  }
+
   // ---------------------------------------------------------------------------
   // 7c: reject payload redaction — HASHED stores no plaintext values
   // ---------------------------------------------------------------------------
@@ -401,6 +448,47 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     val payload = quarantined.getAs[String]("raw_record")
     assert(!payload.contains("secret_name"), "HASHED payload must not carry plaintext values")
     assert(payload.contains("name"), "HASHED payload keeps the column structure")
+  }
+
+  // ---------------------------------------------------------------------------
+  // 8b: reject replay semantics — a replayed run REPLACES its reject slice
+  // ---------------------------------------------------------------------------
+
+  test("a replay with a different reject set replaces the previous attempt's rows") {
+    val s = spark
+    import s.implicits._
+    val rctx = RunContext("mrun-replay-1", "members_feed", "INCR", "I")
+    val otherCtx = RunContext("mrun-replay-other", "members_feed", "INCR", "I")
+
+    // Another run's rows must survive the slice rewrite untouched
+    rejects.persistRows(Seq(("X1", "keep")).toDF("member_id", "name"),
+      otherCtx, "CUR_001", "null key", "NULL_BUSINESS_KEY")
+
+    rejects.persistRows(Seq(("A1", "first"), ("A2", "first")).toDF("member_id", "name"),
+      rctx, "CUR_001", "null key", "NULL_BUSINESS_KEY")
+
+    def sliceRecords(runId: String): Set[String] = spark.table("m_audit.ingest_rejects")
+      .filter(col("run_id") === runId && col("error_code") === "CUR_001")
+      .collect().map(_.getAs[String]("raw_record")).toSet
+
+    // Identical replay: idempotent, no duplicates
+    rejects.persistRows(Seq(("A1", "first"), ("A2", "first")).toDF("member_id", "name"),
+      rctx, "CUR_001", "null key", "NULL_BUSINESS_KEY")
+    assert(sliceRecords("mrun-replay-1").size == 2)
+
+    // Changed replay: the stale rows must be replaced, not skipped
+    rejects.persistRows(Seq(("A3", "second")).toDF("member_id", "name"),
+      rctx, "CUR_001", "null key", "NULL_BUSINESS_KEY")
+    val afterChange = sliceRecords("mrun-replay-1")
+    assert(afterChange.size == 1, s"stale replay rows must be replaced, got $afterChange")
+    assert(afterChange.head.contains("A3"))
+    assert(sliceRecords("mrun-replay-other").size == 1, "other runs' rows must survive the rewrite")
+
+    // Replay that produces ZERO rejects: the stale slice is purged
+    rejects.persistRows(Seq.empty[(String, String)].toDF("member_id", "name"),
+      rctx, "CUR_001", "null key", "NULL_BUSINESS_KEY")
+    assert(sliceRecords("mrun-replay-1").isEmpty, "a clean replay must purge the stale slice")
+    assert(sliceRecords("mrun-replay-other").size == 1)
   }
 
   // ---------------------------------------------------------------------------
@@ -445,6 +533,135 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       "a stale record must not undo a newer delete")
   }
 
+  test("SOFT delete tombstones survive the record_hash no-change pre-filter") {
+    val delHashConf = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_del_hash
+        |format = parquet
+        |merge {
+        |  keys = ["member_id"]
+        |  freshness { column = "src_modified_ts", tie_breakers = ["src_seq"] }
+        |  deletes { mode = "SOFT", indicator_column = "status", indicator_values = ["d"] }
+        |}
+        |""".stripMargin)
+    val svc = new CuratedService(spark, delHashConf)
+    def row(rows: Seq[(String, String, String, Int)], status: String, hash: String) =
+      batch(rows)
+        .withColumn("status", org.apache.spark.sql.functions.lit(status))
+        .withColumn("record_hash", org.apache.spark.sql.functions.lit(hash))
+
+    svc.process(row(Seq(("DH1", "active", "2026-01-01 10:00:00", 1)), "a", "hashA"),
+      "INCR", ctx("mrun-delhash-1"), None, None)
+
+    // The source flags the row deleted WITHOUT touching business content:
+    // identical record_hash. The tombstone must not be swallowed by the
+    // no-change pre-filter — the delete is the change.
+    val r2 = svc.process(row(Seq(("DH1", "active", "2026-01-01 12:00:00", 2)), "d", "hashA"),
+      "INCR", ctx("mrun-delhash-2"), None, None).get
+    assert(r2.deleteCount == 1, "an unchanged-content tombstone must still delete")
+    assert(r2.ignoredCount == 0)
+    val tombstone = spark.table("m_curated.members_del_hash")
+      .filter(col("member_id") === "DH1").collect().head
+    assert(tombstone.getAs[String]("last_modified_op") == "D")
+  }
+
+  test("delete counts are disjoint from insert and update counts") {
+    val delConf = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_del_disjoint
+        |format = parquet
+        |merge {
+        |  keys = ["member_id"]
+        |  freshness { column = "src_modified_ts", tie_breakers = ["src_seq"] }
+        |  deletes { mode = "SOFT", indicator_column = "status", indicator_values = ["d"] }
+        |}
+        |""".stripMargin)
+    val svc = new CuratedService(spark, delConf)
+    def withStatus(rows: Seq[(String, String, String, Int)], status: String) =
+      batch(rows).withColumn("status", org.apache.spark.sql.functions.lit(status))
+
+    svc.process(withStatus(Seq(("DJ1", "live", "2026-01-01 10:00:00", 1)), "a"),
+      "INCR", ctx("mrun-dj-1"), None, None)
+
+    // Contested tombstone: counted as delete, NOT also as update
+    val r2 = svc.process(withStatus(Seq(("DJ1", "gone", "2026-01-01 12:00:00", 2)), "d"),
+      "INCR", ctx("mrun-dj-2"), None, None).get
+    assert(r2.deleteCount == 1 && r2.updateCount == 0 && r2.insertCount == 0)
+    assert(r2.insertCount + r2.updateCount + r2.deleteCount + r2.ignoredCount == 1,
+      "the disjoint counts must total the accepted row")
+
+    // Brand-new-key tombstone: counted as delete, NOT also as insert
+    val r3 = svc.process(withStatus(Seq(("DJ2", "never_lived", "2026-01-01 12:00:00", 1)), "d"),
+      "INCR", ctx("mrun-dj-3"), None, None).get
+    assert(r3.deleteCount == 1 && r3.insertCount == 0 && r3.updateCount == 0)
+  }
+
+  test("INCR passthrough rows get delete marking like the FULL path") {
+    val delConf = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_del_pass
+        |format = parquet
+        |merge {
+        |  keys = ["member_id"]
+        |  freshness { column = "src_modified_ts", tie_breakers = ["src_seq"] }
+        |  null_handling { drop_null_keys = false }
+        |  deletes { mode = "SOFT", indicator_column = "status", indicator_values = ["d"] }
+        |}
+        |""".stripMargin)
+    val svc = new CuratedService(spark, delConf)
+    def withStatus(rows: Seq[(String, String, String, Int)], status: String) =
+      batch(rows).withColumn("status", org.apache.spark.sql.functions.lit(status))
+
+    svc.process(withStatus(Seq(("PD1", "live", "2026-01-01 10:00:00", 1)), "a"),
+      "INCR", ctx("mrun-pd-1"), None, None)
+
+    // A keyless tombstone passes through unmerged but must still be MARKED
+    val r2 = svc.process(
+      withStatus(Seq((null.asInstanceOf[String], "keyless_gone", "2026-01-01 12:00:00", 1)), "d"),
+      "INCR", ctx("mrun-pd-2"), None, None).get
+    assert(r2.passthroughCount == 1)
+    assert(r2.deleteCount == 0, "passthrough tombstones stay in passthroughCount")
+    val keyless = spark.table("m_curated.members_del_pass")
+      .filter(col("member_id").isNull).collect().head
+    assert(keyless.getAs[String]("last_modified_op") == "D",
+      "an INCR passthrough tombstone must be delete-marked like on the FULL path")
+  }
+
+  test("INCR passthrough rows are covered by the CUR_002 alignment cast guard") {
+    val s = spark
+    import s.implicits._
+    val passConf = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_pass_guard
+        |format = parquet
+        |merge {
+        |  keys = ["member_id"]
+        |  freshness { column = "src_modified_ts" }
+        |  null_handling { drop_null_keys = false }
+        |}
+        |""".stripMargin)
+    val svc = new CuratedService(spark, passConf)
+    svc.process(batch(Seq(("PG1", "seed", "2026-01-01 10:00:00", 1))),
+      "INCR", ctx("mrun-pg-1"), None, None)
+
+    // Keyed row casts cleanly; the KEYLESS passthrough row would silently
+    // NULL on the string->int alignment cast — the guard must catch it.
+    val mixed = Seq(
+      ("PG1", "ok", "2026-01-01 11:00:00", "7"),
+      (null.asInstanceOf[String], "bad", "2026-01-01 11:00:00", "not_a_number")
+    ).toDF("member_id", "name", "src_modified_ts", "src_seq")
+      .withColumn("src_modified_ts", col("src_modified_ts").cast("timestamp"))
+    val e = intercept[IllegalStateException] {
+      svc.process(mixed, "INCR", ctx("mrun-pg-2"), None, None)
+    }
+    assert(e.getMessage.contains("CUR_002"))
+    assert(e.getMessage.contains("src_seq"))
+  }
+
   // ---------------------------------------------------------------------------
   // 10: contract-driven configuration — key derivation and MASKED payloads
   // ---------------------------------------------------------------------------
@@ -477,6 +694,26 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       .process(df, "INCR", ctx("mrun-derive-1"), attributedContract, None).get
     assert(result.dedupedCount == 1, "derived keys must drive hygiene dedup")
     assert(spark.table("m_curated.members_derived").count() == 1)
+  }
+
+  test("merge.keys = [] explicitly opts out of contract-derived merge semantics") {
+    val optOut = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_optout
+        |format = parquet
+        |merge { keys = [] }
+        |""".stripMargin)
+    val df = batch(Seq(
+      ("K1", "v1", "2026-01-01 10:00:00", 1),
+      ("K1", "v2", "2026-01-01 11:00:00", 2) // would dedup if keys were derived
+    ))
+    val result = new CuratedService(spark, optOut)
+      .process(df, "FULL", ctx("mrun-optout-1"), attributedContract, None).get
+    assert(result.dedupedCount == 0, "explicit empty keys must disable key hygiene entirely")
+    assert(result.nullKeyCount == 0)
+    assert(spark.table("m_curated.members_optout").count() == 2,
+      "keyless publish keeps every row — no silent contract-derived merge")
   }
 
   test("configured merge keys contradicting the contract's business_key fail (HDR_017)") {
@@ -512,6 +749,26 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       .filter(col("run_id") === "mrun-mask-1").collect().head.getAs[String]("raw_record")
     assert(!payload.contains("secret_phi_name"), "PHI column must be hashed")
     assert(payload.contains("\"src_seq\":7"), "non-sensitive columns stay readable for triage")
+  }
+
+  test("rejects.payload=KEYS_ONLY hashes sensitivity-tagged key columns") {
+    val keysOnlyRejects = new RejectService(spark,
+      Some(ConfigFactory.parseString(
+        """{ enabled = true, database = "m_audit", table = "ingest_rejects",
+          |  payload = "KEYS_ONLY", payload_columns = ["member_id", "name", "src_seq"] }""".stripMargin)),
+      attributedContract, logger)
+    val df = batch(Seq(
+      ("K9", "ok", "2026-01-01 10:00:00", 1),
+      (null.asInstanceOf[String], "secret_phi_name", "2026-01-01 10:00:00", 8)
+    ))
+    val result = service.process(df, "INCR", ctx("mrun-keysonly-1"), None, Some(keysOnlyRejects)).get
+    assert(result.nullKeyCount == 1)
+
+    val payload = spark.table("m_audit.ingest_rejects")
+      .filter(col("run_id") === "mrun-keysonly-1").collect().head.getAs[String]("raw_record")
+    assert(!payload.contains("secret_phi_name"),
+      "a sensitivity-tagged column must be hashed even under KEYS_ONLY")
+    assert(payload.contains("\"src_seq\":8"), "non-sensitive payload columns stay readable")
   }
 
   test("curated.partitioning is rejected explicitly (not silently ignored)") {

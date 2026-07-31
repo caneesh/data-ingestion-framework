@@ -66,7 +66,7 @@ final class IngestPipeline(
     // overlapping windows and erase each other's curated writes.
     val lock = com.hcsc.generic.ingest.lock.LockService.fromConfig(spark, feedConf, logger)
     val held = if (ctx.dryRun) None else lock.map { l => l.acquire(ctx.entity, ctx.runId); l }
-    try runInternal()
+    try runInternal(held)
     catch {
       case e: Throwable =>
         // A failed run's in-memory read window must not linger: it would
@@ -114,6 +114,19 @@ final class IngestPipeline(
 
       val slice = cli.runId match {
         case Some(rid) =>
+          // The replay publishes whatever the slice holds and stamps the run
+          // SUCCESS — replaying a run whose raw stage never completed would
+          // publish a PARTIAL slice that later --resume trusts as complete.
+          if (audit.enabled) {
+            val rawStatus = audit.stageStatus(rid, ctx.entity, Stages.Raw)
+            require(rawStatus.contains(StageStatus.Success),
+              s"PIPE_003 curated replay from run_id=$rid requires that run's raw stage to be " +
+                s"SUCCESS in the ledger (found: ${rawStatus.getOrElse("no record")}). A partial " +
+                "RAW slice must not be published as a complete curated build; re-run or --resume " +
+                "the original run first.")
+          } else
+            logger.warn(s"[Pipeline] Replaying run_id=$rid WITHOUT a ledger check " +
+              "(audit disabled): cannot verify the RAW slice is complete")
           logger.info(s"[Pipeline] Curated replay from RAW slice run_id=$rid")
           spark.table(fullTable).filter(col("run_id") === lit(rid))
         case None =>
@@ -226,7 +239,7 @@ final class IngestPipeline(
           problems.map(p => s"  - $p").mkString("\n"))
   }
 
-  private def runInternal(): Unit = {
+  private def runInternal(heldLock: Option[com.hcsc.generic.ingest.lock.LockService]): Unit = {
     logger.info(s"==== Pipeline start entity=${ctx.entity} mode=${ctx.mode} runId=${ctx.runId} " +
       s"dryRun=${ctx.dryRun} resume=${ctx.resume} ====")
     requireLedger()
@@ -272,6 +285,12 @@ final class IngestPipeline(
 
     val acceptedDf = rawOutcome.accepted
 
+    // The lease was sized for a stage, not the whole run: renew between
+    // stages so a long extraction cannot silently outlive the lock. A failed
+    // renewal (entity claimed by another run after our lease expired) aborts
+    // BEFORE the curated write.
+    heldLock.foreach(_.renew(ctx.entity, ctx.runId))
+
     // ---- Stage: curated + publish -------------------------------------------
     // curatedOutcome distinguishes three states the watermark gate needs:
     //   None             -> stage skipped (--stage raw, or resume-skip)
@@ -307,6 +326,9 @@ final class IngestPipeline(
     // (--stage raw, curated.enabled=false, or a missing curated block).
     // Feeds that are intentionally raw-only declare watermark.advance_after=RAW.
     if (!ctx.dryRun) {
+      // Renew once more before the watermark commit — the single most
+      // dangerous write to make while another run holds the entity.
+      heldLock.foreach(_.renew(ctx.entity, ctx.runId))
       val sourceType = ConfigUtils.optString(sourceConf, "type").getOrElse("file")
       SourceRegistry.resolve(sourceType) match {
         case w: com.hcsc.generic.ingest.source.WatermarkAdvancing =>
@@ -730,13 +752,15 @@ final class IngestPipeline(
         checks += (("raw_duplicate_versions", "0", o.duplicateVersions.toString, o.duplicateVersions == 0))
     }
     // Full accounting identity: every accepted RAW row must be explained by
-    // the curated outcome — a distinct key that was inserted, updated or
-    // ignored as stale, a quarantined null-key row, or an in-batch
-    // dedup loser. Rows silently vanishing between RAW and CURATED fail this.
+    // the curated outcome — a distinct key that was inserted, updated,
+    // tombstoned or ignored as stale, a quarantined null-key row, or an
+    // in-batch dedup loser. The counts are DISJOINT (a tombstone is not also
+    // an insert/update). Rows silently vanishing between RAW and CURATED
+    // fail this.
     curated.foreach { r =>
       val rawAccepted = raw.map(_.counts.acceptedCount).getOrElse(-1L)
       if (!ctx.dryRun && rawAccepted >= 0) {
-        val accounted = r.insertCount + r.updateCount + r.ignoredCount +
+        val accounted = r.insertCount + r.updateCount + r.deleteCount + r.ignoredCount +
           r.nullKeyCount + r.dedupedCount + r.passthroughCount
         checks += (("curated_accounts_for_accepted_rows",
           rawAccepted.toString, accounted.toString, accounted == rawAccepted))

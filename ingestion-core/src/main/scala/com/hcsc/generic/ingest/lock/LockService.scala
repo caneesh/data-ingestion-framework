@@ -75,6 +75,27 @@ final class LockService(
       s"(expires ${new Timestamp(System.currentTimeMillis() + leaseMillis)})")
   }
 
+  /** Extends this holder's lease mid-run. A run outliving lease_minutes
+    * silently loses its concurrency protection otherwise — the pipeline
+    * renews at stage boundaries so the lease only needs to outlast a single
+    * stage, not the whole run. Fails loudly when the lease has expired AND
+    * another run has claimed the entity in the meantime: continuing would
+    * mean two writers. */
+  def renew(entity: String, runId: String): Unit = {
+    validateKey("entity", entity)
+    validateKey("run id", runId)
+    ensureTable()
+    activeClaims(entity).filterNot(_.holder == runId).headOption.foreach { thief =>
+      throw new PipelineLockException(
+        s"PIPE_001 lease renewal failed for run '$runId': ${contention(entity, thief)} " +
+          "This run's lease expired mid-flight and the entity was claimed by another run; " +
+          "aborting rather than writing concurrently.")
+    }
+    appendRow(entity, runId, "CLAIM", Some(leaseMillis))
+    logger.info(s"[Lock] entity=$entity lease renewed by run $runId " +
+      s"(expires ${new Timestamp(System.currentTimeMillis() + leaseMillis)})")
+  }
+
   def release(entity: String, runId: String): Unit = {
     validateKey("entity", entity)
     validateKey("run id", runId)

@@ -43,9 +43,26 @@ object RawMetadata {
   def sqlType(column: String): String =
     ColumnTypes.collectFirst { case (n, t) if n.equalsIgnoreCase(column) => t }.getOrElse("string")
 
+  private val LineageColumns = Seq("run_id", "source_system", "source_database",
+    "source_schema", "source_table", "extract_start_ts", "extract_end_ts")
+
+  /** withColumn silently REPLACES an existing column: a source that happens
+    * to carry a column named like a framework metadata column would lose its
+    * data with no error. source_file is the deliberate exception — a preset
+    * value (file intake) is kept, never overwritten. */
+  private[transform] def requireNoCollisions(df: DataFrame, stamped: Seq[String], where: String): Unit = {
+    val collisions = stamped.filter(s => df.columns.exists(_.equalsIgnoreCase(s)))
+    if (collisions.nonEmpty)
+      throw new IllegalStateException(
+        s"RAW_003 Source column(s) [${collisions.mkString(", ")}] collide with framework " +
+          s"metadata column(s) stamped by $where and would be silently overwritten. " +
+          "Rename or drop them in the source query/mapping before RAW ingestion.")
+  }
+
   /** Full lineage stamping: run id, source identity and extract window. */
   def add(df: DataFrame, rawFlag: String, lineage: RawLineage): DataFrame = {
     def str(v: Option[String]) = lit(v.orNull).cast("string")
+    requireNoCollisions(df, LineageColumns, "raw lineage stamping")
     add(df, rawFlag)
       .withColumn("run_id", lit(lineage.runId))
       .withColumn("source_system", str(lineage.sourceSystem))
@@ -57,10 +74,14 @@ object RawMetadata {
   }
 
   /** Adds RAW metadata plus run lineage for replay and audit. */
-  def add(df: DataFrame, rawFlag: String, runId: String): DataFrame =
+  def add(df: DataFrame, rawFlag: String, runId: String): DataFrame = {
+    requireNoCollisions(df, Seq("run_id"), "raw lineage stamping")
     add(df, rawFlag).withColumn("run_id", lit(runId))
+  }
 
   def add(df: DataFrame, rawFlag: String): DataFrame = {
+    requireNoCollisions(df, Seq("row_idx", "load_timestamp", "file_type", "file_id"),
+      "raw metadata stamping")
     val withSource =
       if (df.columns.exists(_.equalsIgnoreCase("source_file"))) df
       else df.withColumn("source_file", input_file_name())

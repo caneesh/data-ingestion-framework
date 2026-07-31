@@ -96,6 +96,36 @@ class LockServiceSpec extends AnyFunSuite with BeforeAndAfterAll {
     shortLease.release("expiry_feed", "takeover-run")
   }
 
+  test("renew extends the lease so a long run keeps its protection") {
+    // Lease granularity is one second (timestampadd SECOND in SQL), and
+    // every lock operation costs real time — leave multi-second margins.
+    val shortLease = service(leaseMillis = 6000L)
+    shortLease.acquire("renew_feed", "long-run")
+    Thread.sleep(4000)
+    shortLease.renew("renew_feed", "long-run") // extends to ~t+10s
+    Thread.sleep(4000)
+    // ~8s after acquire the ORIGINAL lease is gone; the renewal keeps the
+    // entity locked against a competitor.
+    val e = intercept[PipelineLockException] {
+      shortLease.acquire("renew_feed", "intruder-run")
+    }
+    assert(e.getMessage.contains("long-run"))
+    shortLease.release("renew_feed", "long-run")
+  }
+
+  test("renew fails loudly when the expired entity was claimed by another run") {
+    val shortLease = service(leaseMillis = 1000L)
+    shortLease.acquire("stolen_feed", "slow-run")
+    Thread.sleep(1600)
+    shortLease.acquire("stolen_feed", "thief-run") // lease expired: legal takeover
+    val e = intercept[PipelineLockException] {
+      shortLease.renew("stolen_feed", "slow-run")
+    }
+    assert(e.getMessage.contains("PIPE_001"))
+    assert(e.getMessage.contains("thief-run"))
+    shortLease.release("stolen_feed", "thief-run")
+  }
+
   test("forceRelease evicts the active holder") {
     val lock = service()
     lock.acquire("stuck_feed", "wedged-run")

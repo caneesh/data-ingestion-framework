@@ -149,7 +149,7 @@ final class FileIntakeService(
         val duplicate = idempotencyEnabled && !ctx.forceReprocess &&
           (knownChecksums.contains(checksum) || stagedChecksums.contains(checksum))
         if (duplicate)
-          handleDuplicate(ctx, fs, l, status, checksum)
+          handleDuplicate(ctx, fs, l, status, checksum, fromLanding)
         else
           stageValidFile(ctx, fs, l, status, checksum, fingerprint, fromLanding, stagedChecksums)
     }
@@ -325,10 +325,35 @@ final class FileIntakeService(
     fs: org.apache.hadoop.fs.FileSystem,
     l: FolderLayout,
     status: org.apache.hadoop.fs.FileStatus,
-    checksum: String
+    checksum: String,
+    fromLanding: Boolean
   ): Option[StagedFile] = {
     val file = status.getPath
     val name = file.getName
+    // An INPROGRESS leftover whose checksum is already registered is OUR OWN
+    // interrupted complete() (registry first, moves second): its content was
+    // ingested — finish the move to processed. The duplicate policy governs
+    // NEW deliveries from landing; applying REJECT here would quarantine a
+    // fully-processed file, and REPROCESS_WITH_APPROVAL would strand it in
+    // inprogress on every subsequent run.
+    if (!fromLanding) {
+      val dest =
+        if (ctx.dryRun) file
+        else {
+          l.archive.foreach { a =>
+            try FsUtils.copyToDir(fs, file, a)
+            catch { case e: Exception =>
+              logger.warn(s"[FileIntake] Archive copy of recovered $name failed: ${e.getMessage}") }
+          }
+          FsUtils.moveToDir(fs, file, l.processed)
+        }
+      audit.recordFile(ctx, name, dest.toString, checksum, status.getLen,
+        FileStatuses.SkippedDuplicate,
+        "Crash recovery: checksum already registered as processed; completed the interrupted move")
+      logger.warn(s"[FileIntake] Recovered $name from inprogress (already registered as " +
+        "processed); moved to processed without re-ingesting")
+      return None
+    }
     duplicatePolicy match {
       case DuplicatePolicy.Reject =>
         val dest = if (ctx.dryRun) file else FsUtils.moveToDir(fs, file, l.quarantine)

@@ -62,4 +62,35 @@ class RawMetadataTest extends AnyFunSuite with SharedSparkSession {
     val result = RawMetadata.add(df, "F")
     assert(result.count() == 3)
   }
+
+  // ---------------------------------------------------------------------------
+  // RAW_003: withColumn REPLACES silently — colliding source columns must
+  // fail fast, never lose their data
+  // ---------------------------------------------------------------------------
+
+  test("a source column colliding with a stamped metadata column fails fast (RAW_003)") {
+    import spark.implicits._
+    val df = Seq(("x", "source-provided")).toDF("name", "load_timestamp")
+    val e = intercept[IllegalStateException] { RawMetadata.add(df, "F") }
+    assert(e.getMessage.contains("RAW_003"))
+    assert(e.getMessage.contains("load_timestamp"))
+  }
+
+  test("a source run_id column collides with lineage stamping (RAW_003)") {
+    import spark.implicits._
+    val df = Seq(("x", "rogue")).toDF("name", "RUN_ID") // case-insensitive
+    val e = intercept[IllegalStateException] {
+      RawMetadata.add(df, "F", RawLineage(runId = "r1"))
+    }
+    assert(e.getMessage.contains("RAW_003"))
+    assert(e.getMessage.toLowerCase.contains("run_id"))
+  }
+
+  test("a source record_hash column collides with hash stamping (RAW_003)") {
+    import spark.implicits._
+    val df = Seq(("x", "fake-hash")).toDF("name", "record_hash")
+    val e = intercept[IllegalStateException] { RecordHash.stamp(df, None) }
+    assert(e.getMessage.contains("RAW_003"))
+    assert(e.getMessage.contains("record_hash"))
+  }
 }

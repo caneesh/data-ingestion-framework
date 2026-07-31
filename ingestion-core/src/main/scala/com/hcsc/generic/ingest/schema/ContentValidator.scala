@@ -30,7 +30,20 @@ object ContentValidator {
 
     if (ruledColumns.isEmpty && allNullChecked.isEmpty) return Seq.empty
 
-    val scope = if (cfg.sampleMode) df.limit(cfg.sampleRows) else df
+    // SAMPLE must draw from the WHOLE frame: limit(n) takes the first rows
+    // of the first file, so a swapped column in any later file would be
+    // invisible. Sample a seeded fraction across all partitions instead
+    // (small frames are validated in full).
+    val scope =
+      if (!cfg.sampleMode) df
+      else {
+        val totalRows = df.count()
+        if (totalRows <= cfg.sampleRows) df
+        else {
+          val fraction = math.min(1.0, cfg.sampleRows.toDouble * 1.2 / totalRows)
+          df.sample(withReplacement = false, fraction, seed = 42L).limit(cfg.sampleRows)
+        }
+      }
 
     // Single Spark action: rule failures, per-column null counts, and
     // non-null counts for the all-null check

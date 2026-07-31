@@ -44,6 +44,11 @@ object IngestMain {
           // Governed replay path: real run context, entity lock, ledger,
           // rejects and contract validation — never the watermark.
           new IngestPipeline(spark, feedConf, cli, logger).curatedReplay()
+        case "retention" =>
+          // Config-driven purge of raw partitions, reject/audit rows and
+          // watermark history; honors --dry-run.
+          new com.hcsc.generic.ingest.retention.RetentionService(spark, feedConf, logger)
+            .run(dryRun = cli.dryRun)
         case _ =>
           new IngestPipeline(spark, feedConf, cli, logger).run()
       }

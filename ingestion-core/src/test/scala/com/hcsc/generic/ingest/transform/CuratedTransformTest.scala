@@ -265,6 +265,67 @@ class CuratedTransformTest extends AnyFunSuite with SharedSparkSession {
     assert(e.getMessage.contains("nonexistent_col"))
   }
 
+  test("contract transforms apply TRIM/UPPER/LOWER and {col} expressions") {
+    import spark.implicits._
+    val contract = com.hcsc.generic.ingest.schema.SchemaContract.parse(
+      com.typesafe.config.ConfigFactory.parseString(
+        """schema {
+          |  version = "1.0"
+          |  columns = [
+          |    { name = "member_id", type = "string", transform = "TRIM" },
+          |    { name = "state", type = "string", transform = "UPPER" },
+          |    { name = "email", type = "string", transform = "lower({col})" }
+          |  ]
+          |}""".stripMargin))
+    val df = Seq(("  M1  ", "il", "A@B.COM")).toDF("member_id", "state", "email")
+    val out = transform.applyContractTransforms(df, contract).collect().head
+    assert(out.getString(0) == "M1")
+    assert(out.getString(1) == "IL")
+    assert(out.getString(2) == "a@b.com")
+  }
+
+  test("an unknown contract transform fails fast (HDR_017)") {
+    import spark.implicits._
+    val contract = com.hcsc.generic.ingest.schema.SchemaContract.parse(
+      com.typesafe.config.ConfigFactory.parseString(
+        """schema {
+          |  version = "1.0"
+          |  columns = [ { name = "x", type = "string", transform = "reverse" } ]
+          |}""".stripMargin))
+    val e = intercept[IllegalArgumentException] {
+      transform.applyContractTransforms(Seq("v").toDF("x"), contract)
+    }
+    assert(e.getMessage.contains("HDR_017"))
+  }
+
+  test("contract mapping attributes parse: sensitivity, business_key, incremental") {
+    val contract = com.hcsc.generic.ingest.schema.SchemaContract.parse(
+      com.typesafe.config.ConfigFactory.parseString(
+        """schema {
+          |  version = "1.0"
+          |  columns = [
+          |    { name = "member_id", type = "string", business_key = true, sensitivity = "PII",
+          |      source_type = "nvarchar(20)" },
+          |    { name = "modified_ts", type = "timestamp", incremental = true },
+          |    { name = "notes", type = "string", sensitivity = "UNRESTRICTED" }
+          |  ]
+          |}""".stripMargin)).get
+    assert(contract.businessKeyColumns == Seq("member_id"))
+    assert(contract.incrementalColumns == Seq("modified_ts"))
+    assert(contract.sensitiveColumns == Seq("member_id"), "UNRESTRICTED is not sensitive")
+    assert(contract.columns.head.sourceType.contains("nvarchar(20)"))
+
+    val bad = intercept[IllegalArgumentException] {
+      com.hcsc.generic.ingest.schema.SchemaContract.parse(
+        com.typesafe.config.ConfigFactory.parseString(
+          """schema {
+            |  version = "1.0"
+            |  columns = [ { name = "x", sensitivity = "TOP_SECRET" } ]
+            |}""".stripMargin))
+    }
+    assert(bad.getMessage.contains("HDR_017"))
+  }
+
   test("record_hash is stable across column order and distinguishes null from empty") {
     import spark.implicits._
     val a = Seq(("x", "y")).toDF("c1", "c2")

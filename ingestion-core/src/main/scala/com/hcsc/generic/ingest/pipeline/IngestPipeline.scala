@@ -67,6 +67,21 @@ final class IngestPipeline(
     val lock = com.hcsc.generic.ingest.lock.LockService.fromConfig(spark, feedConf, logger)
     val held = if (ctx.dryRun) None else lock.map { l => l.acquire(ctx.entity, ctx.runId); l }
     try runInternal()
+    catch {
+      case e: Throwable =>
+        // A failed run's in-memory read window must not linger: it would
+        // accumulate in a long-lived driver and could feed a stale captured
+        // upper to a later same-JVM attempt.
+        try {
+          val sourceType = ConfigUtils.optString(feedConf.getConfig("source"), "type").getOrElse("file")
+          SourceRegistry.resolve(sourceType) match {
+            case w: com.hcsc.generic.ingest.source.WatermarkAdvancing =>
+              w.discardWindow(ctx.entity, Some(ctx.runId))
+            case _ => ()
+          }
+        } catch { case _: Exception => () }
+        throw e
+    }
     finally {
       held.foreach(l =>
         try l.release(ctx.entity, ctx.runId)

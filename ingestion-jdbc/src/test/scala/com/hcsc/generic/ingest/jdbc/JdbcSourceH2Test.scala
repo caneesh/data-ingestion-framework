@@ -501,6 +501,61 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
     assert(ex.getMessage.contains("incremental"))
   }
 
+  test("watermark_columns derive from contract columns flagged incremental=true") {
+    val cfg = JdbcSourceConfig.parse(conf(
+      """
+        |mode = "INCREMENTAL"
+        |table = "members"
+        |incremental {
+        |  watermark_type = "TIMESTAMP"
+        |  initial_value = "1900-01-01 00:00:00"
+        |  watermark_store { type = "memory" }
+        |}
+        |schema {
+        |  version = "1.0"
+        |  columns = [
+        |    { name = "subscriber_id", type = "string" },
+        |    { name = "plan_hios_id", type = "string" },
+        |    { name = "amount", type = "int" },
+        |    { name = "modified_ts", type = "timestamp", incremental = true }
+        |  ]
+        |}
+      """.stripMargin))
+    assert(cfg.watermark.get.columns == Seq("modified_ts"),
+      "the contract's incremental flag must derive the watermark column")
+  }
+
+  test("discardWindow drops a failed run's window so a stale upper cannot commit") {
+    val incremental = conf(
+      """
+        |mode = "INCREMENTAL"
+        |table = "members"
+        |entity = "discard_feed"
+        |incremental {
+        |  watermark_type = "TIMESTAMP"
+        |  watermark_columns = ["modified_ts"]
+        |  initial_value = "1900-01-01 00:00:00"
+        |  upper_bound = "SOURCE_CLOCK"
+        |  clock_zone = "LOCAL"
+        |  watermark_store { type = "memory" }
+        |}
+      """.stripMargin)
+
+    val df = JdbcSource.read(spark, incremental)
+    assert(JdbcSource.lastWindow("discard_feed", None).isDefined)
+
+    // The run "fails": the pipeline discards its window
+    JdbcSource.discardWindow("discard_feed", None)
+    assert(JdbcSource.lastWindow("discard_feed", None).isEmpty)
+
+    // A later commit (resume-style) falls back to the extracted max — it
+    // must NOT be the discarded clock upper (which is far ahead of row data)
+    JdbcSource.advanceWatermark(spark, incremental, "discard_feed", "run-d1", df)
+    val committed = InMemoryWatermarkStore.latest("discard_feed").get.values.head
+    assert(committed.startsWith("2026-04-01"),
+      s"committed=$committed must be the extracted row max (2026-04-01), not the discarded clock upper")
+  }
+
   test("schema contract detects drift: aliases map, unknown required column fails") {
     val contract =
       """

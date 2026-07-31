@@ -387,8 +387,17 @@ object JdbcSourceConfig {
     if (!WatermarkType.all.contains(watermarkType))
       fail(s"incremental.watermark_type '$watermarkType' must be one of ${WatermarkType.all.mkString(", ")}")
 
-    val columns = ConfigUtils.stringList(inc, "watermark_columns")
-    if (columns.isEmpty) fail("incremental.watermark_columns must not be empty")
+    // Explicit watermark_columns win; otherwise columns the contract flags
+    // incremental = true derive them (same precedence as merge-key
+    // derivation on the curated side).
+    val configuredColumns = ConfigUtils.stringList(inc, "watermark_columns")
+    val columns =
+      if (configuredColumns.nonEmpty) configuredColumns
+      else com.hcsc.generic.ingest.schema.SchemaContract.parse(source)
+        .map(_.incrementalColumns).getOrElse(Seq.empty)
+    if (columns.isEmpty)
+      fail("incremental.watermark_columns must not be empty (configure it, or flag contract " +
+        "columns with incremental = true)")
     if (watermarkType != WatermarkType.Composite && columns.size != 1)
       fail(s"watermark_type $watermarkType requires exactly one watermark column")
     if (watermarkType == WatermarkType.Composite && columns.size < 2)

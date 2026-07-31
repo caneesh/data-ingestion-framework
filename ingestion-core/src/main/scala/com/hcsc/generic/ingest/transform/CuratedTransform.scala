@@ -22,6 +22,30 @@ final class CuratedTransform(spark: SparkSession) {
     }
   }
 
+  /** Contract-declared per-column transforms (mapping-spec attribute):
+    * TRIM | UPPER | LOWER, or a Spark SQL expression containing {col}.
+    * Applied at the curated stage — RAW stays untransformed. */
+  def applyContractTransforms(df: DataFrame, contract: Option[com.hcsc.generic.ingest.schema.SchemaContract]): DataFrame =
+    contract.fold(df) { c =>
+      c.columns.filter(_.transform.isDefined).foldLeft(df) { (acc, cc) =>
+        acc.columns.find(_.equalsIgnoreCase(cc.name)) match {
+          case Some(actual) =>
+            val quoted = s"`${actual.replace("`", "``")}`"
+            val exprStr = cc.transform.get.trim match {
+              case t if t.equalsIgnoreCase("TRIM")  => s"trim($quoted)"
+              case t if t.equalsIgnoreCase("UPPER") => s"upper($quoted)"
+              case t if t.equalsIgnoreCase("LOWER") => s"lower($quoted)"
+              case t if t.contains("{col}")         => t.replace("{col}", quoted)
+              case other => throw new IllegalArgumentException(
+                s"HDR_017 column '${cc.name}' transform '$other' must be TRIM, UPPER, LOWER " +
+                  "or a Spark SQL expression containing {col}")
+            }
+            acc.withColumn(actual, expr(exprStr))
+          case None => acc
+        }
+      }
+    }
+
   def applyTransforms(df: DataFrame, conf: Config): DataFrame = {
     if (!conf.hasPath("transform.derive")) return df
     conf.getConfigList("transform.derive").asScala.foldLeft(df) { (acc, item) =>

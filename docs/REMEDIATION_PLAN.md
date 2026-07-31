@@ -43,8 +43,25 @@ C1–C12, S1–S16, backlog items 1–21.
 > separate `<entity>-schema.conf` via HOCON `include required(...)`, the
 > JDBC flow gained the contract questions, and `JdbcSchemaIntrospector`
 > bootstraps wide mappings from `DatabaseMetaData`/INFORMATION_SCHEMA.
-> The `ColumnContract` attribute extensions (sensitivity, business-key,
-> incremental flags) remain open.
+>
+> **Phase 3 implemented (2026-07-30) except the Delta/Iceberg spike:**
+> #16 soft-delete strategy (`curated.merge.deletes = IGNORE | SOFT` with
+> indicator column/values; tombstones compete by freshness, stamped
+> op='D'/is_deleted; stale records cannot resurrect a newer delete;
+> RECONCILE remains future work); #17 record_hash (done earlier); #18
+> `ColumnContract` gains source_type/transform/sensitivity/business_key/
+> incremental — merge keys and watermark columns derive from the contract
+> (explicit config wins, contradictions are HDR_017), contract transforms
+> (TRIM/UPPER/LOWER/{col} expressions) run at the curated stage, and
+> `rejects.payload = MASKED` hashes only sensitivity-tagged columns; #20
+> `RetentionService` via `--stage retention` (raw ingest_dt partition
+> drops, staged-rewrite purges for reject/audit tables, watermark
+> keep-last-N, dry-run); #21 advanceWatermark reuses the read-time parsed
+> config (no last-step secret re-resolution), failed runs discard their
+> read windows, and `curated.partitioning` is rejected explicitly.
+> **#19 (Delta/Iceberg atomic publish) remains open, gated on the target-
+> technology business decision** — the staged INSERT OVERWRITE stays the
+> publish mechanism until then.
 **Goal:** close the P0 correctness gaps first, then the P1 guardrails, with
 every phase leaving the framework releasable (no phase depends on a later
 one to be safe). File/line references are to current `main`.

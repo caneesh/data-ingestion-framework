@@ -69,8 +69,31 @@ final case class ColumnContract(
   required: Boolean = true,
   default: Option[String] = None,
   category: String = "business",
-  validation: Option[ColumnValidation] = None
-)
+  validation: Option[ColumnValidation] = None,
+  /** Source engine's declared type (e.g. "nvarchar(50)") — documentation of
+    * the mapping; the framework validates against dataType (the Spark type). */
+  sourceType: Option[String] = None,
+  /** Per-column transformation applied at the CURATED stage: TRIM | UPPER |
+    * LOWER, or a Spark SQL expression containing the placeholder {col}. */
+  transform: Option[String] = None,
+  /** Data-sensitivity classification: PII | PHI | CONFIDENTIAL |
+    * UNRESTRICTED. Drives sensitivity-aware reject-payload masking. */
+  sensitivity: Option[String] = None,
+  /** Part of the business key: curated.merge.keys derives from these when
+    * not configured explicitly (a configured mismatch is HDR_017). */
+  businessKey: Boolean = false,
+  /** Drives incremental extraction: incremental.watermark_columns derives
+    * from these when not configured explicitly. */
+  incremental: Boolean = false
+) {
+  def isSensitive: Boolean =
+    sensitivity.exists(s => ColumnContract.SensitiveClassifications.contains(s.toUpperCase))
+}
+
+object ColumnContract {
+  val Sensitivities: Set[String] = Set("PII", "PHI", "CONFIDENTIAL", "UNRESTRICTED")
+  val SensitiveClassifications: Set[String] = Set("PII", "PHI", "CONFIDENTIAL")
+}
 
 final case class PositionalFallback(
   enabled: Boolean,
@@ -119,6 +142,17 @@ final case class SchemaContract(
 
   def requiredColumns: Seq[ColumnContract] = columns.filter(_.required)
   def optionalColumns: Seq[ColumnContract] = columns.filterNot(_.required)
+
+  /** Contract-declared business key (business_key = true), in declaration
+    * order — the derivation source for curated.merge.keys. */
+  def businessKeyColumns: Seq[String] = columns.filter(_.businessKey).map(_.name)
+
+  /** Contract-declared incremental column(s) — the derivation source for
+    * incremental.watermark_columns. */
+  def incrementalColumns: Seq[String] = columns.filter(_.incremental).map(_.name)
+
+  /** Columns classified PII/PHI/CONFIDENTIAL. */
+  def sensitiveColumns: Seq[String] = columns.filter(_.isSensitive).map(_.name)
 
   /** Normalized canonical name -> canonical name (STRICT_NAME matching). */
   lazy val nameLookup: Map[String, String] =
@@ -208,6 +242,11 @@ object SchemaContract {
     val default =
       if (c.hasPathOrNull("default") && !c.getIsNull("default")) Some(c.getString("default"))
       else None
+    val sensitivity = ConfigUtils.optString(c, "sensitivity").map(_.toUpperCase)
+    sensitivity.foreach(s => require(ColumnContract.Sensitivities.contains(s),
+      s"HDR_017 column '${c.getString("name")}' sensitivity '$s' must be one of " +
+        ColumnContract.Sensitivities.mkString(", ")))
+
     ColumnContract(
       name = c.getString("name"),
       dataType = ConfigUtils.optString(c, "type")
@@ -218,7 +257,12 @@ object SchemaContract {
       required = ConfigUtils.optBoolean(c, "required").getOrElse(true),
       default = default,
       category = ConfigUtils.optString(c, "category").getOrElse("business").toLowerCase,
-      validation = if (validation.isDefined) Some(validation) else None
+      validation = if (validation.isDefined) Some(validation) else None,
+      sourceType = ConfigUtils.optString(c, "source_type"),
+      transform = ConfigUtils.optString(c, "transform"),
+      sensitivity = sensitivity,
+      businessKey = ConfigUtils.optBoolean(c, "business_key").getOrElse(false),
+      incremental = ConfigUtils.optBoolean(c, "incremental").getOrElse(false)
     )
   }
 

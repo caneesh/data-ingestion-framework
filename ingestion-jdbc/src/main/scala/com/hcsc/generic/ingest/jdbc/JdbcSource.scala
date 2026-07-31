@@ -37,7 +37,10 @@ object JdbcSource extends Source with WatermarkAdvancing {
     lower: WatermarkValue,
     capturedUpper: Option[WatermarkValue],
     version: Long,
-    queryHash: Option[String] = None)
+    queryHash: Option[String] = None,
+    // Read-time parsed config, so the commit step never re-parses (and
+    // re-resolves vault secrets) after RAW and curated already committed.
+    cfg: Option[JdbcSourceConfig] = None)
   private val readWindows = new java.util.concurrent.ConcurrentHashMap[String, ReadWindow]()
 
   override def sourceType: String = "jdbc"
@@ -89,7 +92,7 @@ object JdbcSource extends Source with WatermarkAdvancing {
         // Bounded window: capture the source's upper bound BEFORE the read
         // (MAX of the watermark column, or the source clock for SOURCE_CLOCK).
         val upper = captureUpper(cfg, wm, companionParams)
-        readWindows.put(windowKey(entity, runId), ReadWindow(lower, upper, version))
+        readWindows.put(windowKey(entity, runId), ReadWindow(lower, upper, version, cfg = Some(cfg)))
         contextLower = Some(lower.serialized)
         contextUpper = upper.map(_.serialized)
 
@@ -119,7 +122,7 @@ object JdbcSource extends Source with WatermarkAdvancing {
         // one-time FULL -> INCR handoff).
         if (!wm.allowNullWatermark) validateNoNullWatermarks(cfg, wm, companionParams)
         val upper = captureUpper(cfg, wm, companionParams)
-        readWindows.put(windowKey(entity, runId), ReadWindow(lower, upper, version))
+        readWindows.put(windowKey(entity, runId), ReadWindow(lower, upper, version, cfg = Some(cfg)))
         contextLower = Some(lower.serialized)
         contextUpper = upper.map(_.serialized)
         logger.info(s"[JdbcSource] entity=$entity FULL_TABLE run captured watermark seed " +
@@ -449,15 +452,19 @@ object JdbcSource extends Source with WatermarkAdvancing {
     runId: String,
     accepted: DataFrame
   ): Unit = {
-    val cfg = JdbcSourceConfig.parse(sourceConf)
+    // Windows are keyed per (entity, run) so concurrent runs of the same
+    // entity in one JVM cannot commit each other's captured upper. The
+    // bare-entity fallback covers standalone reads whose config carried no
+    // run_id (the pipeline always injects one).
+    val window = Option(readWindows.remove(windowKey(entity, Some(runId))))
+      .orElse(Option(readWindows.remove(windowKey(entity, None))))
+    // Reuse the read-time parsed config: re-parsing at the LAST pipeline
+    // step re-resolves vault secrets, and a vault hiccup here would fail
+    // the run AFTER raw and curated already committed (forcing a duplicate
+    // re-extract). Only the resume path (no window) still parses.
+    val cfg = window.flatMap(_.cfg).getOrElse(JdbcSourceConfig.parse(sourceConf))
     cfg.watermark.foreach { wm =>
       val store = WatermarkStores.from(wm, spark)
-      // Windows are keyed per (entity, run) so concurrent runs of the same
-      // entity in one JVM cannot commit each other's captured upper. The
-      // bare-entity fallback covers standalone reads whose config carried no
-      // run_id (the pipeline always injects one).
-      val window = Option(readWindows.remove(windowKey(entity, Some(runId))))
-        .orElse(Option(readWindows.remove(windowKey(entity, None))))
 
       // Seeding is only ever committed from a recorded seed window: a
       // FULL_TABLE run whose read declined to seed (store already
@@ -515,6 +522,14 @@ object JdbcSource extends Source with WatermarkAdvancing {
     Option(readWindows.get(windowKey(entity, runId)))
       .orElse(Option(readWindows.get(windowKey(entity, None))))
       .map(w => (w.lower.serialized, w.capturedUpper.map(_.serialized)))
+
+  /** Drops a failed run's recorded window so a long-lived driver JVM does
+    * not accumulate abandoned entries (and a later same-JVM attempt cannot
+    * commit a stale captured upper). Invoked by the pipeline on failure. */
+  override def discardWindow(entity: String, runId: Option[String]): Unit = {
+    readWindows.remove(windowKey(entity, runId))
+    readWindows.remove(windowKey(entity, None))
+  }
 
   def register(): Unit = SourceRegistry.register(this)
 

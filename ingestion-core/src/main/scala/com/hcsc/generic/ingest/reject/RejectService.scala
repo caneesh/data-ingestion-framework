@@ -52,25 +52,36 @@ final class RejectService(
   val handlesContractNullability: Boolean =
     enabled && rejectConf.exists(c => ConfigUtils.optBoolean(c, "use_contract_nullability").getOrElse(false))
 
-  /** rejects.payload = FULL | HASHED | KEYS_ONLY. The reject table can hold
-    * PHI: FULL stores the record verbatim (loud warning), HASHED preserves
-    * the structure but SHA-256s every value (joinable, irreversible),
+  /** rejects.payload = FULL | MASKED | HASHED | KEYS_ONLY. The reject table
+    * can hold PHI: FULL stores the record verbatim (loud warning), MASKED
+    * hashes only the columns the contract classifies PII/PHI/CONFIDENTIAL
+    * (keeping the rest readable for triage), HASHED SHA-256s every value,
     * KEYS_ONLY stores only rejects.payload_columns. */
   private val payloadMode: String = {
     val mode = rejectConf.flatMap(c => ConfigUtils.optString(c, "payload"))
       .getOrElse("FULL").toUpperCase
-    require(Seq("FULL", "HASHED", "KEYS_ONLY").contains(mode),
-      s"rejects.payload '$mode' must be FULL, HASHED or KEYS_ONLY")
+    require(Seq("FULL", "MASKED", "HASHED", "KEYS_ONLY").contains(mode),
+      s"rejects.payload '$mode' must be FULL, MASKED, HASHED or KEYS_ONLY")
+    if (mode == "MASKED")
+      require(contract.exists(_.sensitiveColumns.nonEmpty),
+        "rejects.payload = MASKED requires a schema contract with sensitivity classifications " +
+          "(PII/PHI/CONFIDENTIAL) — without them nothing would be masked; use HASHED instead")
     if (enabled && mode == "FULL")
       logger.warn("[RejectService] rejects.payload=FULL: rejected records are stored UNREDACTED " +
-        "in the reject table — for sensitive feeds set payload = HASHED or KEYS_ONLY and " +
-        "restrict access to the reject table like the RAW layer")
+        "in the reject table — for sensitive feeds set payload = MASKED, HASHED or KEYS_ONLY " +
+        "and restrict access to the reject table like the RAW layer")
     mode
   }
 
   private def payloadJson(df: DataFrame, businessCols: Seq[String]): Column = payloadMode match {
     case "HASHED" =>
       to_json(struct(businessCols.map(c => sha2(col(c).cast("string"), 256).as(c)): _*))
+    case "MASKED" =>
+      val sensitive = contract.map(_.sensitiveColumns.map(_.toLowerCase).toSet).getOrElse(Set.empty)
+      to_json(struct(businessCols.map { c =>
+        if (sensitive.contains(c.toLowerCase)) sha2(col(c).cast("string"), 256).as(c)
+        else col(c)
+      }: _*))
     case "KEYS_ONLY" =>
       val keep = rejectConf.map(c => ConfigUtils.stringList(c, "payload_columns")).getOrElse(Seq.empty)
       require(keep.nonEmpty, "rejects.payload = KEYS_ONLY requires rejects.payload_columns")

@@ -404,6 +404,132 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   // ---------------------------------------------------------------------------
+  // 9: soft deletes — tombstones compete by freshness (spec §8)
+  // ---------------------------------------------------------------------------
+
+  test("SOFT deletes tombstone the winning key and never resurrect by staleness") {
+    val delConf = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_del
+        |format = parquet
+        |merge {
+        |  keys = ["member_id"]
+        |  freshness { column = "src_modified_ts", tie_breakers = ["src_seq"] }
+        |  deletes { mode = "SOFT", indicator_column = "status", indicator_values = ["d"] }
+        |}
+        |""".stripMargin)
+    val svc = new CuratedService(spark, delConf)
+    def withStatus(rows: Seq[(String, String, String, Int)], status: String) =
+      batch(rows).withColumn("status", org.apache.spark.sql.functions.lit(status))
+
+    // Seed an active record
+    val r1 = svc.process(withStatus(Seq(("D1", "active", "2026-01-01 10:00:00", 1)), "a"),
+      "INCR", ctx("mrun-del-1"), None, None).get
+    assert(r1.deleteCount == 0)
+
+    // A NEWER delete record wins and tombstones the key
+    val r2 = svc.process(withStatus(Seq(("D1", "gone", "2026-01-01 12:00:00", 2)), "d"),
+      "INCR", ctx("mrun-del-2"), None, None).get
+    assert(r2.deleteCount == 1)
+    val tombstone = spark.table("m_curated.members_del")
+      .filter(col("member_id") === "D1").collect().head
+    assert(tombstone.getAs[String]("last_modified_op") == "D")
+
+    // A STALE (older) non-delete record must not resurrect the tombstone
+    val r3 = svc.process(withStatus(Seq(("D1", "zombie", "2026-01-01 11:00:00", 1)), "a"),
+      "INCR", ctx("mrun-del-3"), None, None).get
+    assert(r3.ignoredCount == 1)
+    assert(spark.table("m_curated.members_del").filter(col("member_id") === "D1")
+      .collect().head.getAs[String]("last_modified_op") == "D",
+      "a stale record must not undo a newer delete")
+  }
+
+  // ---------------------------------------------------------------------------
+  // 10: contract-driven configuration — key derivation and MASKED payloads
+  // ---------------------------------------------------------------------------
+
+  private val attributedContract = com.hcsc.generic.ingest.schema.SchemaContract.parse(
+    ConfigFactory.parseString(
+      """schema {
+        |  version = "1.0"
+        |  columns = [
+        |    { name = "member_id", type = "string", business_key = true, nullable = false },
+        |    { name = "name", type = "string", sensitivity = "PHI", required = false },
+        |    { name = "src_modified_ts", type = "timestamp", incremental = true, required = false },
+        |    { name = "src_seq", type = "int", required = false }
+        |  ]
+        |}""".stripMargin))
+
+  test("merge keys derive from contract business_key columns when unconfigured") {
+    val keyless = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_derived
+        |format = parquet
+        |merge { freshness { column = "src_modified_ts", tie_breakers = ["src_seq"] } }
+        |""".stripMargin)
+    val df = batch(Seq(
+      ("K1", "v1", "2026-01-01 10:00:00", 1),
+      ("K1", "v2", "2026-01-01 11:00:00", 2) // dedup only happens if keys derived
+    ))
+    val result = new CuratedService(spark, keyless)
+      .process(df, "INCR", ctx("mrun-derive-1"), attributedContract, None).get
+    assert(result.dedupedCount == 1, "derived keys must drive hygiene dedup")
+    assert(spark.table("m_curated.members_derived").count() == 1)
+  }
+
+  test("configured merge keys contradicting the contract's business_key fail (HDR_017)") {
+    val contradicting = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_conflict
+        |format = parquet
+        |merge { keys = ["name"] }
+        |""".stripMargin)
+    val e = intercept[IllegalArgumentException] {
+      new CuratedService(spark, contradicting)
+        .process(batch(Seq(("K1", "v", "2026-01-01 10:00:00", 1))),
+          "INCR", ctx("mrun-derive-2"), attributedContract, None)
+    }
+    assert(e.getMessage.contains("HDR_017"))
+    assert(e.getMessage.contains("business_key"))
+  }
+
+  test("rejects.payload=MASKED hashes only sensitivity-tagged columns") {
+    val maskedRejects = new RejectService(spark,
+      Some(ConfigFactory.parseString(
+        """{ enabled = true, database = "m_audit", table = "ingest_rejects", payload = "MASKED" }""")),
+      attributedContract, logger)
+    val df = batch(Seq(
+      ("M9", "ok", "2026-01-01 10:00:00", 1),
+      (null.asInstanceOf[String], "secret_phi_name", "2026-01-01 10:00:00", 7)
+    ))
+    val result = service.process(df, "INCR", ctx("mrun-mask-1"), None, Some(maskedRejects)).get
+    assert(result.nullKeyCount == 1)
+
+    val payload = spark.table("m_audit.ingest_rejects")
+      .filter(col("run_id") === "mrun-mask-1").collect().head.getAs[String]("raw_record")
+    assert(!payload.contains("secret_phi_name"), "PHI column must be hashed")
+    assert(payload.contains("\"src_seq\":7"), "non-sensitive columns stay readable for triage")
+  }
+
+  test("curated.partitioning is rejected explicitly (not silently ignored)") {
+    val partitioned = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_part
+        |format = parquet
+        |partitioning { keys = ["state"] }
+        |""".stripMargin)
+    val e = intercept[IllegalArgumentException] {
+      new CuratedService(spark, partitioned)
+        .process(batch(Seq(("P1", "v", "2026-01-01 10:00:00", 1))), "FULL", ctx("mrun-part-1"), None, None)
+    }
+    assert(e.getMessage.contains("partitioning is not supported"))
+  }
+
+  // ---------------------------------------------------------------------------
   // 8: freshness column colliding with framework audit columns is rejected
   // ---------------------------------------------------------------------------
 

@@ -109,13 +109,18 @@ final class CuratedTransform(spark: SparkSession) {
         "or curated.merge.freshness.column for deterministic results.")
       return df.dropDuplicates(keys)
     }
-    val missing = orderBy.filterNot(o => df.columns.exists(_.equalsIgnoreCase(o)))
+    // Entries parse as "column [asc|desc] [nulls_first|nulls_last]"; a bare
+    // name keeps the historical desc_nulls_last, so existing configurations
+    // order identically.
+    val specs = orderBy.map(OrderSpec.parse)
+    val missing = specs.map(_.column).filterNot(o => df.columns.exists(_.equalsIgnoreCase(o)))
     if (missing.nonEmpty)
       throw new IllegalStateException(
         s"HDR_019 Dedup ordering column(s) ${missing.mkString(", ")} not present in the data; " +
           "refusing nondeterministic deduplication"
       )
-    val existingOrder = orderBy.flatMap(o => df.columns.find(_.equalsIgnoreCase(o)))
+    val existingOrder = specs.flatMap(s =>
+      df.columns.find(_.equalsIgnoreCase(s.column)).map(s.toColumn))
     // Rows tied on every order_by column previously produced an arbitrary
     // winner (partition-layout dependent). row_idx — when present from RAW
     // metadata — is a defined final tie-break, so one computed frame always
@@ -125,7 +130,7 @@ final class CuratedTransform(spark: SparkSession) {
     val tieBreak = df.columns.find(_.equalsIgnoreCase("row_idx"))
       .map(c => col(c).desc_nulls_last).toSeq
     val w = Window.partitionBy(keys.map(col): _*)
-      .orderBy(existingOrder.map(c => col(c).desc_nulls_last) ++ tieBreak: _*)
+      .orderBy(existingOrder ++ tieBreak: _*)
     df.withColumn("_rn", row_number().over(w))
       .filter(col("_rn") === 1)
       .drop("_rn")

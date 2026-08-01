@@ -376,6 +376,32 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       "ADVANCE (default) commits the captured upper even with rejects")
   }
 
+  test("merge.require_ordering=true refuses the nondeterministic dedup fallback (CUR_004)") {
+    val strict = ConfigFactory.parseString(
+      """curated { merge { require_ordering = true } }""").withFallback(auditedConf("strict"))
+    val e = intercept[IllegalStateException] {
+      new IngestPipeline(spark, strict,
+        Cli(entity = "claims_strict", mode = "FULL", runId = Some("st-1")), logger).run()
+    }
+    assert(e.getMessage.contains("CUR_004"))
+  }
+
+  test("merge.null_handling.policy=FAIL_RUN fails the run on null business keys (CUR_001)") {
+    h2("INSERT INTO claims VALUES (NULL, 999, '2026-01-09 09:00:00')")
+    val failRun = ConfigFactory.parseString(
+      """curated { merge {
+        |  null_handling { policy = "FAIL_RUN" }
+        |  freshness { column = "modified_ts" }
+        |} }""".stripMargin).withFallback(auditedConf("failrun"))
+    val e = intercept[IllegalStateException] {
+      new IngestPipeline(spark, failRun,
+        Cli(entity = "claims_failrun", mode = "FULL", runId = Some("fr-1")), logger).run()
+    }
+    assert(e.getMessage.contains("CUR_001"))
+    assert(InMemoryWatermarkStore.latest("claims_failrun").isEmpty,
+      "the failed run must not seed the watermark")
+  }
+
   test("watermark continuity mismatch between store and ledger fails reconciliation") {
     import org.apache.spark.sql.functions.col
     // A ghost ledger entry claims a newer window was already extracted for

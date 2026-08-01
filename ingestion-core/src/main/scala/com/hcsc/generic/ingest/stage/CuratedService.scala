@@ -25,8 +25,10 @@ final case class CuratedResult(
 )
 
 /** Source-freshness contract for the incremental merge: the column whose
-  * highest value wins per business key, plus deterministic tie-breakers
-  * (all compared descending, nulls last; remaining ties keep the target). */
+  * highest value wins per business key (always descending, nulls last),
+  * plus deterministic tie-breakers — each optionally carrying direction and
+  * null ordering ("col asc nulls_first"), defaulting to descending nulls
+  * last. Remaining exact ties keep the target. */
 final case class FreshnessSpec(column: String, tieBreakers: Seq[String])
 
 /** Explicit delete strategy (spec §8: delete handling cannot be inferred). */
@@ -99,10 +101,24 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     val ordering = effectiveOrdering(freshness)
     val deletes = parseDeletes(mergeConf)
 
+    // merge.require_ordering = true: refuse the nondeterministic
+    // dropDuplicates fallback outright — a keyed feed must declare
+    // freshness or dedup.order_by. Default false (legacy fallback + warn).
+    if (keys.nonEmpty && ordering.isEmpty &&
+        mergeConf.flatMap(m => ConfigUtils.optBoolean(m, "require_ordering")).getOrElse(false))
+      throw new IllegalStateException(
+        "CUR_004 merge.require_ordering = true but no ordering is configured: declare " +
+          "curated.merge.freshness.column (preferred) or curated.dedup.order_by so the " +
+          "surviving row per key is deterministic")
+
     // Second validation gate (HDR_018): the CURATED contract is validated
-    // independently of RAW, immediately before publication.
+    // independently of RAW, immediately before publication. Ordering
+    // entries may carry direction tokens ("col desc nulls_first") — the
+    // validator sees column names only.
     contract.foreach { c =>
-      val violations = CuratedContractValidator.validate(prepared, c, keys, ordering, logger)
+      val violations = CuratedContractValidator.validate(
+        prepared, c, keys,
+        ordering.map(o => com.hcsc.generic.ingest.transform.OrderSpec.parse(o).column), logger)
       if (violations.nonEmpty)
         throw new SchemaContractViolationException(violations)
     }
@@ -143,9 +159,30 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           val missingKeys = keys.filterNot(k => prepared.columns.exists(_.equalsIgnoreCase(k)))
           require(missingKeys.isEmpty,
             s"curated.merge.keys missing from incoming data: ${missingKeys.mkString(",")}")
-          val dropNull = mergeConf.flatMap(m => ConfigUtils.optBoolean(m, "null_handling.drop_null_keys")).getOrElse(true)
+          // merge.null_handling.policy = QUARANTINE | ALLOW | FAIL_RUN wins
+          // over the legacy drop_null_keys boolean when declared:
+          // QUARANTINE = drop_null_keys=true, ALLOW = false, FAIL_RUN fails
+          // the run outright on any null/blank business key.
+          val nullPolicy = mergeConf
+            .flatMap(m => ConfigUtils.optString(m, "null_handling.policy")).map(_.toUpperCase)
+          nullPolicy.foreach(p => require(Seq("QUARANTINE", "ALLOW", "FAIL_RUN").contains(p),
+            s"curated.merge.null_handling.policy '$p' must be QUARANTINE, ALLOW or FAIL_RUN"))
+          val dropNull = nullPolicy match {
+            case Some("ALLOW") => false
+            case Some(_)       => true
+            case None => mergeConf
+              .flatMap(m => ConfigUtils.optBoolean(m, "null_handling.drop_null_keys")).getOrElse(true)
+          }
           val blanksAsNull = mergeConf.flatMap(m => ConfigUtils.optBoolean(m, "null_handling.treat_blank_as_null")).getOrElse(true)
           val (valid, nullKeyed) = transform.splitNullKeys(prepared, keys, drop = true, blanksAsNull)
+          if (nullPolicy.contains("FAIL_RUN")) {
+            val invalid = nullKeyed.count()
+            if (invalid > 0)
+              throw new IllegalStateException(
+                s"CUR_001 $invalid row(s) carry null/blank business key(s) and " +
+                  "merge.null_handling.policy = FAIL_RUN; fix the source or switch the policy " +
+                  "to QUARANTINE to divert them instead")
+          }
           val (nullCount, pass, passCount) =
             if (dropNull) (quarantineNullKeys(nullKeyed, ctx, rejects), None, 0L)
             else {
@@ -258,13 +295,18 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     }
 
   /** Dedup ordering: freshness spec first (it also decides the cross-run
-    * merge), then any additionally configured dedup.order_by columns. */
+    * merge), then any additionally configured dedup.order_by columns.
+    * Entries may carry direction tokens; duplicate suppression compares the
+    * COLUMN, so "seq" configured in both places orders once (the freshness
+    * spec's direction wins by position). */
   private def effectiveOrdering(freshness: Option[FreshnessSpec]): Seq[String] = {
     val configured = ConfigUtils.stringList(conf, "dedup.order_by")
+    def columnOf(spec: String) = com.hcsc.generic.ingest.transform.OrderSpec.parse(spec).column
     freshness match {
       case Some(f) =>
         val primary = f.column +: f.tieBreakers
-        primary ++ configured.filterNot(o => primary.exists(_.equalsIgnoreCase(o)))
+        val primaryColumns = primary.map(columnOf)
+        primary ++ configured.filterNot(o => primaryColumns.exists(_.equalsIgnoreCase(columnOf(o))))
       case None => configured
     }
   }
@@ -581,9 +623,16 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           }
           val union = contested.withColumn(src, lit("T"))
             .unionByName(challengers.withColumn(src, lit("I")))
-          val orderCols = (f.column +: f.tieBreakers)
-            .flatMap(o => union.columns.find(_.equalsIgnoreCase(o)))
-            .map(c => col(c).desc_nulls_last) :+ col(src).desc // 'T' > 'I': exact ties keep the target
+          // The freshness column itself is always highest-wins (desc, nulls
+          // last); tie-breakers may declare direction and null ordering
+          // ("col asc nulls_first") and default to the same desc_nulls_last.
+          val freshnessCol = union.columns.find(_.equalsIgnoreCase(f.column))
+            .map(c => col(c).desc_nulls_last).toSeq
+          val tieBreakCols = f.tieBreakers
+            .map(com.hcsc.generic.ingest.transform.OrderSpec.parse)
+            .flatMap(s => union.columns.find(_.equalsIgnoreCase(s.column)).map(s.toColumn))
+          val orderCols = (freshnessCol ++ tieBreakCols) :+
+            col(src).desc // 'T' > 'I': exact ties keep the target
           val w = Window.partitionBy(keyCols.map(col): _*).orderBy(orderCols: _*)
           val winners = union.withColumn("_rn", row_number().over(w))
             .filter(col("_rn") === 1).drop("_rn").persist()

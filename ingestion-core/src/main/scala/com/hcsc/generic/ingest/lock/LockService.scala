@@ -39,7 +39,11 @@ final class LockService(
   table: String,
   leaseMillis: Long,
   settleMillis: Long,
-  logger: Logger
+  logger: Logger,
+  /** concurrency.wait_ms: total budget to WAIT for a held entity instead of
+    * failing fast (the default, 0). The claim is retried until the budget
+    * runs out; the last contention error propagates unchanged. */
+  waitMillis: Long = 0L
 ) {
   require(database.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"lock database '$database' is not a safe SQL identifier")
   require(table.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"lock table '$table' is not a safe SQL identifier")
@@ -49,6 +53,24 @@ final class LockService(
   private final case class Claim(holder: String, action: String, leaseUntil: Option[Timestamp], eventTs: Timestamp)
 
   def acquire(entity: String, runId: String): Unit = {
+    val deadline = System.currentTimeMillis() + waitMillis
+    var attempt = 0
+    while (true) {
+      attempt += 1
+      try { acquireOnce(entity, runId); return }
+      catch {
+        case e: PipelineLockException =>
+          val remaining = deadline - System.currentTimeMillis()
+          if (waitMillis <= 0 || remaining <= 0) throw e
+          val pause = math.min(math.max(settleMillis, 1000L), remaining)
+          logger.info(s"[Lock] entity=$entity held by another run; retrying in ${pause}ms " +
+            s"(attempt $attempt, ${remaining}ms left of concurrency.wait_ms)")
+          Thread.sleep(pause)
+      }
+    }
+  }
+
+  private def acquireOnce(entity: String, runId: String): Unit = {
     validateKey("entity", entity)
     validateKey("run id", runId)
     ensureTable()
@@ -199,7 +221,8 @@ object LockService {
               table = conc.flatMap(c => ConfigUtils.optString(c, "table")).getOrElse("ingest_run_locks"),
               leaseMillis = conc.flatMap(c => ConfigUtils.optLong(c, "lease_minutes")).getOrElse(240L) * 60000L,
               settleMillis = conc.flatMap(c => ConfigUtils.optLong(c, "settle_ms")).getOrElse(2000L),
-              logger = logger))
+              logger = logger,
+              waitMillis = conc.flatMap(c => ConfigUtils.optLong(c, "wait_ms")).getOrElse(0L)))
           case None if conc.isDefined =>
             throw new IllegalArgumentException(
               "PIPE_001 concurrency lock requires concurrency.database (or an audit.database to reuse)")

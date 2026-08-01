@@ -17,6 +17,18 @@ final case class RawLineage(
   extractEnd: Option[String] = None
 )
 
+/** Opt-in per-record source lineage (raw.lineage_extended = true):
+  * source_modified_ts (copy of the designated source freshness column),
+  * source_operation ('D' when the soft-delete indicator matches, else 'I'),
+  * source_primary_key (business-key concat). All stored as strings so
+  * rowversion/composite values round-trip like the extract window does. */
+final case class ExtendedLineage(
+  sourceModifiedColumn: Option[String],
+  softDeleteIndicator: Option[(String, Seq[String])],
+  primaryKeyColumns: Seq[String],
+  nullFileId: Boolean
+)
+
 object RawMetadata {
 
   /** Framework metadata columns and their SQL types, in stamping order —
@@ -35,7 +47,11 @@ object RawMetadata {
     "source_table" -> "string",
     "extract_start_ts" -> "string",
     "extract_end_ts" -> "string",
-    "record_hash" -> "string" // stamped only when raw.record_hash = true
+    "record_hash" -> "string", // stamped only when raw.record_hash = true
+    // Stamped only when raw.lineage_extended = true:
+    "source_modified_ts" -> "string",
+    "source_operation" -> "string",
+    "source_primary_key" -> "string"
   )
 
   val ColumnNames: Set[String] = ColumnTypes.map(_._1).toSet
@@ -71,6 +87,45 @@ object RawMetadata {
       .withColumn("source_table", str(lineage.sourceTable))
       .withColumn("extract_start_ts", str(lineage.extractStart))
       .withColumn("extract_end_ts", str(lineage.extractEnd))
+  }
+
+  /** Opt-in extended source lineage. Stamped AFTER the record hash so the
+    * hash never covers these technical columns; membership in ColumnTypes
+    * gives them the same HiveSink never-silently-dropped guarantee as the
+    * mandatory set once a feed opts in. */
+  def addExtended(df: DataFrame, ext: ExtendedLineage): DataFrame = {
+    requireNoCollisions(df,
+      Seq("source_modified_ts", "source_operation", "source_primary_key"),
+      "extended lineage stamping")
+
+    def actual(name: String): Option[String] = df.columns.find(_.equalsIgnoreCase(name))
+
+    val modified = ext.sourceModifiedColumn.flatMap(actual)
+      .map(c => col(c).cast("string"))
+      .getOrElse(lit(null).cast("string"))
+
+    val operation = ext.softDeleteIndicator.flatMap { case (indicator, values) =>
+      actual(indicator).map { c =>
+        when(lower(trim(col(c).cast("string")))
+          .isin(values.map(_.trim.toLowerCase): _*), "D").otherwise("I")
+      }
+    }.getOrElse(lit("I"))
+
+    val presentKeys = ext.primaryKeyColumns.flatMap(actual)
+    val primaryKey =
+      if (presentKeys.isEmpty) lit(null).cast("string")
+      else concat_ws("|", presentKeys.map(c => coalesce(col(c).cast("string"), lit(""))): _*)
+
+    val stamped = df
+      .withColumn("source_modified_ts", modified)
+      .withColumn("source_operation", operation)
+      .withColumn("source_primary_key", primaryKey)
+
+    // Sources without physical files (JDBC, Kafka) historically stamped a
+    // constant sha2("") as file_id — meaningless and easy to mistake for a
+    // real identity. Extended lineage nulls it; file feeds keep theirs.
+    if (ext.nullFileId) stamped.withColumn("file_id", lit(null).cast("string"))
+    else stamped
   }
 
   /** Adds RAW metadata plus run lineage for replay and audit. */

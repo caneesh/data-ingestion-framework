@@ -352,7 +352,17 @@ final class IngestPipeline(
           // once the cause is fixed).
           val holdForRejects = rejectService.onRejectWatermark == "HOLD" &&
             rawOutcome.counts.rejectedCount > 0
-          if (holdForRejects) {
+          // Intent-override patterns (BACKFILL, RAW_REPLAY) never commit the
+          // watermark unless the feed declares ingestion.watermark_commit=true:
+          // a backfill re-reads history and must not burn the live window.
+          val patternCommitAllowed =
+            com.hcsc.generic.ingest.config.IngestionPattern.commitAllowed(feedConf)
+          if (!patternCommitAllowed) {
+            w.discardWindow(ctx.entity, Some(ctx.runId))
+            logger.info("[Pipeline] Watermark NOT advanced: ingestion.pattern is an intent " +
+              "override (BACKFILL/RAW_REPLAY) with watermark_commit=false (default). The live " +
+              "incremental window is preserved.")
+          } else if (holdForRejects) {
             w.discardWindow(ctx.entity, Some(ctx.runId))
             logger.warn(s"[Pipeline] Watermark HELD: ${rawOutcome.counts.rejectedCount} row(s) " +
               "rejected and rejects.on_reject_watermark = HOLD. The source window stays open and " +
@@ -469,9 +479,39 @@ final class IngestPipeline(
       if (ConfigUtils.optBoolean(rawConf, "record_hash").getOrElse(false))
         com.hcsc.generic.ingest.transform.RecordHash.stamp(withMetaBase, contract)
       else withMetaBase
+    // Opt-in extended lineage (raw.lineage_extended = true): per-record
+    // source_modified_ts / source_operation / source_primary_key, and no
+    // constant file_id for file-less sources. Stamped after the record hash
+    // so the hash never covers technical columns.
+    val withMetaExt =
+      if (!ConfigUtils.optBoolean(rawConf, "lineage_extended").getOrElse(false)) withMeta0
+      else {
+        val modifiedColumn = ConfigUtils.optString(rawConf, "source_modified_column")
+          .orElse(contract.flatMap(_.incrementalColumns.headOption))
+          .orElse(ConfigUtils.optConfig(effectiveSource, "incremental")
+            .flatMap(i => ConfigUtils.stringList(i, "watermark_columns").headOption))
+        val softDelete = ConfigUtils.optConfig(feedConf, "curated")
+          .flatMap(c => ConfigUtils.optConfig(c, "merge"))
+          .flatMap(m => ConfigUtils.optConfig(m, "deletes"))
+          .filter(d => ConfigUtils.optString(d, "mode").exists(_.equalsIgnoreCase("SOFT")))
+          .flatMap(d => ConfigUtils.optString(d, "indicator_column").map { indicator =>
+            val values = ConfigUtils.stringList(d, "indicator_values")
+            (indicator, if (values.nonEmpty) values else Seq("true", "1", "y", "d"))
+          })
+        val primaryKey = contract.map(_.businessKeyColumns).filter(_.nonEmpty)
+          .orElse(ConfigUtils.optConfig(feedConf, "curated")
+            .flatMap(c => ConfigUtils.optConfig(c, "merge"))
+            .map(m => ConfigUtils.stringList(m, "keys")))
+          .getOrElse(Seq.empty)
+        RawMetadata.addExtended(withMeta0, com.hcsc.generic.ingest.transform.ExtendedLineage(
+          sourceModifiedColumn = modifiedColumn,
+          softDeleteIndicator = softDelete,
+          primaryKeyColumns = primaryKey,
+          nullFileId = staged.isEmpty && !sourceType.equalsIgnoreCase("file")))
+      }
     val withMeta1 = ctx.fileIdFilter match {
-      case Some(fileId) if staged.isEmpty => withMeta0.filter(col("file_id") === lit(fileId))
-      case _ => withMeta0
+      case Some(fileId) if staged.isEmpty => withMetaExt.filter(col("file_id") === lit(fileId))
+      case _ => withMetaExt
     }
 
     // Cross-run file idempotency (managed feeds): a crash after the RAW

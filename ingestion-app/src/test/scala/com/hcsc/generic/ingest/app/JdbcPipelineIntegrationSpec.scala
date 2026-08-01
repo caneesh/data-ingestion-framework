@@ -278,6 +278,35 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
          |$rejectsBlock
        """.stripMargin).withFallback(feedConf())
 
+  test("raw.lineage_extended stamps source lineage and nulls the constant JDBC file_id") {
+    import org.apache.spark.sql.functions.col
+    val extended = ConfigFactory.parseString("""raw { lineage_extended = true }""")
+      .withFallback(auditedConf("lineage"))
+    new IngestPipeline(spark, extended,
+      Cli(entity = "claims_lineage", mode = "FULL", runId = Some("lin-1")), logger).run()
+
+    val row = spark.table("j_raw.claims_lineage").filter(col("claim_id") === "C001")
+      .select("source_modified_ts", "source_operation", "source_primary_key", "file_id")
+      .collect().head
+    assert(row.getString(0) != null && row.getString(0).startsWith("2026-01-01 09:00:00"),
+      "source_modified_ts copies the designated watermark column")
+    assert(row.getString(1) == "I")
+    assert(row.getString(2) == "C001", "source_primary_key derives from merge keys")
+    assert(row.getString(3) == null, "JDBC rows carry no constant file_id under extended lineage")
+  }
+
+  test("ingestion.pattern=BACKFILL publishes but never commits the watermark") {
+    val backfill = ConfigFactory.parseString("""ingestion { pattern = "BACKFILL" }""")
+      .withFallback(auditedConf("backfill"))
+    new IngestPipeline(spark, backfill,
+      Cli(entity = "claims_backfill", mode = "FULL", runId = Some("bkf-1")), logger).run()
+
+    assert(spark.table("j_curated.claims_backfill").count() > 0,
+      "a backfill still publishes raw and curated")
+    assert(InMemoryWatermarkStore.latest("claims_backfill").isEmpty,
+      "BACKFILL must not seed/advance the live watermark")
+  }
+
   test("on_reject_watermark=HOLD keeps the window open; the fixed rerun recovers the rejects") {
     import org.apache.spark.sql.functions.col
     val holdEntity = "claims_hold"

@@ -37,7 +37,13 @@ object QueryBuilder {
 
     cfg.mode match {
       case JdbcMode.FullTable =>
-        cfg.table.get
+        // A bounded seed pull (FULL_THEN_INCREMENTAL cutoff) carries a
+        // watermark predicate; plain FULL_TABLE keeps the bare-table fast
+        // path for metadata operations.
+        watermarkPredicate match {
+          case Some(p) => s"(SELECT * FROM ${cfg.table.get} WHERE ($p)) src"
+          case None    => cfg.table.get
+        }
 
       case JdbcMode.SelectQuery =>
         s"(SELECT ${projection(cfg)} FROM ${cfg.table.get}${whereClause(cfg, None)}) src"

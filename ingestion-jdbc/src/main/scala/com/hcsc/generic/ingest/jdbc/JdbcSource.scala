@@ -127,7 +127,22 @@ object JdbcSource extends Source with WatermarkAdvancing {
         contextUpper = upper.map(_.serialized)
         logger.info(s"[JdbcSource] entity=$entity FULL_TABLE run captured watermark seed " +
           s"cutoff=${upper.map(_.serialized).getOrElse("<none>")} (committed only after success)")
-        None
+        // Bound the seed pull at the cutoff: rows modified during the long
+        // full load belong to the FIRST incremental window (which starts
+        // exactly at the committed seed) — loading them here too would
+        // duplicate them across the handoff. FULL_TABLE is the only mode
+        // that parses with an incremental block (rejectStrayIncremental),
+        // so the guard is spelled out rather than assumed.
+        // allow_null_watermark feeds stay unbounded: `NOT (col > x)` is
+        // NULL (excluded) for NULL watermark rows, and those rows were
+        // explicitly admitted. Opt out with incremental.bound_full_load = false.
+        upper
+          .filter(_ => wm.boundFullLoad && !wm.allowNullWatermark &&
+            cfg.mode == JdbcMode.FullTable)
+          .map { u =>
+            logger.info(s"[JdbcSource] entity=$entity FULL pull bounded at the seed cutoff")
+            Watermarks.upperBoundPredicate(wm, cfg.dialect, u)
+          }
       }
     }
 

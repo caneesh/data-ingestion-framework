@@ -64,6 +64,16 @@ object Watermarks {
     // is exact so the committed boundary equals what was extracted.
     s"(${predicate(cfg, dialect, lower)}) AND NOT (${predicate(cfg, dialect, upper, useOverlap = false)})"
 
+  /** Upper-cutoff-only predicate for bounded FULL loads (seed runs): rows at
+    * or below the captured cutoff — everything beyond it belongs to the
+    * FIRST incremental window, which starts exactly at the committed seed. */
+  def upperBoundPredicate(
+    cfg: WatermarkConfig,
+    dialect: JdbcDialect,
+    upper: WatermarkValue
+  ): String =
+    s"NOT (${predicate(cfg, dialect, upper, useOverlap = false)})"
+
   def predicate(
     cfg: WatermarkConfig,
     dialect: JdbcDialect,

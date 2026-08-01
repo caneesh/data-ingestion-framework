@@ -63,7 +63,11 @@ final case class WatermarkConfig(
   storeTable: String,
   upperBound: String = WatermarkUpperBound.MaxValue,
   allowNullWatermark: Boolean = false,
-  clockZone: Option[String] = None // UTC | LOCAL: the zone the watermark column stores
+  clockZone: Option[String] = None, // UTC | LOCAL: the zone the watermark column stores
+  /** Bound the FULL_THEN_INCREMENTAL seed pull at the captured cutoff so
+    * rows modified during the long full load are not loaded twice (they
+    * belong to the first incremental window). Opt-out for legacy behavior. */
+  boundFullLoad: Boolean = true
 )
 
 final case class JdbcPartitioning(
@@ -479,7 +483,8 @@ object JdbcSourceConfig {
       storeTable = store.flatMap(s => ConfigUtils.optString(s, "table")).getOrElse("ingest_watermarks"),
       upperBound = upperBound,
       allowNullWatermark = ConfigUtils.optBoolean(inc, "allow_null_watermark").getOrElse(false),
-      clockZone = clockZone
+      clockZone = clockZone,
+      boundFullLoad = ConfigUtils.optBoolean(inc, "bound_full_load").getOrElse(true)
     )
   }
 

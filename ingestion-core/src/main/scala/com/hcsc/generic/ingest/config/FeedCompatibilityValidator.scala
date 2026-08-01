@@ -92,6 +92,10 @@ object FeedCompatibilityValidator {
         "curated.merge.keys; a keyless overwrite would keep only the latest extraction window " +
         "(use curated.strategy APPEND for delta-history tables)"
 
+    // Typed ingestion-pattern model (CFG_010 unsupported capability,
+    // CFG_011 pattern/config contradiction, CFG_012 backfill commit clash).
+    errors ++= IngestionPattern.derive(feed)._2
+
     errors.result()
   }
 }

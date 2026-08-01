@@ -262,6 +262,47 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
       s"missingRequired=[${record.missing_required_columns}]")
   }
 
+  /** True when some OTHER run's raw stage succeeded over the same extract
+    * window with rejected rows — the signal the HOLD recovery path uses to
+    * re-append a held window instead of window-skipping it. Requires the
+    * migrated ledger (window columns); false otherwise. */
+  def windowHadRejects(entity: String, excludeRunId: String, start: String, end: String): Boolean = {
+    if (!enabled || !spark.catalog.tableExists(runTable)) return false
+    import org.apache.spark.sql.functions.col
+    val cols = spark.table(runTable).columns.map(_.toLowerCase).toSet
+    if (!cols.contains("window_start") || !cols.contains("window_end")) return false
+    spark.table(runTable)
+      .filter(col("entity") === entity &&
+        col("stage") === com.hcsc.generic.ingest.runtime.Stages.Raw &&
+        col("status") === com.hcsc.generic.ingest.runtime.StageStatus.Success &&
+        col("run_id") =!= excludeRunId &&
+        col("window_start") === start && col("window_end") === end &&
+        col("rejected_count") > 0)
+      .limit(1).count() > 0
+  }
+
+  /** Most recent OTHER run's successful raw-stage extract window for the
+    * entity — the previous link the watermark-continuity check validates
+    * against. None without a migrated ledger or a prior windowed run. */
+  def lastRawWindow(entity: String, excludeRunId: String): Option[(String, String)] = {
+    if (!enabled || !spark.catalog.tableExists(runTable)) return None
+    import org.apache.spark.sql.functions.col
+    val cols = spark.table(runTable).columns.map(_.toLowerCase).toSet
+    if (!cols.contains("window_start") || !cols.contains("window_end")) return None
+    spark.table(runTable)
+      .filter(col("entity") === entity &&
+        col("stage") === com.hcsc.generic.ingest.runtime.Stages.Raw &&
+        col("status") === com.hcsc.generic.ingest.runtime.StageStatus.Success &&
+        col("run_id") =!= excludeRunId &&
+        col("window_start") =!= "")
+      .orderBy(col("event_ts").desc)
+      .select("window_start", "window_end")
+      .limit(1)
+      .collect()
+      .headOption
+      .map(r => (r.getString(0), r.getString(1)))
+  }
+
   /** Latest recorded status for a stage of a given run, used by --resume.
     * Terminal statuses win over STARTED when timestamps tie. */
   def stageStatus(runId: String, entity: String, stage: String): Option[String] = {

@@ -344,7 +344,22 @@ final class IngestPipeline(
           val curatedResumedComplete = curatedConfigured && curatedOutcome.isEmpty &&
             !cli.stage.equalsIgnoreCase("raw") && ctx.resume &&
             audit.stageStatus(ctx.runId, ctx.entity, Stages.Curated).contains(StageStatus.Success)
-          if (curatedResult.isDefined || curatedResumedComplete || advanceAfter == "RAW")
+          // rejects.on_reject_watermark = HOLD: rows diverted to the reject
+          // table left the committed window — advancing over them makes them
+          // permanently unreachable from the source. Holding keeps the window
+          // open; the next run re-extracts it and the window-idempotency
+          // guard's held-window exemption re-appends (recovering the rejects
+          // once the cause is fixed).
+          val holdForRejects = rejectService.onRejectWatermark == "HOLD" &&
+            rawOutcome.counts.rejectedCount > 0
+          if (holdForRejects) {
+            w.discardWindow(ctx.entity, Some(ctx.runId))
+            logger.warn(s"[Pipeline] Watermark HELD: ${rawOutcome.counts.rejectedCount} row(s) " +
+              "rejected and rejects.on_reject_watermark = HOLD. The source window stays open and " +
+              "will be re-extracted next run; previously accepted rows re-append into RAW as " +
+              "documented duplicates (the curated merge absorbs them). Fix the reject cause to " +
+              "recover the rows, or switch to ADVANCE to accept the loss.")
+          } else if (curatedResult.isDefined || curatedResumedComplete || advanceAfter == "RAW")
             w.advanceWatermark(spark, sourceConf, ctx.entity, ctx.runId, rawOutcome.accepted)
           else
             logger.warn(s"[Pipeline] Watermark NOT advanced: no curated publish in this run " +
@@ -473,7 +488,8 @@ final class IngestPipeline(
     val split = rejectService.split(withMeta, ctx)
     val accepted = track(split.accepted.persist(StorageLevel.MEMORY_AND_DISK))
 
-    val windowSkipped = writeRawIdempotently(accepted, rawConf, rawFullTable, rawDatabase, rawTable, window)
+    val windowSkipped =
+      writeRawIdempotently(accepted, rawConf, rawFullTable, rawDatabase, rawTable, window, rejectService)
 
     val acceptedCount = if (split.acceptedCount >= 0) split.acceptedCount else sourceCount
     // Measure rawCount from the table itself so the raw_equals_accepted
@@ -594,7 +610,8 @@ final class IngestPipeline(
     rawFullTable: String,
     rawDatabase: String,
     rawTable: String,
-    window: Option[(String, Option[String])]
+    window: Option[(String, Option[String])],
+    rejectService: RejectService
   ): Option[(String, String)] = {
     if (ctx.dryRun) {
       logger.info("[Pipeline] DRY-RUN: skipping RAW write")
@@ -604,7 +621,7 @@ final class IngestPipeline(
       spark.table(rawFullTable).columns.contains("run_id") &&
       spark.table(rawFullTable).filter(col("run_id") === lit(ctx.runId)).limit(1).count() > 0
 
-    val windowLoaded: Option[(String, String)] =
+    val windowMatched: Option[(String, String)] =
       if (runIdLoaded || ctx.forceReprocess) None
       else window.flatMap { case (s, eOpt) =>
         eOpt.filter { e =>
@@ -618,6 +635,22 @@ final class IngestPipeline(
           }
         }.map(e => (s, e))
       }
+
+    // Held-window recovery (rejects.on_reject_watermark = HOLD): the matched
+    // window was written by a run that REJECTED rows and held the watermark —
+    // this re-extraction exists precisely to recover them, so it must append
+    // rather than window-skip. Previously accepted rows duplicate in RAW
+    // (documented at-least-once, same as drifted retries; curated dedups).
+    val heldRecovery = windowMatched.exists { case (s, e) =>
+      rejectService.onRejectWatermark == "HOLD" &&
+        audit.windowHadRejects(ctx.entity, ctx.runId, s, e)
+    }
+    val windowLoaded = if (heldRecovery) None else windowMatched
+    if (heldRecovery)
+      logger.warn(s"[Pipeline] Held-window recovery: RAW already holds rows for extract window " +
+        s"${windowMatched.get} from a run that rejected rows under HOLD. Appending the " +
+        "re-extracted window — previously accepted rows will duplicate in RAW (curated dedup " +
+        "absorbs them); rows that now pass the reject rules are recovered.")
 
     if (runIdLoaded) {
       logger.warn(s"[Pipeline] RAW already holds rows for run ${ctx.runId}; skipping write (idempotent replay)")
@@ -750,6 +783,22 @@ final class IngestPipeline(
       // extraction defect, not the intentional overlap re-read.
       if (o.duplicateVersions >= 0)
         checks += (("raw_duplicate_versions", "0", o.duplicateVersions.toString, o.duplicateVersions == 0))
+      // Watermark continuity (§11): this run's window start must equal the
+      // previous run's recorded end (watermark advanced) or the previous
+      // run's own start (watermark unchanged: held, empty window, raw-only
+      // run, or failed publish). Anything else means the watermark store and
+      // the run ledger disagree — history was skipped, reseeded or edited
+      // outside the pipeline. The recorded start is the stored watermark
+      // itself, never the overlap-widened read bound, so a configured
+      // overlap does not affect this check.
+      if (!ctx.dryRun) o.window.foreach { case (start, _) =>
+        audit.lastRawWindow(ctx.entity, ctx.runId).foreach { case (prevStart, prevEnd) =>
+          val passed = start == prevEnd || start == prevStart
+          val expected =
+            if (passed && start == prevStart && start != prevEnd) prevStart else prevEnd
+          checks += (("watermark_continuity", expected, start, passed))
+        }
+      }
     }
     // Full accounting identity: every accepted RAW row must be explained by
     // the curated outcome — a distinct key that was inserted, updated,

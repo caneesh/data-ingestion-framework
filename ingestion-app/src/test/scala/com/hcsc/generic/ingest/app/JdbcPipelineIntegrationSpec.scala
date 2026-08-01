@@ -254,4 +254,118 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       "curated holds exactly one row per key despite the RAW duplicate")
     assert(InMemoryWatermarkStore.latest(entity).get.values.head.startsWith("2026-01-07 09:00:00"))
   }
+
+  /** Audited variant of feedConf for the HOLD/continuity tests: real ledger
+    * (the recovery signal and the continuity check both live there), own
+    * raw/curated tables, near-zero lock settle so the suite stays fast. */
+  private def auditedConf(suffix: String, rejectsBlock: String = ""): Config =
+    ConfigFactory.parseString(
+      s"""
+         |audit { enabled = true, database = "j_audit" }
+         |concurrency { settle_ms = 1 }
+         |raw {
+         |  database = j_raw
+         |  table = claims_$suffix
+         |  path = "${tempDir.resolve(s"raw_claims_$suffix").toAbsolutePath}"
+         |  format = parquet
+         |  record_hash = true
+         |}
+         |curated {
+         |  database = j_curated
+         |  table = claims_$suffix
+         |  path = "${tempDir.resolve(s"curated_claims_$suffix").toAbsolutePath}"
+         |}
+         |$rejectsBlock
+       """.stripMargin).withFallback(feedConf())
+
+  test("on_reject_watermark=HOLD keeps the window open; the fixed rerun recovers the rejects") {
+    import org.apache.spark.sql.functions.col
+    val holdEntity = "claims_hold"
+    val holdRejects = (rules: String) =>
+      s"""rejects {
+         |  database = "j_audit"
+         |  table = "ingest_rejects_hold"
+         |  on_reject_watermark = "HOLD"
+         |  $rules
+         |}""".stripMargin
+
+    // Run 1: one row trips the reject rule -> run SUCCEEDS but the
+    // watermark is HELD, so the window is not burned over the reject.
+    new IngestPipeline(spark,
+      auditedConf("hold", holdRejects(
+        """rules = [ { name = "too_big", condition = "amount >= 700",
+          |  error_code = "R900", category = "TEST", message = "amount cap" } ]""".stripMargin)),
+      Cli(entity = holdEntity, mode = "FULL", runId = Some("hrun-1")), logger).run()
+
+    assert(spark.table("j_audit.ingest_rejects_hold").filter(col("run_id") === "hrun-1").count() == 1)
+    assert(spark.table("j_raw.claims_hold").filter(col("claim_id") === "C007").count() == 0,
+      "the rejected row must not be in RAW")
+    assert(InMemoryWatermarkStore.latest(holdEntity).isEmpty,
+      "HOLD with rejected rows must leave the watermark untouched")
+
+    // Run 2: reject rule fixed (removed). The same window is re-extracted;
+    // the held-window exemption re-appends instead of window-skipping, so
+    // the previously rejected row is RECOVERED, and only now does the
+    // watermark advance.
+    new IngestPipeline(spark, auditedConf("hold", holdRejects("")),
+      Cli(entity = holdEntity, mode = "FULL", runId = Some("hrun-2")), logger).run()
+
+    assert(spark.table("j_raw.claims_hold").filter(col("claim_id") === "C007").count() == 1,
+      "the previously rejected row must be recovered into RAW")
+    assert(spark.table("j_raw.claims_hold").filter(col("claim_id") === "C001").count() == 2,
+      "previously accepted rows re-append as documented at-least-once duplicates")
+    assert(spark.table("j_curated.claims_hold").count() ==
+      spark.table("j_curated.claims_hold").select("claim_id").distinct().count(),
+      "curated dedups the recovery duplicates")
+    assert(spark.table("j_curated.claims_hold").filter(col("claim_id") === "C007").count() == 1)
+    assert(InMemoryWatermarkStore.latest(holdEntity).get.values.head.startsWith("2026-01-07 09:00:00"))
+
+    // The continuity check saw run 2 start where run 1 started (held) and passed
+    val continuity = spark.table("j_audit.ingest_reconciliation")
+      .filter(col("entity") === holdEntity && col("check_name") === "watermark_continuity" &&
+        col("run_id") === "hrun-2")
+      .select("passed").collect()
+    assert(continuity.nonEmpty && continuity.forall(_.getBoolean(0)),
+      "a held window rerun is a legal continuity link")
+  }
+
+  test("default ADVANCE still burns the window over rejects (historical behavior)") {
+    import org.apache.spark.sql.functions.col
+    val advEntity = "claims_adv"
+    new IngestPipeline(spark,
+      auditedConf("adv",
+        """rejects {
+          |  database = "j_audit"
+          |  table = "ingest_rejects_adv"
+          |  rules = [ { name = "too_big", condition = "amount >= 700",
+          |    error_code = "R900", category = "TEST", message = "amount cap" } ]
+          |}""".stripMargin),
+      Cli(entity = advEntity, mode = "FULL", runId = Some("arun-1")), logger).run()
+
+    assert(spark.table("j_audit.ingest_rejects_adv").count() == 1)
+    assert(InMemoryWatermarkStore.latest(advEntity).get.values.head.startsWith("2026-01-07 09:00:00"),
+      "ADVANCE (default) commits the captured upper even with rejects")
+  }
+
+  test("watermark continuity mismatch between store and ledger fails reconciliation") {
+    import org.apache.spark.sql.functions.col
+    // A ghost ledger entry claims a newer window was already extracted for
+    // the entity — the store (still at 2026-01-07) and ledger now disagree,
+    // exactly what tampering/reseeding outside the pipeline looks like.
+    spark.sql(
+      "INSERT INTO j_audit.ingest_run_audit VALUES ('ghost-run', 'claims_hold', 'raw', 'SUCCESS', " +
+        "0, 0, 0, 0, 0, 0, 0, CAST(NULL AS STRING), '', TIMESTAMP '2030-01-01 00:00:00', 'FULL', " +
+        "'2027-01-01 00:00:00.0', '2027-02-01 00:00:00.0')")
+    h2("INSERT INTO claims VALUES ('C008', 150, '2026-01-08 09:00:00')")
+
+    val e = intercept[IllegalStateException] {
+      new IngestPipeline(spark, auditedConf("hold"),
+        Cli(entity = "claims_hold", mode = "FULL", runId = Some("hrun-3")), logger).run()
+    }
+    assert(e.getMessage.contains("watermark_continuity"),
+      s"expected a continuity reconciliation failure, got: ${e.getMessage}")
+    assert(InMemoryWatermarkStore.latest("claims_hold").get.values.head.startsWith("2026-01-07 09:00:00"),
+      "the failed run must not advance the watermark")
+  }
+
 }

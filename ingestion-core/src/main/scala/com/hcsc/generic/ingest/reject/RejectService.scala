@@ -97,6 +97,22 @@ final class RejectService(
       to_json(struct(businessCols.map(col): _*))
   }
 
+  /** rejects.on_reject_watermark = ADVANCE | HOLD. Rows diverted to the
+    * reject table leave the committed source window: with ADVANCE (default,
+    * the historical behavior) they can never be re-extracted and recovery is
+    * manual from the reject payload. HOLD keeps the watermark unchanged
+    * whenever this run rejected anything, so the window is re-extracted next
+    * run — after the cause is fixed, previously rejected rows are recovered
+    * from the source (previously accepted rows re-append into RAW as
+    * documented at-least-once duplicates; the curated merge absorbs them). */
+  val onRejectWatermark: String = {
+    val mode = rejectConf.flatMap(c => ConfigUtils.optString(c, "on_reject_watermark"))
+      .getOrElse("ADVANCE").toUpperCase
+    require(Seq("ADVANCE", "HOLD").contains(mode),
+      s"rejects.on_reject_watermark '$mode' must be ADVANCE or HOLD")
+    mode
+  }
+
   private lazy val rejectTable: String = {
     val c = rejectConf.get
     val db = ConfigUtils.sqlIdentifier(c, "database")

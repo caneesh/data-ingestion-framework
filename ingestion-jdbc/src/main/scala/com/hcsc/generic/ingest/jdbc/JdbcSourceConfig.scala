@@ -67,8 +67,24 @@ final case class WatermarkConfig(
   /** Bound the FULL_THEN_INCREMENTAL seed pull at the captured cutoff so
     * rows modified during the long full load are not loaded twice (they
     * belong to the first incremental window). Opt-out for legacy behavior. */
-  boundFullLoad: Boolean = true
+  boundFullLoad: Boolean = true,
+  /** LEGACY = (lower, upper]  — strictly-greater lower, inclusive upper
+    * (the historical wire-compatible convention).
+    * HALF_OPEN = [lower, upper) — the spec's convention; scalar watermarks
+    * with upper_bound = SOURCE_CLOCK only (a MAX_VALUE upper would exclude
+    * the max row forever: `col < MAX` never matches it and the next window
+    * [MAX, MAX) is empty). */
+  boundaryConvention: String = BoundaryConvention.Legacy,
+  /** SOURCE_CLOCK capture logs a warning when |source clock - driver clock|
+    * exceeds this threshold; 0 disables the diagnostic. */
+  clockDriftWarnMs: Long = 30000L
 )
+
+object BoundaryConvention {
+  val Legacy = "LEGACY"
+  val HalfOpen = "HALF_OPEN"
+  val all = Seq(Legacy, HalfOpen)
+}
 
 final case class JdbcPartitioning(
   numPartitions: Option[Int],
@@ -470,6 +486,22 @@ object JdbcSourceConfig {
         "incremental.clock_zone = UTC or LOCAL — declare the zone the watermark column stores " +
         "(a UTC clock committed over a local-time column silently skips one offset of rows forever)")
 
+    val boundaryConvention = ConfigUtils.optString(inc, "boundary_convention")
+      .map(_.trim.toUpperCase).getOrElse(BoundaryConvention.Legacy)
+    if (!BoundaryConvention.all.contains(boundaryConvention))
+      fail(s"incremental.boundary_convention '$boundaryConvention' must be one of " +
+        BoundaryConvention.all.mkString(", "))
+    if (boundaryConvention == BoundaryConvention.HalfOpen) {
+      if (watermarkType == WatermarkType.Composite)
+        fail("incremental.boundary_convention = HALF_OPEN supports scalar watermarks only; " +
+          "COMPOSITE windows keep the LEGACY (lower, upper] convention")
+      if (upperBound != WatermarkUpperBound.SourceClock)
+        fail("incremental.boundary_convention = HALF_OPEN requires incremental.upper_bound = " +
+          "SOURCE_CLOCK: with MAX_VALUE the row AT the captured maximum never satisfies " +
+          "`col < upper`, the next window [upper, upper) is empty, and that row is skipped " +
+          "permanently")
+    }
+
     val store = ConfigUtils.optConfig(inc, "watermark_store")
     WatermarkConfig(
       watermarkType = watermarkType,
@@ -484,7 +516,9 @@ object JdbcSourceConfig {
       upperBound = upperBound,
       allowNullWatermark = ConfigUtils.optBoolean(inc, "allow_null_watermark").getOrElse(false),
       clockZone = clockZone,
-      boundFullLoad = ConfigUtils.optBoolean(inc, "bound_full_load").getOrElse(true)
+      boundFullLoad = ConfigUtils.optBoolean(inc, "bound_full_load").getOrElse(true),
+      boundaryConvention = boundaryConvention,
+      clockDriftWarnMs = ConfigUtils.optLong(inc, "clock_drift_warn_ms").getOrElse(30000L)
     )
   }
 

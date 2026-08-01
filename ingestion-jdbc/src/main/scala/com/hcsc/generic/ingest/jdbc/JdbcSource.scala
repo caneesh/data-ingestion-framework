@@ -357,6 +357,15 @@ object JdbcSource extends Source with WatermarkAdvancing {
         .flatMap(_.headOption.flatten)
         .getOrElse(throw new IllegalStateException(
           s"JDBC_006 source clock capture returned no value ($clockSql); cannot form a bounded window"))
+      // Drift diagnostic (never fails the run): SOURCE_CLOCK windows follow
+      // the SOURCE's clock; large source-vs-driver drift usually means a
+      // wrong clock_zone declaration or NTP drift on one side.
+      if (wm.clockDriftWarnMs > 0)
+        clockDriftMillis(wm.watermarkType, wm.clockZone, clock, System.currentTimeMillis())
+          .filter(d => math.abs(d) > wm.clockDriftWarnMs)
+          .foreach(d => logger.warn(f"[JdbcSource] source clock differs from the driver clock " +
+            f"by ${d}ms (threshold ${wm.clockDriftWarnMs}ms). Verify incremental.clock_zone and " +
+            "both hosts' NTP sync; the window boundary follows the SOURCE clock."))
       return Some(WatermarkValue(Seq(clock)))
     }
 
@@ -389,6 +398,37 @@ object JdbcSource extends Source with WatermarkAdvancing {
       }
     }
   }
+
+  /** Source-vs-driver clock delta in millis (positive = source ahead), or
+    * None when the clock string cannot be interpreted — the diagnostic must
+    * never fail a run over a parse. */
+  private[jdbc] def clockDriftMillis(
+    watermarkType: String,
+    clockZone: Option[String],
+    clock: String,
+    nowMillis: Long
+  ): Option[Long] = try {
+    val v = clock.trim
+    val instant = watermarkType match {
+      case WatermarkType.DatetimeOffset =>
+        // ISO first, then the SQL Server literal shape 'y-M-d H:m:s[.f] +HH:MM'
+        try java.time.OffsetDateTime.parse(v).toInstant
+        catch {
+          case _: Exception =>
+            val lastSpace = v.lastIndexOf(' ')
+            java.time.OffsetDateTime
+              .parse(v.substring(0, lastSpace).replace(' ', 'T') + v.substring(lastSpace + 1))
+              .toInstant
+        }
+      case _ =>
+        val zone = clockZone match {
+          case Some("UTC") => java.time.ZoneOffset.UTC
+          case _           => java.time.ZoneId.systemDefault()
+        }
+        java.sql.Timestamp.valueOf(v).toLocalDateTime.atZone(zone).toInstant
+    }
+    Some(instant.toEpochMilli - nowMillis)
+  } catch { case scala.util.control.NonFatal(_) => None }
 
   private def nullCaptureOutcome(wm: WatermarkConfig, rowsInScope: Long): Option[WatermarkValue] =
     if (rowsInScope == 0L) None // verified empty; the unbounded predicate extracts nothing

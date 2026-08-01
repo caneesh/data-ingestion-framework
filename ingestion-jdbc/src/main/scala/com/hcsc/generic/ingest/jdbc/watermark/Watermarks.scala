@@ -50,10 +50,16 @@ object WatermarkValue {
   */
 object Watermarks {
 
-  /** Bounded extraction window: strictly greater than `lower` AND at most
-    * `upper` (the upper watermark captured on the driver before extraction),
-    * so every Spark partition observes the same reproducible window even
-    * while the source keeps changing. */
+  /** Bounded extraction window, rendered per the configured convention:
+    *
+    * LEGACY    (lower, upper]  =  col >  lower AND NOT (col >  upper)
+    * HALF_OPEN [lower, upper)  =  col >= lower AND NOT (col >= upper)
+    *
+    * Both are gap-free when used consistently; HALF_OPEN is parse-gated to
+    * scalar SOURCE_CLOCK windows (a MAX_VALUE upper would permanently skip
+    * the max row). The upper is the value captured on the driver before the
+    * read, so every Spark partition observes the same reproducible window
+    * even while the source keeps changing. */
   def boundedPredicate(
     cfg: WatermarkConfig,
     dialect: JdbcDialect,
@@ -88,7 +94,11 @@ object Watermarks {
     }
 
     if (cfg.columns.size == 1) {
-      s"${dialect.quoteIdentifier(cfg.columns.head)} > ${literal(cfg.columnTypes.head, overlapped.head)}"
+      // The SAME comparator on both edges keeps each convention gap-free:
+      // LEGACY  `>`  ⇒ (lower, upper];  HALF_OPEN `>=` ⇒ [lower, upper).
+      val cmp = if (cfg.boundaryConvention ==
+        com.hcsc.generic.ingest.jdbc.BoundaryConvention.HalfOpen) ">=" else ">"
+      s"${dialect.quoteIdentifier(cfg.columns.head)} $cmp ${literal(cfg.columnTypes.head, overlapped.head)}"
     } else {
       // Lexicographic strictly-greater over (c1..cn)
       val clauses = cfg.columns.indices.map { i =>

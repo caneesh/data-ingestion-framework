@@ -376,6 +376,73 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       "ADVANCE (default) commits the captured upper even with rejects")
   }
 
+  test("raw.delivery_mode=DEDUPLICATED_APPEND skips overlap rereads by source-version identity") {
+    import org.apache.spark.sql.functions.col
+    // BACKFILL: neither run commits the watermark, so both extract the
+    // identical full window — the second run is a pure overlap reread.
+    val dedupConf = ConfigFactory.parseString(
+      """ingestion { pattern = "BACKFILL" }
+        |raw {
+        |  delivery_mode = "DEDUPLICATED_APPEND"
+        |  idempotency_key = ["claim_id", "modified_ts"]
+        |}""".stripMargin).withFallback(auditedConf("dedup"))
+
+    new IngestPipeline(spark, dedupConf,
+      Cli(entity = "claims_dedup", mode = "FULL", runId = Some("dd-1")), logger).run()
+    val loaded = spark.table("j_raw.claims_dedup").count()
+    assert(loaded > 0)
+
+    // Re-extract the identical rows (--force-reprocess bypasses the window
+    // guard): every row is an overlap reread, so NOTHING new is appended and
+    // the adjusted raw_equals_accepted reconciliation still passes.
+    new IngestPipeline(spark, dedupConf,
+      Cli(entity = "claims_dedup", mode = "FULL", runId = Some("dd-2"), forceReprocess = true),
+      logger).run()
+    assert(spark.table("j_raw.claims_dedup").count() == loaded,
+      "identical source versions must not duplicate in RAW under DEDUPLICATED_APPEND")
+    assert(spark.table("j_raw.claims_dedup").filter(col("run_id") === "dd-2").count() == 0)
+
+    val overlap = spark.table("j_audit.ingest_reconciliation")
+      .filter(col("entity") === "claims_dedup" && col("run_id") === "dd-2" &&
+        col("check_name") === "raw_overlap_reread")
+      .select("actual").collect()
+    assert(overlap.nonEmpty && overlap.head.getString(0).toLong == loaded,
+      "the measured overlap reread is recorded in reconciliation")
+  }
+
+  test("CFG_013: DEDUPLICATED_APPEND without an identity, or run_id as identity, fails at startup") {
+    val noKey = ConfigFactory.parseString("""raw { delivery_mode = "DEDUPLICATED_APPEND" }""")
+      .withFallback(auditedConf("cfg13"))
+    val e1 = intercept[IllegalStateException] {
+      new IngestPipeline(spark, noKey,
+        Cli(entity = "claims_cfg13", mode = "FULL", runId = Some("c13-1")), logger).run()
+    }
+    assert(e1.getMessage.contains("CFG_013"))
+
+    val runIdKey = ConfigFactory.parseString(
+      """raw { idempotency_key = ["run_id", "claim_id"] }""")
+      .withFallback(auditedConf("cfg13"))
+    val e2 = intercept[IllegalStateException] {
+      new IngestPipeline(spark, runIdKey,
+        Cli(entity = "claims_cfg13", mode = "FULL", runId = Some("c13-2")), logger).run()
+    }
+    assert(e2.getMessage.contains("CFG_013") && e2.getMessage.contains("run_id"))
+  }
+
+  test("concurrency.wait_ms retries a held lock instead of failing fast") {
+    val lock = new com.hcsc.generic.ingest.lock.LockService(
+      spark, "j_audit", "wait_locks", leaseMillis = 60000L, settleMillis = 1L,
+      logger = logger, waitMillis = 8000L)
+    lock.acquire("wait_entity", "holder-1")
+    val releaser = new Thread(new Runnable {
+      def run(): Unit = { Thread.sleep(1500); lock.release("wait_entity", "holder-1") }
+    })
+    releaser.start()
+    lock.acquire("wait_entity", "run-2") // blocks until holder-1 releases, then wins
+    releaser.join()
+    lock.release("wait_entity", "run-2")
+  }
+
   test("merge.require_ordering=true refuses the nondeterministic dedup fallback (CUR_004)") {
     val strict = ConfigFactory.parseString(
       """curated { merge { require_ordering = true } }""").withFallback(auditedConf("strict"))
@@ -421,6 +488,63 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       s"expected a continuity reconciliation failure, got: ${e.getMessage}")
     assert(InMemoryWatermarkStore.latest("claims_hold").get.values.head.startsWith("2026-01-07 09:00:00"),
       "the failed run must not advance the watermark")
+  }
+
+  test("FULL_SNAPSHOT_ABSENCE tombstones keys missing from a complete snapshot; reactivation revives them") {
+    import org.apache.spark.sql.functions.col
+    // FULL_TABLE every run = a complete snapshot each time (the incremental
+    // block only seeds once; later runs read the whole table unbounded).
+    val absenceConf = ConfigFactory.parseString(
+      """source { mode = "FULL_TABLE" }
+        |curated { merge { deletes {
+        |  mode = "FULL_SNAPSHOT_ABSENCE"
+        |  confirm_complete_extract = true
+        |} } }""".stripMargin).withFallback(auditedConf("absence"))
+
+    new IngestPipeline(spark, absenceConf,
+      Cli(entity = "claims_absence", mode = "FULL", runId = Some("ab-1")), logger).run()
+    val initial = spark.table("j_curated.claims_absence").count()
+    assert(initial > 0)
+
+    // Source row disappears -> next complete snapshot tombstones it
+    h2("DELETE FROM claims WHERE claim_id = 'C002'")
+    new IngestPipeline(spark, absenceConf,
+      Cli(entity = "claims_absence", mode = "FULL", runId = Some("ab-2")), logger).run()
+    val afterDelete = spark.table("j_curated.claims_absence")
+    assert(afterDelete.count() == initial, "tombstoned rows are retained, not dropped")
+    assert(afterDelete.filter(col("claim_id") === "C002")
+      .select("last_modified_op").collect().head.getString(0) == "D")
+
+    // Reactivation: the key returns to the source and publishes live again
+    h2("INSERT INTO claims VALUES ('C002', 201, '2026-01-10 09:00:00')")
+    new IngestPipeline(spark, absenceConf,
+      Cli(entity = "claims_absence", mode = "FULL", runId = Some("ab-3")), logger).run()
+    assert(spark.table("j_curated.claims_absence").filter(col("claim_id") === "C002")
+      .select("last_modified_op").collect().head.getString(0) != "D",
+      "a reappearing key publishes as a live row")
+  }
+
+  test("CFG_014: absence deletion rejects partial extracts and unimplemented capabilities") {
+    val filtered = ConfigFactory.parseString(
+      """source { mode = "FULL_TABLE", where = "amount > 0" }
+        |curated { merge { deletes {
+        |  mode = "FULL_SNAPSHOT_ABSENCE"
+        |  confirm_complete_extract = true
+        |} } }""".stripMargin).withFallback(auditedConf("cfg14"))
+    val e1 = intercept[IllegalStateException] {
+      new IngestPipeline(spark, filtered,
+        Cli(entity = "claims_cfg14", mode = "FULL", runId = Some("c14-1")), logger).run()
+    }
+    assert(e1.getMessage.contains("CFG_014") && e1.getMessage.contains("PARTIAL"))
+
+    val ct = ConfigFactory.parseString(
+      """curated { merge { deletes { mode = "CHANGE_TRACKING" } } }""")
+      .withFallback(auditedConf("cfg14"))
+    val e2 = intercept[IllegalStateException] {
+      new IngestPipeline(spark, ct,
+        Cli(entity = "claims_cfg14", mode = "FULL", runId = Some("c14-2")), logger).run()
+    }
+    assert(e2.getMessage.contains("CFG_014"))
   }
 
 }

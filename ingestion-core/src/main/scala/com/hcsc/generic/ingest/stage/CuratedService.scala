@@ -21,7 +21,13 @@ final case class CuratedResult(
   ignoredCount: Long = 0L,
   nullKeyCount: Long = 0L,
   dedupedCount: Long = 0L,
-  passthroughCount: Long = 0L
+  passthroughCount: Long = 0L,
+  /** Target keys newly tombstoned because they were ABSENT from a complete
+    * incoming snapshot (FULL_SNAPSHOT_ABSENCE). Counted separately: these
+    * rows come from the TARGET, not the accepted batch, so they are outside
+    * the curated_accounts_for_accepted_rows identity; the ledger's
+    * delete_count reports deleteCount + absenceDeleteCount. */
+  absenceDeleteCount: Long = 0L
 )
 
 /** Source-freshness contract for the incremental merge: the column whose
@@ -40,6 +46,12 @@ object DeleteSpec {
     * (freshness decides), stamped last_modified_op='D' and is_deleted=true
     * when the curated schema carries those columns. */
   final case class Soft(indicatorColumn: String, indicatorValues: Seq[String]) extends DeleteSpec
+  /** FULL snapshot publishes tombstone target keys ABSENT from the incoming
+    * complete snapshot. Gated on confirm_complete_extract and statically
+    * incompatible with source-side filtering (CFG_014) — absence over a
+    * partial extract would tombstone every excluded row. Reactivation is
+    * natural: a key present again simply publishes as a live row. */
+  case object SnapshotAbsence extends DeleteSpec
 }
 
 final class CuratedService(spark: SparkSession, conf: Config) {
@@ -204,11 +216,17 @@ final class CuratedService(spark: SparkSession, conf: Config) {
         logger.info("[CuratedService] Delete strategy undeclared for a keyed feed: defaulting to " +
           "IGNORE (source deletions are not reflected in curated). Declare " +
           "curated.merge.deletes { mode = IGNORE | SOFT } to make the decision explicit.")
+      if (deletes.contains(DeleteSpec.Ignore))
+        logger.info("[CuratedService] deletes.mode = IGNORE declared: source deletions are " +
+          "intentionally not reflected in curated (audited decision)")
+      if (deletes.contains(DeleteSpec.SnapshotAbsence) && isIncremental)
+        logger.warn("[CuratedService] deletes.mode = FULL_SNAPSHOT_ABSENCE applies to FULL " +
+          "snapshot publishes only; this incremental run performs no absence deletion")
 
       val result =
         if (!isIncremental)
           publishFull(hygienic, passthrough, nullKeyCount, passthroughCount, inputCount,
-            deletes, fullTable, request, ctx, contract)
+            keys, deletes, fullTable, request, ctx, contract)
         else
           publishIncremental(hygienic, passthrough, nullKeyCount, passthroughCount, inputCount,
             keys, freshness, deletes, fullTable, request, ctx, contract)
@@ -265,19 +283,35 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     * column). IGNORE is the default and is logged once for keyed feeds. */
   private def parseDeletes(mergeConf: Option[Config]): Option[DeleteSpec] =
     mergeConf.flatMap(m => ConfigUtils.optConfig(m, "deletes")).map { d =>
-      val mode = ConfigUtils.optString(d, "mode").getOrElse("IGNORE").toUpperCase
-      require(Seq("IGNORE", "SOFT").contains(mode),
-        s"curated.merge.deletes.mode '$mode' must be IGNORE or SOFT (RECONCILE is future work)")
-      if (mode == "IGNORE") DeleteSpec.Ignore
-      else {
-        val indicator = ConfigUtils.optString(d, "indicator_column").getOrElse(
+      ConfigUtils.optString(d, "mode").getOrElse("IGNORE").toUpperCase match {
+        case "IGNORE" => DeleteSpec.Ignore
+        case "SOFT" =>
+          val indicator = ConfigUtils.optString(d, "indicator_column").getOrElse(
+            throw new IllegalArgumentException(
+              "curated.merge.deletes.mode = SOFT requires indicator_column (the source's soft-delete flag)"))
+          DeleteSpec.Soft(indicator,
+            ConfigUtils.stringList(d, "indicator_values") match {
+              case Nil => Seq("true", "1", "y", "d")
+              case vs => vs.map(_.toLowerCase)
+            })
+        case "FULL_SNAPSHOT_ABSENCE" =>
+          require(ConfigUtils.optBoolean(d, "confirm_complete_extract").getOrElse(false),
+            "CUR_005 deletes.mode = FULL_SNAPSHOT_ABSENCE requires confirm_complete_extract = true: " +
+              "absence-based deletion is only sound over a COMPLETE source extract")
+          DeleteSpec.SnapshotAbsence
+        case m @ ("CHANGE_TRACKING" | "CDC") =>
           throw new IllegalArgumentException(
-            "curated.merge.deletes.mode = SOFT requires indicator_column (the source's soft-delete flag)"))
-        DeleteSpec.Soft(indicator,
-          ConfigUtils.stringList(d, "indicator_values") match {
-            case Nil => Seq("true", "1", "y", "d")
-            case vs => vs.map(_.toLowerCase)
-          })
+            s"CUR_005 deletes.mode = $m is a declared capability that is NOT implemented (no " +
+              "Change Tracking / CDC extraction exists); use SOFT with a source indicator, " +
+              "FULL_SNAPSHOT_ABSENCE for complete snapshots, or IGNORE")
+        case m @ ("RECONCILE" | "PERIODIC_KEY_RECONCILIATION") =>
+          throw new IllegalArgumentException(
+            s"CUR_005 deletes.mode = $m (periodic source-key reconciliation) is future work; " +
+              "it needs a source-key snapshot channel, a reviewable candidate table and a " +
+              "governed apply step. Use SOFT, FULL_SNAPSHOT_ABSENCE or IGNORE")
+        case other =>
+          throw new IllegalArgumentException(
+            s"curated.merge.deletes.mode '$other' must be IGNORE, SOFT or FULL_SNAPSHOT_ABSENCE")
       }
     }
 
@@ -437,6 +471,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     nullKeyCount: Long,
     passthroughCount: Long,
     inputCount: Long,
+    keys: Seq[String],
     deletes: Option[DeleteSpec],
     fullTable: String,
     request: PublishRequest,
@@ -457,21 +492,66 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     // counted once). Marking is column-wise, so marking the parts equals
     // marking the union.
     val keyedMarked = applyDeleteMarking(alignTo(df), deletes, fullTable)
-    val publishDf = passthrough
+    val incomingDf = passthrough
       .map(p => applyDeleteMarking(alignTo(p), deletes, fullTable))
       .fold(keyedMarked)(p => keyedMarked.unionByName(p))
 
-    val published = publisher.publish(publishDf, request, ctx)
-    val keyedPublished = published.publishedCount - passthroughCount
+    // FULL_SNAPSHOT_ABSENCE: target keys missing from the complete incoming
+    // snapshot become retained tombstones (op='D', is_deleted=true when the
+    // column exists). Already-tombstoned rows are retained but only NEWLY
+    // absent rows count as this run's deletes. Reactivation needs no code:
+    // a key present again publishes as a live incoming row.
+    val (absentRows, absenceDeletes) = (deletes, schemaOpt) match {
+      case (Some(DeleteSpec.SnapshotAbsence), Some(_)) if keys.nonEmpty =>
+        val target = spark.table(fullTable)
+        val missingKeys = keys.filterNot(k => target.columns.exists(_.equalsIgnoreCase(k)))
+        require(missingKeys.isEmpty,
+          s"CUR_005 FULL_SNAPSHOT_ABSENCE requires business keys in $fullTable; " +
+            s"missing: ${missingKeys.mkString(", ")}")
+        val incomingKeys = incomingDf
+          .select(keys.map(k => col(incomingDf.columns.find(_.equalsIgnoreCase(k)).get).as(k)): _*)
+          .distinct().alias("k")
+        val t = target.alias("t")
+        val condition = keys.map { k =>
+          col(s"t.${target.columns.find(_.equalsIgnoreCase(k)).get}") <=> col(s"k.$k")
+        }.reduce(_ && _)
+        val absent = t.join(incomingKeys, condition, "left_anti").persist()
+        val newlyDeleted = target.columns.find(_.equalsIgnoreCase("is_deleted")) match {
+          case Some(flag) => absent.filter(!coalesce(col(flag).cast("boolean"), lit(false))).count()
+          case None       => absent.count()
+        }
+        val retained = absent.count()
+        if (newlyDeleted > 0)
+          logger.info(s"[CuratedService] FULL_SNAPSHOT_ABSENCE: $newlyDeleted key(s) absent " +
+            s"from the complete snapshot tombstoned (retained rows: $retained)")
+        (Some((markAllDeleted(absent), retained)), newlyDeleted)
+      case _ => (None, 0L)
+    }
+    val publishDf = absentRows.map(_._1).fold(incomingDf)(a => incomingDf.unionByName(a))
+
+    val published = try publisher.publish(publishDf, request, ctx)
+    finally absentRows.foreach { case (m, _) => try m.unpersist(false) catch { case _: Exception => () } }
+    val absentTotal = absentRows.map(_._2).getOrElse(0L)
+    val keyedPublished = published.publishedCount - passthroughCount - absentTotal
     val deleteCount = deleteMarkCount(keyedMarked, deletes)
     val dedupedCount = if (inputCount >= 0) math.max(inputCount - keyedPublished, 0L) else 0L
     // Disjoint accounting: a published keyed row is EITHER an insert or a
     // tombstone, never both — insert+update+delete+ignored+nullKey+deduped+
-    // passthrough must total the accepted rows.
+    // passthrough must total the accepted rows. Absence tombstones come
+    // from the TARGET and stay outside this identity (absenceDeleteCount).
     CuratedResult(published.publishedCount, insertCount = keyedPublished - deleteCount,
       updateCount = 0L, deleteCount = deleteCount,
       ignoredCount = 0L, nullKeyCount = nullKeyCount, dedupedCount = dedupedCount,
-      passthroughCount = passthroughCount)
+      passthroughCount = passthroughCount, absenceDeleteCount = absenceDeletes)
+  }
+
+  /** Unconditional tombstone stamping for absence rows: op='D' plus
+    * is_deleted=true when the schema carries the columns. */
+  private def markAllDeleted(df: DataFrame): DataFrame = {
+    val withOp = df.columns.find(_.equalsIgnoreCase("last_modified_op"))
+      .fold(df)(op => df.withColumn(op, lit("D")))
+    df.columns.find(_.equalsIgnoreCase("is_deleted"))
+      .fold(withOp)(flag => withOp.withColumn(flag, lit(true)))
   }
 
   /**

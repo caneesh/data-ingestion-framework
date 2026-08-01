@@ -96,6 +96,47 @@ object FeedCompatibilityValidator {
     // CFG_011 pattern/config contradiction, CFG_012 backfill commit clash).
     errors ++= IngestionPattern.derive(feed)._2
 
+    // Raw delivery mode: deduplicated appends need a SOURCE record-version
+    // identity, and run_id can never be one (it identifies the pipeline
+    // execution, not the record).
+    val deliveryMode = opt("raw.delivery_mode")
+    val rawIdempotencyKey = ConfigUtils.optConfig(feed, "raw")
+      .map(r => ConfigUtils.stringList(r, "idempotency_key")).getOrElse(Seq.empty)
+    deliveryMode.foreach { m =>
+      if (!Seq("AT_LEAST_ONCE_APPEND", "DEDUPLICATED_APPEND").contains(m))
+        errors += s"CFG_013 raw.delivery_mode '$m' must be AT_LEAST_ONCE_APPEND or DEDUPLICATED_APPEND"
+      else if (m == "DEDUPLICATED_APPEND" && rawIdempotencyKey.isEmpty)
+        errors += "CFG_013 raw.delivery_mode DEDUPLICATED_APPEND requires raw.idempotency_key " +
+          "(source PK + version column[s] identifying one source record version)"
+    }
+    if (rawIdempotencyKey.exists(_.equalsIgnoreCase("run_id")))
+      errors += "CFG_013 raw.idempotency_key must identify a SOURCE record version; run_id " +
+        "identifies the pipeline execution and would defeat cross-run deduplication"
+
+    // Absence-based deletion is only sound over a COMPLETE extract: any
+    // source-side filtering would tombstone every excluded row. Unsupported
+    // delete capabilities fail here too (runtime parse also guards).
+    val deleteMode = opt("curated.merge.deletes.mode")
+    if (deleteMode.contains("FULL_SNAPSHOT_ABSENCE")) {
+      val filtered = feed.hasPath("source.where") || feed.hasPath("source.filters") ||
+        feed.hasPath("source.sql") || feed.hasPath("source.query")
+      if (filtered)
+        errors += "CFG_014 deletes.mode FULL_SNAPSHOT_ABSENCE with source-side filtering " +
+          "(where/filters/sql): absence over a PARTIAL extract tombstones every excluded row; " +
+          "remove the filters or use SOFT/IGNORE"
+      val confirmed = ConfigUtils.optConfig(feed, "curated")
+        .flatMap(c => ConfigUtils.optConfig(c, "merge"))
+        .flatMap(m => ConfigUtils.optConfig(m, "deletes"))
+        .flatMap(d => ConfigUtils.optBoolean(d, "confirm_complete_extract")).getOrElse(false)
+      if (!confirmed)
+        errors += "CFG_014 deletes.mode FULL_SNAPSHOT_ABSENCE requires " +
+          "deletes.confirm_complete_extract = true"
+    }
+    if (deleteMode.exists(m => Seq("CHANGE_TRACKING", "CDC", "RECONCILE",
+        "PERIODIC_KEY_RECONCILIATION").contains(m)))
+      errors += s"CFG_014 deletes.mode ${deleteMode.get} is a declared capability that is not " +
+        "implemented; use IGNORE, SOFT or FULL_SNAPSHOT_ABSENCE"
+
     errors.result()
   }
 }

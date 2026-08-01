@@ -149,7 +149,8 @@ final class IngestPipeline(
         val r = new CuratedStageRunner(spark, curatedConf, logger)
           .run(slice, ctx.mode, ctx, contract, Some(rejectService))
         val counts = r.map(x => StageCounts(
-          insertCount = x.insertCount, updateCount = x.updateCount, deleteCount = x.deleteCount
+          insertCount = x.insertCount, updateCount = x.updateCount,
+          deleteCount = x.deleteCount + x.absenceDeleteCount
         )).getOrElse(StageCounts())
         (r, counts)
       }.flatten
@@ -305,7 +306,8 @@ final class IngestPipeline(
         val result = new CuratedStageRunner(spark, curatedConf, logger)
           .run(acceptedDf, ctx.mode, ctx, contract, Some(rejectService))
         val counts = result.map(r => StageCounts(
-          insertCount = r.insertCount, updateCount = r.updateCount, deleteCount = r.deleteCount
+          insertCount = r.insertCount, updateCount = r.updateCount,
+          deleteCount = r.deleteCount + r.absenceDeleteCount
         )).getOrElse(StageCounts())
         (result, counts)
       }
@@ -387,7 +389,11 @@ final class IngestPipeline(
     accepted: DataFrame,
     counts: StageCounts,
     window: Option[(String, Option[String])] = None,
-    duplicateVersions: Long = -1L)
+    duplicateVersions: Long = -1L,
+    /** Rows the DEDUPLICATED_APPEND delivery mode skipped because the same
+      * source-version identity already exists in RAW — the measured overlap
+      * reread. 0 under AT_LEAST_ONCE_APPEND. */
+    overlapSkipped: Long = 0L)
 
   /** Runs a stage unless --resume finds it already SUCCESS; records audit
     * STARTED/SUCCESS/FAILED around the body. Returns None when skipped. */
@@ -528,7 +534,7 @@ final class IngestPipeline(
     val split = rejectService.split(withMeta, ctx)
     val accepted = track(split.accepted.persist(StorageLevel.MEMORY_AND_DISK))
 
-    val windowSkipped =
+    val (windowSkipped, overlapSkipped) =
       writeRawIdempotently(accepted, rawConf, rawFullTable, rawDatabase, rawTable, window, rejectService)
 
     val acceptedCount = if (split.acceptedCount >= 0) split.acceptedCount else sourceCount
@@ -575,7 +581,7 @@ final class IngestPipeline(
       rejectedCount = split.rejectedCount,
       controlTotal = controlTotal(accepted)
     )
-    RawOutcome(accepted, counts, window, duplicateVersions)
+    RawOutcome(accepted, counts, window, duplicateVersions, overlapSkipped)
   }
 
   /** Multi-file batch safety: staged files were validated per-file at
@@ -652,10 +658,10 @@ final class IngestPipeline(
     rawTable: String,
     window: Option[(String, Option[String])],
     rejectService: RejectService
-  ): Option[(String, String)] = {
+  ): (Option[(String, String)], Long) = {
     if (ctx.dryRun) {
       logger.info("[Pipeline] DRY-RUN: skipping RAW write")
-      return None
+      return (None, 0L)
     }
     val runIdLoaded = spark.catalog.tableExists(rawFullTable) &&
       spark.table(rawFullTable).columns.contains("run_id") &&
@@ -692,6 +698,7 @@ final class IngestPipeline(
         "re-extracted window — previously accepted rows will duplicate in RAW (curated dedup " +
         "absorbs them); rows that now pass the reject rules are recovered.")
 
+    var overlapSkipped = 0L
     if (runIdLoaded) {
       logger.warn(s"[Pipeline] RAW already holds rows for run ${ctx.runId}; skipping write (idempotent replay)")
     } else if (windowLoaded.isDefined) {
@@ -721,11 +728,52 @@ final class IngestPipeline(
               "deduplicates by key, and raw.idempotency_key monitoring can quantify the overlap.")
         }
       }
+      // raw.delivery_mode = AT_LEAST_ONCE_APPEND (default) | DEDUPLICATED_APPEND.
+      // Deduplicated mode anti-joins on the SOURCE record-version identity
+      // (raw.idempotency_key: PK + version [+ operation] — never run_id), so
+      // overlap rereads, drifted retries and held-window recoveries append
+      // only genuinely new versions; the skipped count is the measured
+      // overlap, reconciled below.
+      val deliveryMode = ConfigUtils.optString(rawConf, "delivery_mode")
+        .map(_.trim.toUpperCase).getOrElse("AT_LEAST_ONCE_APPEND")
+      require(Seq("AT_LEAST_ONCE_APPEND", "DEDUPLICATED_APPEND").contains(deliveryMode),
+        s"raw.delivery_mode '$deliveryMode' must be AT_LEAST_ONCE_APPEND or DEDUPLICATED_APPEND")
+      val idempotencyKeyCols = ConfigUtils.stringList(rawConf, "idempotency_key")
+      val toWrite =
+        if (deliveryMode != "DEDUPLICATED_APPEND" || !spark.catalog.tableExists(rawFullTable)) accepted
+        else {
+          require(idempotencyKeyCols.nonEmpty,
+            "RAW_004 raw.delivery_mode = DEDUPLICATED_APPEND requires raw.idempotency_key " +
+              "(the source record-version identity: source PK + version column[s])")
+          val existingCols = spark.table(rawFullTable).columns
+          val missing = idempotencyKeyCols.filterNot(k =>
+            existingCols.exists(_.equalsIgnoreCase(k)) && accepted.columns.exists(_.equalsIgnoreCase(k)))
+          require(missing.isEmpty,
+            s"RAW_004 raw.idempotency_key column(s) [${missing.mkString(", ")}] missing from the " +
+              "RAW table or the incoming batch; DEDUPLICATED_APPEND cannot establish identity")
+          val incoming = accepted.alias("i")
+          val existing = spark.table(rawFullTable)
+            .select(idempotencyKeyCols.map(k => col(existingCols.find(_.equalsIgnoreCase(k)).get)): _*)
+            .distinct().alias("e")
+          val condition = idempotencyKeyCols.map { k =>
+            val iCol = accepted.columns.find(_.equalsIgnoreCase(k)).get
+            val eCol = existingCols.find(_.equalsIgnoreCase(k)).get
+            col(s"i.$iCol") <=> col(s"e.$eCol")
+          }.reduce(_ && _)
+          val fresh = incoming.join(existing, condition, "left_anti")
+          val freshCount = fresh.count()
+          overlapSkipped = accepted.count() - freshCount
+          if (overlapSkipped > 0)
+            logger.info(s"[Pipeline] DEDUPLICATED_APPEND: $overlapSkipped overlap-reread row(s) " +
+              s"already in RAW by identity [${idempotencyKeyCols.mkString(", ")}]; " +
+              s"appending $freshCount new version(s)")
+          fresh
+        }
       val sinkType = ConfigUtils.optString(rawConf, "type").getOrElse("hive")
-      SinkRegistry.resolve(sinkType).write(spark, accepted, rawConf)
+      SinkRegistry.resolve(sinkType).write(spark, toWrite, rawConf)
     }
     contract.foreach(c => SchemaVersions.record(spark, rawDatabase, rawTable, c.version, Some(c), logger))
-    windowLoaded
+    (windowLoaded, overlapSkipped)
   }
 
   /** Audits a header/content contract failure and quarantines the staged
@@ -816,8 +864,15 @@ final class IngestPipeline(
         checks += (("source_equals_accepted_plus_rejected", expected.toString, actual.toString, expected == actual))
       }
       if (!ctx.dryRun && c.rawCount >= 0 && c.acceptedCount >= 0) {
-        checks += (("raw_equals_accepted", c.acceptedCount.toString, c.rawCount.toString, c.rawCount == c.acceptedCount))
+        // DEDUPLICATED_APPEND deliberately writes fewer rows than accepted:
+        // the overlap already present by source-version identity.
+        val expectedRaw = c.acceptedCount - o.overlapSkipped
+        checks += (("raw_equals_accepted", expectedRaw.toString, c.rawCount.toString, c.rawCount == expectedRaw))
       }
+      // Measured overlap reread (DEDUPLICATED_APPEND): informational record
+      // so operators can see exactly how much of the window was re-extracted.
+      if (o.overlapSkipped > 0)
+        checks += (("raw_overlap_reread", o.overlapSkipped.toString, o.overlapSkipped.toString, true))
       // Raw version-duplicate check (raw.idempotency_key configured):
       // duplicate key-tuples inside one run's write indicate a source or
       // extraction defect, not the intentional overlap re-read.

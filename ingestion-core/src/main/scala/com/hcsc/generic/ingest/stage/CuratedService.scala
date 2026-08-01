@@ -110,13 +110,38 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       require(missing.isEmpty,
         s"CUR_006 curated.partitioning.keys missing from incoming data: ${missing.mkString(", ")}")
     }
-    val prepared = applyNullPartitionPolicy(prepared3, partitionSpec)
+    val prepared4 = applyNullPartitionPolicy(prepared3, partitionSpec)
 
     val mergeConf = ConfigUtils.optConfig(conf, "merge")
     val keys = resolveMergeKeys(mergeConf, contract)
     val freshness = parseFreshness(mergeConf)
     val ordering = effectiveOrdering(freshness)
     val deletes = parseDeletes(mergeConf)
+
+    // Source-specific TECHNICAL metadata (Kafka coordinates, file record
+    // numbers) must not become curated business columns by accident: drop
+    // them unless the feed opts in — and fail loudly when the merge
+    // configuration references one, instead of letting it vanish mid-merge.
+    val prepared = {
+      val technical = com.hcsc.generic.ingest.transform.SourceMetadata.TechnicalColumns
+      val present = prepared4.columns.filter(c => technical.contains(c.toLowerCase))
+      val retain = ConfigUtils.optBoolean(conf, "retain_source_metadata").getOrElse(false)
+      if (present.isEmpty || retain) prepared4
+      else {
+        val deleteIndicator = deletes.collect { case DeleteSpec.Soft(ind, _) => ind }.toSeq
+        val referenced = (keys ++ partitionSpec.keys ++ deleteIndicator ++
+          ordering.map(o => com.hcsc.generic.ingest.transform.OrderSpec.parse(o).column))
+          .filter(r => present.exists(_.equalsIgnoreCase(r)))
+        require(referenced.isEmpty,
+          s"CUR_007 merge keys/ordering/partitioning/deletes reference source metadata " +
+            s"column(s) [${referenced.distinct.mkString(", ")}] which are dropped before curated " +
+            "by default. Set curated.retain_source_metadata = true to keep them in the " +
+            "curated schema (deliberate, audited decision).")
+        logger.info(s"[CuratedService] Dropping source metadata column(s) before curated: " +
+          s"${present.mkString(", ")} (curated.retain_source_metadata = true keeps them)")
+        prepared4.drop(present: _*)
+      }
+    }
 
     // merge.require_ordering = true: refuse the nondeterministic
     // dropDuplicates fallback outright — a keyed feed must declare

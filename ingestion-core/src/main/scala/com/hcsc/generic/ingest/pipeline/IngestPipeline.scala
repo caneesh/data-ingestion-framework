@@ -483,7 +483,8 @@ final class IngestPipeline(
     // curated merge uses it to skip no-change rewrites.
     val withMeta0 =
       if (ConfigUtils.optBoolean(rawConf, "record_hash").getOrElse(false))
-        com.hcsc.generic.ingest.transform.RecordHash.stamp(withMetaBase, contract)
+        com.hcsc.generic.ingest.transform.RecordHash.stamp(
+          withMetaBase, contract, recordHashOptions(rawConf))
       else withMetaBase
     // Opt-in extended lineage (raw.lineage_extended = true): per-record
     // source_modified_ts / source_operation / source_primary_key, and no
@@ -773,8 +774,42 @@ final class IngestPipeline(
       SinkRegistry.resolve(sinkType).write(spark, toWrite, rawConf)
     }
     contract.foreach(c => SchemaVersions.record(spark, rawDatabase, rawTable, c.version, Some(c), logger))
+    // Record-hash recipe versioning (§11): the active recipe (base version +
+    // canonicalization options) lives on the table so a recipe change is
+    // DETECTED — hashes across two recipes are never comparable silently.
+    if (ConfigUtils.optBoolean(rawConf, "record_hash").getOrElse(false) &&
+        spark.catalog.tableExists(rawFullTable))
+      recordHashVersionProperty(rawFullTable,
+        com.hcsc.generic.ingest.transform.RecordHash.recipeVersion(recordHashOptions(rawConf)))
     (windowLoaded, overlapSkipped)
   }
+
+  private def recordHashOptions(rawConf: Config): com.hcsc.generic.ingest.transform.RecordHashOptions = {
+    val opts = ConfigUtils.optConfig(rawConf, "record_hash_options")
+    com.hcsc.generic.ingest.transform.RecordHashOptions(
+      trimValues = opts.flatMap(o => ConfigUtils.optBoolean(o, "trim")).getOrElse(false),
+      uppercaseValues = opts.flatMap(o => ConfigUtils.optBoolean(o, "uppercase")).getOrElse(false))
+  }
+
+  /** Writes ingest.record_hash.version only when it changed (no per-run
+    * ALTER chatter); a change is loudly warned — unchanged-row detection
+    * treats every pre-recipe-change row as changed until rewritten. */
+  private def recordHashVersionProperty(fullTable: String, version: String): Unit =
+    try {
+      val stored = spark.sql(s"SHOW TBLPROPERTIES $fullTable('ingest.record_hash.version')")
+        .collect().headOption.map(_.getString(1))
+        .filterNot(_.toLowerCase.contains("does not have property"))
+      if (!stored.contains(version)) {
+        stored.foreach(v => logger.warn(
+          s"[Pipeline] record_hash recipe changed for $fullTable: stored '$v' -> '$version'. " +
+            "Hashes across recipes are NOT comparable; the no-change filter treats every " +
+            "pre-change row as changed until it is rewritten under the new recipe."))
+        spark.sql(s"ALTER TABLE $fullTable SET TBLPROPERTIES ('ingest.record_hash.version' = '$version')")
+      }
+    } catch {
+      case scala.util.control.NonFatal(e) =>
+        logger.warn(s"[Pipeline] could not record the record_hash recipe version: ${e.getMessage}")
+    }
 
   /** Audits a header/content contract failure and quarantines the staged
     * files when configured. The audit record is written BEFORE any file is

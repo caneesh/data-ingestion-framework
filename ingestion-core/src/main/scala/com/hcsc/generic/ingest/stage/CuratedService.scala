@@ -231,11 +231,15 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           publishIncremental(hygienic, passthrough, nullKeyCount, passthroughCount, inputCount,
             keys, freshness, deletes, fullTable, request, ctx, contract)
 
+      // unchanged/rewrite metrics (§11): ignoredStale counts stale + hash-
+      // unchanged skips; rewritten is the real mutation volume of the run.
       logger.info(
         s"[CuratedService] published=${result.publishedCount} inserts=${result.insertCount} " +
           s"updates=${result.updateCount} deletes=${result.deleteCount} " +
+          s"absenceDeletes=${result.absenceDeleteCount} " +
           s"ignoredStale=${result.ignoredCount} nullKeys=${result.nullKeyCount} " +
-          s"deduped=${result.dedupedCount} passthrough=${result.passthroughCount}"
+          s"deduped=${result.dedupedCount} passthrough=${result.passthroughCount} " +
+          s"rewritten=${result.insertCount + result.updateCount + result.deleteCount}"
       )
       Some(result)
     } finally {

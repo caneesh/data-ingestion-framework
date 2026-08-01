@@ -19,12 +19,34 @@ import org.apache.spark.sql.functions._
   * comparison), and values containing U+0001/U+0000 can collide with the
   * separator/null encodings. It fingerprints content; it is not a key.
   */
+/** Opt-in value canonicalization (raw.record_hash_options): applied to every
+  * participating value BEFORE hashing. Enabling either flag changes every
+  * hash, which is why the recipe version embeds the active options — a
+  * stored-vs-current recipe mismatch is detectable, never silent. */
+final case class RecordHashOptions(trimValues: Boolean = false, uppercaseValues: Boolean = false)
+
 object RecordHash {
   val Column = "record_hash"
+  /** Bump on any change to the base recipe (separator, null marker, column
+    * selection or ordering rules). */
+  val BaseRecipeVersion = "1"
   private val FieldSeparator = "\u0001"
   private val NullMarker = "\u0000"
 
-  def stamp(df: DataFrame, contract: Option[SchemaContract]): DataFrame = {
+  /** The full recipe identity recorded on the RAW table
+    * (ingest.record_hash.version): base version plus active canonicalization
+    * options, so hashes from different recipes are never compared silently. */
+  def recipeVersion(options: RecordHashOptions): String = {
+    val mods = Seq(
+      if (options.trimValues) Some("trim") else None,
+      if (options.uppercaseValues) Some("upper") else None).flatten
+    if (mods.isEmpty) BaseRecipeVersion else s"$BaseRecipeVersion+${mods.mkString("+")}"
+  }
+
+  def stamp(df: DataFrame, contract: Option[SchemaContract]): DataFrame =
+    stamp(df, contract, RecordHashOptions())
+
+  def stamp(df: DataFrame, contract: Option[SchemaContract], options: RecordHashOptions): DataFrame = {
     RawMetadata.requireNoCollisions(df, Seq(Column), "record_hash stamping")
     val candidates = contract match {
       case Some(c) =>
@@ -34,7 +56,12 @@ object RecordHash {
         df.columns.toSeq.filterNot(c => RawMetadata.ColumnNames.contains(c.toLowerCase))
     }
     val cols = candidates.distinct.sortBy(_.toLowerCase)
-    val input = cols.map(c => coalesce(col(c).cast("string"), lit(NullMarker)))
+    def canonical(name: String): org.apache.spark.sql.Column = {
+      val base = col(name).cast("string")
+      val trimmed = if (options.trimValues) trim(base) else base
+      if (options.uppercaseValues) upper(trimmed) else trimmed
+    }
+    val input = cols.map(c => coalesce(canonical(c), lit(NullMarker)))
     val hash = if (input.isEmpty) lit("") else sha2(concat_ws(FieldSeparator, input: _*), 256)
     df.withColumn(Column, hash)
   }

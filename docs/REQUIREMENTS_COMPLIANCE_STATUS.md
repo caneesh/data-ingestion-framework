@@ -57,7 +57,7 @@ before the commit, counts reconciled) but recovery is manual.
 | §15 Performance | **Reviewed separately** | See `PERFORMANCE_REVIEW.md` — notable open items: O(table) curated publish, single-partition default JDBC read |
 | §16 Security | **Met** (in-scope items) | Vault providers, TLS enforcement with explicit opt-outs, log sanitization (tested), contract sensitivity classification driving reject masking. At-rest encryption/RBAC/curated masking = platform concerns |
 | §17 Retention | **Met** | RetentionService: raw partition drops, reject/audit purges, watermark keep-last-N, dry-run, `--stage retention` under lock (CLI bug fixed) |
-| §18 Concurrency | **Met (best-effort)** | Claim-settle-reread lease with expiry + watermark version CAS; residual races on non-transactional Hive honestly documented; strict serialization needs a transactional store (the unwired `JdbcCheckpointStore` already implements true CAS) |
+| §18 Concurrency | **Met (best-effort)** | Claim-settle-reread lease with expiry + watermark version CAS; residual races on non-transactional Hive honestly documented; strict serialization needs a transactional store (a reference `JdbcCheckpointStore` with true UPDATE-WHERE CAS exists in git history — removed with the duplicate frameworks, see tag v1.0.0-snapshot.6) |
 | §19 Empty runs | **Met for INCR** | Zero-row runs succeed, skip the merge, record zero counts; watermark advances on idle sources only with SOURCE_CLOCK (MAX_VALUE holds safely — spec-compliant advance requires SOURCE_CLOCK). Empty FULL requires `allow_empty` (deliberate wipe protection) |
 
 ## 3. §22 acceptance criteria: 16 of 18 PASS
@@ -79,8 +79,10 @@ has no end-to-end SQL Server test (H2 only).
 2. **Watermark-continuity check** (§11): assert new lower == previous upper
    (unless overlap) at plan time; cheap, closes an audit-blind spot.
 3. **Periodic reconciliation job** (§11): source vs curated counts/keys/
-   sampled hashes; the declarative `reconcile/` engine (unwired) is a
-   natural home.
+   sampled hashes; build on the live pipeline reconcile checks (the
+   declarative `reconcile/` engine prototype was removed with the duplicate
+   frameworks — git history at v1.0.0-snapshot.6 if a starting point is
+   wanted).
 4. **Snapshot consistency for initial loads** (§4.3 / S7): support
    isolation hints / `applicationIntent` / RCSI guidance per dialect.
 5. **Delete completeness** (§8): SQL Server Change Tracking integration or

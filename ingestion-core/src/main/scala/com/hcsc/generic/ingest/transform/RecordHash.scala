@@ -8,9 +8,9 @@ import org.apache.spark.sql.functions._
   * Business-content fingerprint for change detection (§7): a SHA-256 over
   * the business columns in case-insensitively SORTED column-name order with
   * explicit null markers — stable across column reordering and header case
-  * changes, and it distinguishes null from empty string. The recipe matches
-  * raw.RawMetadataStamper exactly so the two stamping paths produce
-  * comparable hashes.
+  * changes, and it distinguishes null from empty string. This is the SINGLE
+  * hash recipe in the framework; BaseRecipeVersion below must be bumped on
+  * any change to it.
   *
   * With a schema contract, only contract columns of category `business`
   * participate (technical/audit/generated columns never shift the hash);

@@ -33,9 +33,9 @@ C1–C12, S1–S16, backlog items 1–21.
 > **Remote-framework adoption (2026-07-29):** `FeedCompatibilityValidator`
 > (CFG_001..009) is wired into pipeline startup (runInternal and
 > curatedReplay) and the config generator's dry run; and Phase 3 item #17
-> is implemented — `RecordHash` (hash recipe identical to
-> `raw.RawMetadataStamper`: case-insensitively sorted business columns,
-> U+0001 separator, U+0000 null marker, SHA-256) stamps RAW rows when
+> is implemented — `RecordHash` (case-insensitively sorted business columns,
+> U+0001 separator, U+0000 null marker, SHA-256; the framework's single hash
+> recipe — the duplicate `raw.RawMetadataStamper` was removed) stamps RAW rows when
 > `raw.record_hash = true` and the freshness merge skips rewriting (and
 > restamping) rows whose key+hash already match the target. Phase 3
 > otherwise remains open, **except** item 3.3/backlog #18's tooling half

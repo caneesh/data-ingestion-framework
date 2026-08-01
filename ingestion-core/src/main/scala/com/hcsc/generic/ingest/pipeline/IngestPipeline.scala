@@ -441,8 +441,15 @@ final class IngestPipeline(
     val df0 =
       try {
         val df = readGroupedSource(effectiveSource, staged)
-        validateContractBeforeRaw(df, rawDatabase, rawTable, rejectService)
-        df
+        // Contract validation runs 2-3 full aggregation passes over the
+        // source BEFORE the raw frame is persisted — cache the source read
+        // first so those passes (and the withMeta materialization below)
+        // parse the source once instead of three or four times. Released
+        // right after withMeta materializes.
+        val cached =
+          if (contract.isDefined) track(df.persist(StorageLevel.MEMORY_AND_DISK)) else df
+        validateContractBeforeRaw(cached, rawDatabase, rawTable, rejectService)
+        cached
       } catch {
         case e: SchemaContractViolationException =>
           handleContractFailure(e, staged, intake)
@@ -531,6 +538,11 @@ final class IngestPipeline(
       else RawIdempotency.excludeLoadedFiles(spark, rawFullTable, withMeta1, logger)
 
     val sourceCount = track(withMeta.persist(StorageLevel.MEMORY_AND_DISK)).count()
+    // withMeta is materialized: the source-level cache from contract
+    // validation has served its purpose — release it now rather than
+    // holding two copies of the batch to end-of-run.
+    if (contract.isDefined)
+      try df0.unpersist(false) catch { case _: Exception => () }
 
     val split = rejectService.split(withMeta, ctx)
     val accepted = track(split.accepted.persist(StorageLevel.MEMORY_AND_DISK))

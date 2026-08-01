@@ -13,37 +13,43 @@ final class CuratedTransform(spark: SparkSession) {
   private val logger = org.apache.log4j.Logger.getLogger(getClass.getName)
 
   def castConfigured(df: DataFrame, conf: Config): DataFrame = {
-    ConfigUtils.stringMap(conf, "column_types").foldLeft(df) {
-      case (acc, (name, dataType)) =>
-        ColumnMapping.findColumn(acc, name) match {
-          case Some(actual) => acc.withColumn(actual, col(actual).cast(dataType))
-          case None => acc
-        }
+    // Single projection instead of a withColumn chain: at wide-table column
+    // counts the chained form re-analyzes a growing plan per column
+    // (quadratic driver time). Each cast reads only its own column, so
+    // collapsing is semantics-preserving.
+    val casts = ConfigUtils.stringMap(conf, "column_types").toSeq.flatMap { case (name, dataType) =>
+      ColumnMapping.findColumn(df, name).map(actual => actual -> col(actual).cast(dataType))
     }
+    if (casts.isEmpty) df else df.withColumns(casts.toMap)
   }
 
   /** Contract-declared per-column transforms (mapping-spec attribute):
     * TRIM | UPPER | LOWER, or a Spark SQL expression containing {col}.
-    * Applied at the curated stage — RAW stays untransformed. */
+    * Applied at the curated stage — RAW stays untransformed.
+    *
+    * All transforms are applied in ONE projection and observe the
+    * PRE-TRANSFORM input values: a transform expression referencing another
+    * column sees that column's original value, never another transform's
+    * output. (Also the performance fix for 350-column contracts — a
+    * withColumn chain re-analyzes a growing plan per column.) */
   def applyContractTransforms(df: DataFrame, contract: Option[com.hcsc.generic.ingest.schema.SchemaContract]): DataFrame =
     contract.fold(df) { c =>
-      c.columns.filter(_.transform.isDefined).foldLeft(df) { (acc, cc) =>
-        acc.columns.find(_.equalsIgnoreCase(cc.name)) match {
-          case Some(actual) =>
-            val quoted = s"`${actual.replace("`", "``")}`"
-            val exprStr = cc.transform.get.trim match {
-              case t if t.equalsIgnoreCase("TRIM")  => s"trim($quoted)"
-              case t if t.equalsIgnoreCase("UPPER") => s"upper($quoted)"
-              case t if t.equalsIgnoreCase("LOWER") => s"lower($quoted)"
-              case t if t.contains("{col}")         => t.replace("{col}", quoted)
-              case other => throw new IllegalArgumentException(
-                s"HDR_017 column '${cc.name}' transform '$other' must be TRIM, UPPER, LOWER " +
-                  "or a Spark SQL expression containing {col}")
-            }
-            acc.withColumn(actual, expr(exprStr))
-          case None => acc
+      val transforms = c.columns.filter(_.transform.isDefined).flatMap { cc =>
+        df.columns.find(_.equalsIgnoreCase(cc.name)).map { actual =>
+          val quoted = s"`${actual.replace("`", "``")}`"
+          val exprStr = cc.transform.get.trim match {
+            case t if t.equalsIgnoreCase("TRIM")  => s"trim($quoted)"
+            case t if t.equalsIgnoreCase("UPPER") => s"upper($quoted)"
+            case t if t.equalsIgnoreCase("LOWER") => s"lower($quoted)"
+            case t if t.contains("{col}")         => t.replace("{col}", quoted)
+            case other => throw new IllegalArgumentException(
+              s"HDR_017 column '${cc.name}' transform '$other' must be TRIM, UPPER, LOWER " +
+                "or a Spark SQL expression containing {col}")
+          }
+          actual -> expr(exprStr)
         }
       }
+      if (transforms.isEmpty) df else df.withColumns(transforms.toMap)
     }
 
   def applyTransforms(df: DataFrame, conf: Config): DataFrame = {

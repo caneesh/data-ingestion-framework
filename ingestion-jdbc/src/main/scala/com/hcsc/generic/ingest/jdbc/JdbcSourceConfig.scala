@@ -122,7 +122,10 @@ final case class JdbcSourceConfig(
   filters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryFilter] = Seq.empty,
   parameters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameterDef] = Seq.empty,
   pipelineParameters: Map[String, String] = Map.empty,
-  executorProbePartitions: Option[Int] = None
+  executorProbePartitions: Option[Int] = None,
+  /** Query timeout for driver-side companion queries (watermark capture,
+    * bound discovery, health checks) — source.companion_timeout_seconds. */
+  companionTimeoutSeconds: Int = 300
 )
 
 object JdbcSourceConfig {
@@ -157,6 +160,11 @@ object JdbcSourceConfig {
       connectionProperties = dialect.defaultConnectionProperties ++ authProps ++
         userConnectionProperties(source),
       fetchSize = ConfigUtils.optInt(source, "fetchsize").getOrElse(1000),
+      companionTimeoutSeconds = {
+        val t = ConfigUtils.optInt(source, "companion_timeout_seconds").getOrElse(300)
+        require(t > 0, "source.companion_timeout_seconds must be positive")
+        t
+      },
       partitioning = partitioning,
       retry = retry,
       watermark = watermark,

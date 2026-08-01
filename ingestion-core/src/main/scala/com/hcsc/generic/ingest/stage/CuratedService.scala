@@ -636,6 +636,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       .toDF(keyCols.map(k => s"__ik_$k"): _*).persist()
     var winnersPersisted: Option[DataFrame] = None
     var persistedContested: Option[DataFrame] = None
+    var contestedFramePersisted: Option[DataFrame] = None
     try {
       val totalIncoming = ik.count()
       val dedupedCount = if (inputCount >= 0) math.max(inputCount - totalIncoming, 0L) else 0L
@@ -655,9 +656,20 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           ignoredCount = 0L, nullKeyCount = nullKeyCount, dedupedCount = dedupedCount)
       }
 
+      // Broadcast the small key frames when the batch's key count (already
+      // in hand) says they fit comfortably — spares the target-side shuffle.
+      // Above the threshold the hint is withheld and AQE decides.
+      val hintKeys: DataFrame => DataFrame =
+        if (totalIncoming <= CuratedService.BroadcastKeyHintMaxKeys)
+          org.apache.spark.sql.functions.broadcast
+        else identity
+
       val joinCond = keyCols.map(k => col(k) <=> col(s"__ik_$k")).reduce(_ && _)
-      val contested = target.join(ik, joinCond, "left_semi")
-      val unchanged = target.join(ik, joinCond, "left_anti")
+      // contested feeds THREE consumers (key count, hash frame, the merge
+      // union): persist it so the target semi-join runs once, not three times.
+      val contested = target.join(hintKeys(ik), joinCond, "left_semi").persist()
+      contestedFramePersisted = Some(contested)
+      val unchanged = target.join(hintKeys(ik), joinCond, "left_anti")
       val contestedKeys = contested.select(keyCols.map(col): _*).distinct()
         .toDF(keyCols.map(k => s"__ck_$k"): _*).persist()
       persistedContested = Some(contestedKeys)
@@ -698,10 +710,10 @@ final class CuratedService(spark: SparkSession, conf: Config) {
               softDeletePredicate(alignedIncoming, deletes) match {
                 case Some(isDel) =>
                   val del = coalesce(isDel, lit(false))
-                  alignedIncoming.filter(!del).join(tgtKeyHash, sameContent, "left_anti")
+                  alignedIncoming.filter(!del).join(hintKeys(tgtKeyHash), sameContent, "left_anti")
                     .unionByName(alignedIncoming.filter(del))
                 case None =>
-                  alignedIncoming.join(tgtKeyHash, sameContent, "left_anti")
+                  alignedIncoming.join(hintKeys(tgtKeyHash), sameContent, "left_anti")
               }
             case None => alignedIncoming
           }
@@ -732,7 +744,8 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           // tombstone for a brand-new key comes out of insertCount, one for
           // an existing key out of updateCount.
           val deletesWon = deleteMarkCount(winnersI, deletes)
-          val deletesNew = deleteMarkCount(winnersI.join(contestedKeys, ckCond, "left_anti"), deletes)
+          val deletesNew = deleteMarkCount(
+            winnersI.join(hintKeys(contestedKeys), ckCond, "left_anti"), deletes)
           (winners.drop(src), updates, ignored, deletesNew, deletesWon - deletesNew)
         case None =>
           if (freshness.isEmpty)
@@ -741,7 +754,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
               "a newer curated row. Configure merge.freshness.column to enable freshness comparison.")
           val deletesAll = deleteMarkCount(alignedIncoming, deletes)
           val deletesNew = deleteMarkCount(
-            alignedIncoming.join(contestedKeys, ckCond, "left_anti"), deletes)
+            alignedIncoming.join(hintKeys(contestedKeys), ckCond, "left_anti"), deletes)
           (alignedIncoming, contestedKeyCount, 0L, deletesNew, deletesAll - deletesNew)
       }
 
@@ -759,6 +772,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     } finally {
       winnersPersisted.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
       persistedContested.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
+      contestedFramePersisted.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
       ik.unpersist(false)
       alignedIncoming.unpersist(false)
     }
@@ -774,6 +788,12 @@ object CuratedService {
 
   /** Default publish shrink guard for incremental merges (percent). */
   val DefaultIncrementalMaxShrinkPercent = 20.0
+
+  /** Broadcast-hint the merge's key frames only below this many distinct
+    * incoming keys — a hint FORCES the broadcast regardless of size, so an
+    * unbounded batch must fall back to AQE's own planning. ~1M small key
+    * rows is comfortably inside default driver/executor memory. */
+  val BroadcastKeyHintMaxKeys = 1000000L
 
   /** Columns stamped by ensureAudit; not usable as a freshness column. */
   val FrameworkAuditColumns: Set[String] =

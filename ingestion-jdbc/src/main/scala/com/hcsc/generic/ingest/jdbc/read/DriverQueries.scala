@@ -41,7 +41,7 @@ object DriverQueries {
       try {
         val statement = connection.createStatement()
         try {
-          statement.setQueryTimeout(300)
+          statement.setQueryTimeout(cfg.companionTimeoutSeconds)
           val rs = statement.executeQuery(sql)
           try {
             if (!rs.next()) None

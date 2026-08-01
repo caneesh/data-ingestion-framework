@@ -171,20 +171,31 @@ object JdbcSource extends Source with WatermarkAdvancing {
     // task retry; whole-run failures are handled by pipeline restart (the
     // watermark never advanced, so replay re-extracts the same window).
     val df = RetryPolicy.withRetries(s"JDBC schema fetch (${cfg.dialect.name})", cfg.retry, logger) {
-      buildReader(spark, cfg, dbtable, resolvedParameters)
+      buildReader(spark, cfg, dbtable, resolvedParameters, watermarkPredicate)
     }
 
     JdbcMetrics.increment("jdbc_partitions_total", df.rdd.getNumPartitions)
-    if (cfg.partitioning.skewMetrics) logSkew(df)
+    // The skew pass is a full extraction: persist FIRST so it fills the
+    // cache instead of hitting the source, and the pipeline's downstream
+    // persist reads from this cache — one JDBC read per run instead of two.
+    // The frame stays cached for the (one-run) session; skew_metrics is an
+    // opt-in diagnostic and pays this memory cost explicitly.
+    val diagnosed =
+      if (cfg.partitioning.skewMetrics) {
+        val p = df.persist(org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK)
+        logSkew(p)
+        p
+      } else df
 
-    applyContract(df, sourceConf)
+    applyContract(diagnosed, sourceConf)
   }
 
   private def buildReader(
     spark: SparkSession,
     cfg: JdbcSourceConfig,
     dbtable: String,
-    resolvedParameters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameter]
+    resolvedParameters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameter],
+    watermarkPredicate: Option[String]
   ): DataFrame = {
     cfg.partitioning.strategy match {
       case PartitionStrategy.Predicates =>
@@ -211,7 +222,7 @@ object JdbcSource extends Source with WatermarkAdvancing {
 
         val bounds: Option[(Long, Long)] = strategy match {
           case PartitionStrategy.MinMaxQuery =>
-            discoverBounds(cfg, resolvedParameters) // stale static bounds problem: discover per run
+            discoverBounds(cfg, resolvedParameters, watermarkPredicate) // stale static bounds problem: discover per run
           case _ =>
             for (lo <- cfg.partitioning.lowerBound; hi <- cfg.partitioning.upperBound) yield (lo, hi)
         }
@@ -233,16 +244,19 @@ object JdbcSource extends Source with WatermarkAdvancing {
     * strides track the actual key range instead of stale static config. */
   private def discoverBounds(
     cfg: JdbcSourceConfig,
-    resolvedParameters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameter]
+    resolvedParameters: Seq[com.hcsc.generic.ingest.jdbc.query.QueryParameter],
+    watermarkPredicate: Option[String]
   ): Option[(Long, Long)] = {
     val column = cfg.partitioning.partitionColumn.get
     val baseFrom = QueryBuilder.validatedBase(cfg, resolvedParameters) match {
       case Some(base) => base
       case None => return None
     }
-    // Same filter scope as the extraction query, so discovered strides track
-    // the rows that will actually be read (not the whole table).
-    val whereClause = QueryBuilder.filterWhereClause(cfg)
+    // Same filter scope as the extraction query INCLUDING the incremental
+    // window, so discovered strides track the rows this run will actually
+    // read — bounds over the whole history would put the entire delta in
+    // one stride and leave the rest empty.
+    val whereClause = QueryBuilder.windowedWhereClause(cfg, watermarkPredicate)
     val quoted = cfg.dialect.quoteQualified(column)
     val sql = s"SELECT MIN($quoted), MAX($quoted) FROM $baseFrom$whereClause"
 
@@ -250,7 +264,16 @@ object JdbcSource extends Source with WatermarkAdvancing {
     // its own retry loop would multiply attempts to maxAttempts squared.
     DriverQueries.firstRow(cfg, sql, logger, withRetry = false) match {
       case Some(Seq(Some(lo), Some(hi))) =>
-        val (l, h) = (BigDecimal(lo).toLong, BigDecimal(hi).toLong)
+        val (l, h) =
+          try { (BigDecimal(lo).toLong, BigDecimal(hi).toLong) }
+          catch {
+            case _: NumberFormatException =>
+              throw new IllegalArgumentException(
+                s"JDBC_003 MIN_MAX_QUERY partition column '$column' returned non-numeric " +
+                  s"bounds ('$lo', '$hi') — range striding requires a numeric column. " +
+                  "Use a numeric surrogate key, or STATIC_RANGE/PREDICATES partitioning " +
+                  "for timestamp/string keys.")
+          }
         if (l < h) {
           logger.info(s"[JdbcSource] MIN_MAX_QUERY discovered bounds [$l, $h] for $column")
           Some((l, h))

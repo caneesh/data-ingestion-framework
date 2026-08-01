@@ -181,6 +181,11 @@ object MySqlDialect extends JdbcDialect {
   val name = "mysql"
   val defaultDriver = "com.mysql.cj.jdbc.Driver"
   val urlPrefix = "jdbc:mysql://"
+  /** Connector/J ignores fetchsize unless server-side cursors are enabled —
+    * without this the whole result set buffers in the executor (OOM risk on
+    * large tables). Feed-level connection_properties still override. */
+  override val defaultConnectionProperties: Map[String, String] =
+    Map("useCursorFetch" -> "true")
   override def quoteIdentifier(identifier: String): String =
     "`" + identifier.replace("`", "``") + "`"
   override def selectTopOne(projection: String, from: String, orderBy: String): String =

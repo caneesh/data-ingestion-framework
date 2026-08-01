@@ -15,10 +15,26 @@ import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
   */
 object HiveTables {
 
+  /** Tables already ensured by THIS JVM: every audit/reject/watermark append
+    * routes through ensure(), and the two IF-NOT-EXISTS statements are pure
+    * metastore overhead after the first call. Existence never regresses
+    * mid-run (nothing drops control tables), so a per-JVM cache is safe;
+    * a concurrent external drop would surface at the append exactly as it
+    * did before this cache. */
+  private val ensured = java.util.concurrent.ConcurrentHashMap.newKeySet[String]()
+
+  /** Test hook: forget the ensure cache (e.g. after a suite drops tables). */
+  private[hive] def resetEnsureCache(): Unit = ensured.clear()
+
   /** Ensures `database` and `fullTable` exist (ORC, `columnsDdl` schema). */
   def ensure(spark: SparkSession, database: String, fullTable: String, columnsDdl: String): Unit = {
+    // Scoped by application id: a later SparkContext in the same JVM (test
+    // forks, restarted sessions) has its own metastore and must re-ensure.
+    val key = s"${spark.sparkContext.applicationId}:$fullTable"
+    if (ensured.contains(key)) return
     spark.sql(s"CREATE DATABASE IF NOT EXISTS $database")
     spark.sql(s"CREATE TABLE IF NOT EXISTS $fullTable ($columnsDdl) USING ORC")
+    ensured.add(key)
   }
 
   /** Ensures `database` and `fullTable` exist (ORC, `columnsDdl` schema) and

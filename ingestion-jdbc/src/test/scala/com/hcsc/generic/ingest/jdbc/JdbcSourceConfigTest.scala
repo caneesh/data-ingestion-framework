@@ -26,6 +26,25 @@ class JdbcSourceConfigTest extends AnyFunSuite {
     assert(cfg.healthCheckEnabled)
   }
 
+  test("companion query timeout defaults to 300s and is configurable") {
+    assert(parse(sqlServerBase).companionTimeoutSeconds == 300)
+    assert(parse(sqlServerBase + "\ncompanion_timeout_seconds = 60").companionTimeoutSeconds == 60)
+    val ex = intercept[IllegalArgumentException] {
+      parse(sqlServerBase + "\ncompanion_timeout_seconds = 0")
+    }
+    assert(ex.getMessage.contains("companion_timeout_seconds"))
+  }
+
+  test("mysql dialect enables server-side cursors so fetchsize is honored") {
+    val cfg = parse("""url = "jdbc:mysql://host:3306/db", table = "t" """)
+    assert(cfg.connectionProperties("useCursorFetch") == "true")
+    // feed-level connection_properties still override the dialect default
+    val overridden = parse(
+      """url = "jdbc:mysql://host:3306/db", table = "t"
+        |connection_properties { useCursorFetch = "false" }""".stripMargin)
+    assert(overridden.connectionProperties("useCursorFetch") == "false")
+  }
+
   test("explicit dialect must match the url prefix") {
     val ex = intercept[IllegalArgumentException] {
       parse("""url = "jdbc:postgresql://host/db", dialect = "sqlserver", table = "t" """)

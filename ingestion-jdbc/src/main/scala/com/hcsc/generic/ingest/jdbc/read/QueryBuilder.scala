@@ -84,6 +84,12 @@ object QueryBuilder {
     */
   def filterWhereClause(cfg: JdbcSourceConfig): String = whereClause(cfg, None)
 
+  /** Filter scope INCLUDING the incremental window — for driver-side
+    * queries (bound discovery) that must see the same row set the
+    * extraction will read, not the whole history. */
+  def windowedWhereClause(cfg: JdbcSourceConfig, watermarkPredicate: Option[String]): String =
+    whereClause(cfg, watermarkPredicate)
+
   /**
     * Validated (and, for sql bases, parameter-rendered) base relation for
     * driver-side companion queries — upper watermark capture, NULL-watermark

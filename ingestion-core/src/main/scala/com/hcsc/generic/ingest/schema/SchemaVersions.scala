@@ -70,9 +70,19 @@ object SchemaVersions {
   ): Unit = {
     val fullTable = s"${validate(database, "database")}.${validate(table, "table")}"
     def escape(v: String) = v.replace("'", "''")
-    val props = (Seq(Property -> version) ++
-      contract.map(c => RequiredProperty -> requiredSnapshot(c)))
-      .map { case (k, v) => s"'$k'='${escape(v)}'" }.mkString(", ")
+    val desired: Seq[(String, String)] = Seq(Property -> version) ++
+      contract.map(c => RequiredProperty -> requiredSnapshot(c))
+    // Steady state is "already recorded": one metastore READ to confirm
+    // beats an unconditional ALTER (a metastore write + table lock) on
+    // every raw publish.
+    val unchanged =
+      try {
+        val existing = spark.sql(s"SHOW TBLPROPERTIES $fullTable").collect()
+          .map(r => r.getString(0) -> r.getString(1)).toMap
+        desired.forall { case (k, v) => existing.get(k).contains(v) }
+      } catch { case _: Exception => false }
+    if (unchanged) return
+    val props = desired.map { case (k, v) => s"'$k'='${escape(v)}'" }.mkString(", ")
     try {
       spark.sql(s"ALTER TABLE $fullTable SET TBLPROPERTIES ($props)")
     } catch {

@@ -253,7 +253,16 @@ final class RejectService(
   private val ComparableColumns = Seq("run_id", "entity", "file_id", "source_file",
     "row_idx", "raw_record", "error_code", "error_message", "reject_category")
 
-  private def persistGuarded(rejectRows: DataFrame, ctx: RunContext, guardCode: Option[String]): Long = {
+  private def persistGuarded(rejectRows0: DataFrame, ctx: RunContext, guardCode: Option[String]): Long = {
+    // The reject-rule predicates and payload hashing are re-evaluated by
+    // every action on this frame (count, replay comparison, write) — persist
+    // once so the expressions run once per row, then release.
+    val rejectRows = rejectRows0.persist(org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK)
+    try persistGuardedInternal(rejectRows, ctx, guardCode)
+    finally { try rejectRows.unpersist(false) catch { case _: Exception => () } }
+  }
+
+  private def persistGuardedInternal(rejectRows: DataFrame, ctx: RunContext, guardCode: Option[String]): Long = {
     val count = rejectRows.count()
     if (count > 0)
       com.hcsc.generic.ingest.hive.HiveTables.ensure(

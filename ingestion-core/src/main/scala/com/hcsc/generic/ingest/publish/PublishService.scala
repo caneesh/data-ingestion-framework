@@ -151,10 +151,12 @@ final class PublishService(spark: SparkSession, logger: Logger) {
   private def cleanupStaleStaging(database: String, table: String, currentStaging: String): Unit = {
     if (!spark.catalog.databaseExists(database)) return
     val prefix = stagingPrefix(table)
-    val candidates = spark.catalog.listTables(database).collect()
-      .map(_.name)
+    // Prefix-scoped listing: SHOW TABLES LIKE lets the metastore filter
+    // instead of shipping the database's whole table list every publish.
+    val candidates = spark.sql(s"SHOW TABLES IN $database LIKE '$prefix*'").collect()
+      .map(_.getAs[String]("tableName"))
       .filter(name =>
-        name.startsWith(prefix) &&
+        name.startsWith(prefix) && // belt-and-braces around LIKE glob semantics
           ConfigUtils.isSqlIdentifier(name) && // never interpolate an unvalidated name
           s"$database.$name" != currentStaging)
     candidates.foreach { name =>

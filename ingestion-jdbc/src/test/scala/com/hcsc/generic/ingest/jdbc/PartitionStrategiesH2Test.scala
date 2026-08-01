@@ -20,10 +20,10 @@ class PartitionStrategiesH2Test extends AnyFunSuite with SharedSparkSession with
       val stmt = conn.createStatement()
       try {
         stmt.execute("DROP TABLE IF EXISTS orders")
-        stmt.execute("CREATE TABLE orders (order_id INT, region VARCHAR(10), amount INT)")
+        stmt.execute("CREATE TABLE orders (order_id INT, region VARCHAR(10), amount INT, updated_ts TIMESTAMP)")
         (1 to 20).foreach { i =>
           val region = if (i % 2 == 0) "EAST" else "WEST"
-          stmt.execute(s"INSERT INTO orders VALUES ($i, '$region', ${i * 10})")
+          stmt.execute(s"INSERT INTO orders VALUES ($i, '$region', ${i * 10}, TIMESTAMP '2026-01-01 00:00:00')")
         }
       } finally stmt.close()
     } finally conn.close()
@@ -64,6 +64,22 @@ class PartitionStrategiesH2Test extends AnyFunSuite with SharedSparkSession with
       """.stripMargin))
     assert(df.rdd.getNumPartitions == 4)
     assert(df.count() == 20)
+  }
+
+  test("MIN_MAX_QUERY on a non-numeric column fails with guidance, not NumberFormatException") {
+    val e = intercept[IllegalArgumentException] {
+      JdbcSource.read(spark, conf(
+        """
+          |mode = "SELECT_QUERY"
+          |table = "orders"
+          |partition_strategy = "MIN_MAX_QUERY"
+          |partitionColumn = "updated_ts"
+          |numPartitions = 4
+        """.stripMargin))
+    }
+    assert(e.getMessage.contains("JDBC_003"))
+    assert(e.getMessage.contains("updated_ts"))
+    assert(e.getMessage.contains("non-numeric"))
   }
 
   test("MIN_MAX_QUERY honors the where clause and degrades gracefully") {

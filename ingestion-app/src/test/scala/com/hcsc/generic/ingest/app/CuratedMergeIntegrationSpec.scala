@@ -771,19 +771,21 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(payload.contains("\"src_seq\":8"), "non-sensitive payload columns stay readable")
   }
 
-  test("curated.partitioning is rejected explicitly (not silently ignored)") {
+  test("curated.partitioning creates a partitioned target on the FULL path") {
     val partitioned = ConfigFactory.parseString(
       """
         |database = m_curated
         |table = members_part
         |format = parquet
-        |partitioning { keys = ["state"] }
+        |partitioning { keys = ["name"] }
         |""".stripMargin)
-    val e = intercept[IllegalArgumentException] {
-      new CuratedService(spark, partitioned)
-        .process(batch(Seq(("P1", "v", "2026-01-01 10:00:00", 1))), "FULL", ctx("mrun-part-1"), None, None)
-    }
-    assert(e.getMessage.contains("partitioning is not supported"))
+    val r = new CuratedService(spark, partitioned)
+      .process(batch(Seq(("P1", "east", "2026-01-01 10:00:00", 1),
+        ("P2", "west", "2026-01-01 10:00:00", 1))), "FULL", ctx("mrun-part-1"), None, None).get
+    assert(r.publishedCount == 2)
+    val parts = spark.sql("SHOW PARTITIONS m_curated.members_part").collect().map(_.getString(0))
+    assert(parts.toSet == Set("name=east", "name=west"),
+      s"the curated target must carry the configured partition layout, got ${parts.mkString(",")}")
   }
 
   // ---------------------------------------------------------------------------

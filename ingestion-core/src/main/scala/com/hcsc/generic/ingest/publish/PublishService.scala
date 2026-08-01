@@ -14,7 +14,18 @@ final case class PublishRequest(
   allowEmpty: Boolean = false,
   validationQuery: Option[String] = None,
   enforceUniqueKeys: Seq[String] = Seq.empty,
-  maxShrinkPercent: Option[Double] = None
+  maxShrinkPercent: Option[Double] = None,
+  /** Physical partition layout of the target (empty = unpartitioned). */
+  partitionColumns: Seq[String] = Seq.empty,
+  /** true = dynamic partition overwrite: only the partitions PRESENT in the
+    * staged data are replaced; everything else is untouched. false = the
+    * whole table is replaced (legacy behavior). */
+  partitionOverwrite: Boolean = false,
+  /** Baseline for the shrink guard. For partition-scoped publishes this is
+    * the affected-slice count (comparing a slice against the whole table
+    * would nonsense-trip the guard); when absent the guard reads the full
+    * target count as before. */
+  shrinkBaseCount: Option[Long] = None
 )
 
 final case class PublishResult(publishedCount: Long, stagingTable: String)
@@ -69,15 +80,71 @@ final class PublishService(spark: SparkSession, logger: Logger) {
       validateShrink(fullTable, stagedCount, req)
 
       if (spark.catalog.tableExists(fullTable)) {
-        spark.sql(s"INSERT OVERWRITE TABLE $fullTable SELECT * FROM $stagingTable")
+        overwriteTarget(fullTable, stagingTable, req)
       } else {
-        val writer = spark.table(stagingTable).write.format(req.format).mode(SaveMode.Overwrite)
+        val base = spark.table(stagingTable).write.format(req.format).mode(SaveMode.Overwrite)
+        val writer =
+          if (req.partitionColumns.nonEmpty) base.partitionBy(req.partitionColumns: _*) else base
         req.path.fold(writer)(p => writer.option("path", p)).saveAsTable(fullTable)
       }
-      logger.info(s"[Publish] Published $stagedCount rows to $fullTable")
+      logger.info(s"[Publish] Published $stagedCount rows to $fullTable" +
+        (if (req.partitionOverwrite) " (dynamic partition overwrite: affected partitions only)" else ""))
       PublishResult(stagedCount, stagingTable)
     } finally {
       spark.sql(s"DROP TABLE IF EXISTS $stagingTable")
+    }
+  }
+
+  /** The overwrite step, with partition semantics made EXPLICIT — the
+    * distinction is load-bearing:
+    *
+    * - full replace of a partitioned DATASOURCE table requires STATIC
+    *   partitionOverwriteMode (dynamic would silently keep partitions the
+    *   staged data does not mention — stale rows surviving a "full" rebuild);
+    * - partition-scoped replace requires DYNAMIC mode (static would truncate
+    *   the whole table — the accidental-full-overwrite the config forbids);
+    * - full replace of a partitioned HIVE-format table cannot be expressed
+    *   as one INSERT OVERWRITE at all (Hive dynamic overwrite only replaces
+    *   written partitions), so it is rejected with guidance.
+    */
+  private def overwriteTarget(fullTable: String, stagingTable: String, req: PublishRequest): Unit = {
+    val partitioned = req.partitionColumns.nonEmpty
+    if (!partitioned) {
+      spark.sql(s"INSERT OVERWRITE TABLE $fullTable SELECT * FROM $stagingTable")
+      return
+    }
+    if (!req.partitionOverwrite && isHiveFormat(fullTable))
+      throw new PublishValidationException(
+        s"CUR_006 $fullTable is a partitioned Hive-format table: a full-table rewrite via " +
+          "INSERT OVERWRITE would only replace the partitions present in the staged data and " +
+          "silently keep stale ones. Recreate the target as a datasource table (USING ORC/PARQUET) " +
+          "or use curated.publish.mode = PARTITION_OVERWRITE.")
+    val mode = if (req.partitionOverwrite) "dynamic" else "static"
+    withSessionConf(
+      "spark.sql.sources.partitionOverwriteMode" -> mode,
+      "hive.exec.dynamic.partition" -> "true",
+      "hive.exec.dynamic.partition.mode" -> "nonstrict"
+    ) {
+      spark.sql(s"INSERT OVERWRITE TABLE $fullTable SELECT * FROM $stagingTable")
+    }
+  }
+
+  private def isHiveFormat(fullTable: String): Boolean =
+    spark.sql(s"DESCRIBE FORMATTED $fullTable").collect()
+      .exists(r => Option(r.getString(0)).exists(_.trim.equalsIgnoreCase("Provider")) &&
+        Option(r.getString(1)).exists(_.trim.equalsIgnoreCase("hive")))
+
+  /** Scoped session-conf override with restore. The pipeline is
+    * single-threaded per session by design (one entity per spark-submit,
+    * entity-lock enforced) — this is not safe for concurrent writers
+    * sharing one SparkSession. */
+  private def withSessionConf(pairs: (String, String)*)(body: => Unit): Unit = {
+    val previous = pairs.map { case (k, _) => k -> spark.conf.getOption(k) }
+    try {
+      pairs.foreach { case (k, v) => spark.conf.set(k, v) }
+      body
+    } finally previous.foreach { case (k, v) =>
+      v.fold(spark.conf.unset(k))(spark.conf.set(k, _))
     }
   }
 
@@ -132,7 +199,7 @@ final class PublishService(spark: SparkSession, logger: Logger) {
   private def validateShrink(fullTable: String, stagedCount: Long, req: PublishRequest): Unit =
     req.maxShrinkPercent.foreach { pct =>
       if (spark.catalog.tableExists(fullTable)) {
-        val current = spark.table(fullTable).count()
+        val current = req.shrinkBaseCount.getOrElse(spark.table(fullTable).count())
         if (current > 0) {
           val floor = current * (100.0 - pct) / 100.0
           if (stagedCount < floor)

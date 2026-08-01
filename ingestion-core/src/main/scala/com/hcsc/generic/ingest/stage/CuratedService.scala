@@ -80,13 +80,9 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     val path = ConfigUtils.optString(conf, "path")
     val format = ConfigUtils.optString(conf, "format").getOrElse("orc")
 
-    // Explicit "none": the staged INSERT OVERWRITE publish never enables
-    // dynamic partitioning, so a partitioned curated target would break the
-    // swap. Reject rather than silently ignoring the intent.
-    require(!conf.hasPath("partitioning"),
-      "curated.partitioning is not supported: the staged publish replaces the whole table " +
-        "and never enables dynamic partitioning. Remove the block (RAW partitioning lives " +
-        "under raw.partitioning); curated partitioning arrives with the Delta/Iceberg publish.")
+    // Physical layout of the curated target + the null-partition policy.
+    // Partition keys are layout only — independent of business keys.
+    val partitionSpec = CuratedPartitioning.parse(conf)
 
     // Contract-declared per-column transforms run FIRST (trim/case/date
     // rules from the mapping spec), then the curated-block config transforms.
@@ -105,7 +101,16 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     val prepared0 = transform.castConfigured(transformed, conf)
     val prepared1 = transform.applyTransforms(prepared0, conf)
     val prepared2 = transform.ensureAudit(prepared1)
-    val prepared = transform.normalizeKeys(prepared2, conf)
+    val prepared3 = transform.normalizeKeys(prepared2, conf)
+
+    // Partition-column validation + null policy run on the fully prepared
+    // frame (a partition column may be produced by a transform above).
+    if (partitionSpec.isPartitioned) {
+      val missing = partitionSpec.keys.filterNot(k => prepared3.columns.exists(_.equalsIgnoreCase(k)))
+      require(missing.isEmpty,
+        s"CUR_006 curated.partitioning.keys missing from incoming data: ${missing.mkString(", ")}")
+    }
+    val prepared = applyNullPartitionPolicy(prepared3, partitionSpec)
 
     val mergeConf = ConfigUtils.optConfig(conf, "merge")
     val keys = resolveMergeKeys(mergeConf, contract)
@@ -135,10 +140,38 @@ final class CuratedService(spark: SparkSession, conf: Config) {
         throw new SchemaContractViolationException(violations)
     }
 
-    val isIncremental =
-      runMode.equalsIgnoreCase("INCR") && spark.catalog.tableExists(fullTable)
+    val tableExists = spark.catalog.tableExists(fullTable)
+    val isIncremental = runMode.equalsIgnoreCase("INCR") && tableExists
 
     val publishConf = ConfigUtils.optConfig(conf, "publish")
+    // Publish mode: explicit config wins; absent keeps the legacy mapping
+    // (INCR against an existing table merges, everything else fully
+    // replaces). PARTITION_OVERWRITE against a missing table downgrades to
+    // the initial full build — there is nothing to scope yet.
+    val configuredMode = publishConf
+      .flatMap(p => ConfigUtils.optString(p, "mode")).map(CuratedPublishMode.parse)
+    val publishMode: CuratedPublishMode = configuredMode match {
+      case Some(CuratedPublishMode.PartitionOverwrite) =>
+        require(partitionSpec.isPartitioned,
+          "CUR_006 curated.publish.mode = PARTITION_OVERWRITE requires curated.partitioning.keys")
+        require(keys.nonEmpty,
+          "CUR_006 curated.publish.mode = PARTITION_OVERWRITE requires merge keys " +
+            "(curated.merge.keys or a contract business_key) — the affected partitions are " +
+            "combined and deduplicated by business key")
+        require(!deletes.contains(DeleteSpec.SnapshotAbsence),
+          "CUR_006 PARTITION_OVERWRITE cannot be combined with deletes.mode = " +
+            "FULL_SNAPSHOT_ABSENCE: absence semantics need the COMPLETE snapshot, a " +
+            "partition-scoped batch cannot prove a key absent")
+        if (tableExists) CuratedPublishMode.PartitionOverwrite
+        else {
+          logger.info(s"[CuratedService] $fullTable does not exist yet; initial build runs as " +
+            "a full publish (PARTITION_OVERWRITE applies from the next run)")
+          CuratedPublishMode.FullOverwrite
+        }
+      case Some(m) => m
+      case None =>
+        if (isIncremental) CuratedPublishMode.Merge else CuratedPublishMode.FullOverwrite
+    }
     val enforceUnique = publishConf
       .flatMap(p => ConfigUtils.optBoolean(p, "enforce_unique_keys"))
       .getOrElse(keys.nonEmpty)
@@ -153,7 +186,10 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       // Incremental merges preserve all untouched target rows, so a large
       // shrink can only mean a defect; FULL replaces are opt-in.
       maxShrinkPercent = publishConf.flatMap(p => ConfigUtils.optDouble(p, "max_shrink_percent"))
-        .orElse(if (isIncremental) Some(CuratedService.DefaultIncrementalMaxShrinkPercent) else None)
+        .orElse(if (publishMode != CuratedPublishMode.FullOverwrite)
+          Some(CuratedService.DefaultIncrementalMaxShrinkPercent) else None),
+      partitionColumns = partitionSpec.keys,
+      partitionOverwrite = publishMode == CuratedPublishMode.PartitionOverwrite
     )
 
     // Key hygiene applies in EVERY mode with configured keys — FULL loads
@@ -223,13 +259,22 @@ final class CuratedService(spark: SparkSession, conf: Config) {
         logger.warn("[CuratedService] deletes.mode = FULL_SNAPSHOT_ABSENCE applies to FULL " +
           "snapshot publishes only; this incremental run performs no absence deletion")
 
-      val result =
-        if (!isIncremental)
+      val result = publishMode match {
+        case CuratedPublishMode.FullOverwrite =>
           publishFull(hygienic, passthrough, nullKeyCount, passthroughCount, inputCount,
             keys, deletes, fullTable, request, ctx, contract)
-        else
+        case CuratedPublishMode.Merge if !tableExists =>
+          publishFull(hygienic, passthrough, nullKeyCount, passthroughCount, inputCount,
+            keys, deletes, fullTable, request, ctx, contract)
+        case CuratedPublishMode.Merge =>
           publishIncremental(hygienic, passthrough, nullKeyCount, passthroughCount, inputCount,
-            keys, freshness, deletes, fullTable, request, ctx, contract)
+            keys, freshness, deletes, fullTable, request, ctx, contract,
+            partitionSpec, partitionOverwrite = false)
+        case CuratedPublishMode.PartitionOverwrite =>
+          publishIncremental(hygienic, passthrough, nullKeyCount, passthroughCount, inputCount,
+            keys, freshness, deletes, fullTable, request, ctx, contract,
+            partitionSpec, partitionOverwrite = true)
+      }
 
       // unchanged/rewrite metrics (§11): ignoredStale counts stale + hash-
       // unchanged skips; rewritten is the real mutation volume of the run.
@@ -605,7 +650,9 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     fullTable: String,
     request: PublishRequest,
     ctx: RunContext,
-    contract: Option[SchemaContract]
+    contract: Option[SchemaContract],
+    partitionSpec: CuratedPartitionSpec = CuratedPartitioning.Unpartitioned,
+    partitionOverwrite: Boolean = false
   ): CuratedResult = {
     require(keys.nonEmpty, "INCR mode requires curated.merge.keys")
     val target = spark.table(fullTable)
@@ -637,6 +684,8 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     var winnersPersisted: Option[DataFrame] = None
     var persistedContested: Option[DataFrame] = None
     var contestedFramePersisted: Option[DataFrame] = None
+    var slicePersisted: Option[DataFrame] = None
+    var affectedPartitionsPersisted: Option[DataFrame] = None
     try {
       val totalIncoming = ik.count()
       val dedupedCount = if (inputCount >= 0) math.max(inputCount - totalIncoming, 0L) else 0L
@@ -665,11 +714,70 @@ final class CuratedService(spark: SparkSession, conf: Config) {
         else identity
 
       val joinCond = keyCols.map(k => col(k) <=> col(s"__ik_$k")).reduce(_ && _)
+
+      // ---- partition scoping (PARTITION_OVERWRITE) ------------------------
+      // The merge runs against the SLICE of the target the batch can touch:
+      // the incoming batch's partitions plus — when a business key can move
+      // between partitions (partition columns not a subset of the business
+      // keys) — the OLD partitions of contested keys, discovered via a
+      // column-pruned key lookup. Skipping that lookup when keys cannot
+      // move is the documented trade-off for the extra scan.
+      val partCols = partitionSpec.keys.map(k =>
+        target.columns.find(_.equalsIgnoreCase(k)).getOrElse(
+          throw new IllegalStateException(
+            s"CUR_006 curated.partitioning.keys entry '$k' is not a column of $fullTable — " +
+              "the configured layout must match the physical table")))
+      val (mergeTarget, sliceCountOpt, affectedPartsOpt) =
+        if (!partitionOverwrite) (target, None: Option[Long], None: Option[DataFrame])
+        else {
+          val incomingParts0 = alignedIncoming.select(partCols.map(col): _*)
+          val incomingParts = alignedPassthrough
+            .fold(incomingParts0)(p => incomingParts0.unionByName(p.select(partCols.map(col): _*)))
+            .distinct()
+          val keysCanMove =
+            !partCols.map(_.toLowerCase).toSet.subsetOf(keyCols.map(_.toLowerCase).toSet)
+          val affectedParts = (
+            if (!keysCanMove) incomingParts
+            else {
+              val oldParts = target.join(hintKeys(ik), joinCond, "left_semi")
+                .select(partCols.map(col): _*).distinct()
+              incomingParts.unionByName(oldParts).distinct()
+            }).persist()
+          affectedPartitionsPersisted = Some(affectedParts)
+
+          // Literal pruning predicate while the tuple count stays under the
+          // configured cap (collect is bounded); beyond it, a distributed
+          // broadcast semi-join filters the target instead.
+          val tuples = affectedParts.limit(partitionSpec.maxAffectedPartitions + 1).collect()
+          val slice =
+            if (tuples.length <= partitionSpec.maxAffectedPartitions) {
+              logger.info(s"[CuratedService] PARTITION_OVERWRITE: ${tuples.length} affected " +
+                s"partition(s) of $fullTable: " +
+                tuples.take(20).map(r => partCols.zipWithIndex
+                  .map { case (c, i) => s"$c=${r.get(i)}" }.mkString("[", ",", "]")).mkString(" ") +
+                (if (tuples.length > 20) " ..." else ""))
+              val predicate = tuples.map(r =>
+                partCols.zipWithIndex.map { case (c, i) => col(c) <=> lit(r.get(i)) }.reduce(_ && _)
+              ).reduce(_ || _)
+              target.filter(predicate)
+            } else {
+              logger.info(s"[CuratedService] PARTITION_OVERWRITE: affected partitions exceed " +
+                s"max_affected_partitions=${partitionSpec.maxAffectedPartitions}; filtering the " +
+                "target via a distributed semi-join instead of a literal predicate")
+              val ap = affectedParts.toDF(partCols.map(c => s"__ap_$c"): _*)
+              val apCond = partCols.map(c => col(c) <=> col(s"__ap_$c")).reduce(_ && _)
+              target.join(org.apache.spark.sql.functions.broadcast(ap), apCond, "left_semi")
+            }
+          val persistedSlice = slice.persist()
+          slicePersisted = Some(persistedSlice)
+          (persistedSlice, Some(persistedSlice.count()), Some(affectedParts))
+        }
+
       // contested feeds THREE consumers (key count, hash frame, the merge
       // union): persist it so the target semi-join runs once, not three times.
-      val contested = target.join(hintKeys(ik), joinCond, "left_semi").persist()
+      val contested = mergeTarget.join(hintKeys(ik), joinCond, "left_semi").persist()
       contestedFramePersisted = Some(contested)
-      val unchanged = target.join(hintKeys(ik), joinCond, "left_anti")
+      val unchanged = mergeTarget.join(hintKeys(ik), joinCond, "left_anti")
       val contestedKeys = contested.select(keyCols.map(col): _*).distinct()
         .toDF(keyCols.map(k => s"__ck_$k"): _*).persist()
       persistedContested = Some(contestedKeys)
@@ -760,7 +868,15 @@ final class CuratedService(spark: SparkSession, conf: Config) {
 
       val merged0 = unchanged.unionByName(replacement)
       val merged = alignedPassthrough.fold(merged0)(p => merged0.unionByName(p))
-      val published = publisher.publish(merged, request, ctx)
+      // Partition-scoped publish compares shrink against the SLICE it
+      // replaces, and only ever rewrites the partitions present in merged.
+      val published = publisher.publish(
+        merged, request.copy(shrinkBaseCount = sliceCountOpt), ctx)
+      // A moved key can leave an affected partition with ZERO surviving
+      // rows; dynamic overwrite only replaces partitions PRESENT in the
+      // written data, so an emptied partition must be dropped explicitly or
+      // its stale rows would survive.
+      affectedPartsOpt.foreach(ap => dropEmptiedPartitions(fullTable, partCols, ap, merged))
       // Disjoint accounting: every incoming key is EXACTLY one of insert,
       // update, delete or ignored — the four plus nullKey/deduped/passthrough
       // total the accepted rows.
@@ -773,8 +889,64 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       winnersPersisted.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
       persistedContested.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
       contestedFramePersisted.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
+      slicePersisted.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
+      affectedPartitionsPersisted.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
       ik.unpersist(false)
       alignedIncoming.unpersist(false)
+    }
+  }
+
+  /** Null-partition policy (curated.partitioning.null_values): REJECT fails
+    * fast, DEFAULT substitutes the configured value (cast to the column's
+    * type), HIVE passes nulls through to __HIVE_DEFAULT_PARTITION__. */
+  private def applyNullPartitionPolicy(df: DataFrame, spec: CuratedPartitionSpec): DataFrame = {
+    if (!spec.isPartitioned) return df
+    val actuals = spec.keys.map(k => df.columns.find(_.equalsIgnoreCase(k)).get)
+    spec.nullPolicy match {
+      case NullPartitionPolicy.Hive => df
+      case NullPartitionPolicy.Default(value) =>
+        df.withColumns(actuals.map(c =>
+          c -> coalesce(col(c), lit(value).cast(df.schema(c).dataType))).toMap)
+      case NullPartitionPolicy.Reject =>
+        val anyNull = actuals.map(col(_).isNull).reduce(_ || _)
+        if (df.filter(anyNull).limit(1).count() > 0)
+          throw new IllegalStateException(
+            s"CUR_006 incoming data carries NULL value(s) in partition column(s) " +
+              s"[${actuals.mkString(", ")}] and curated.partitioning.null_values = REJECT " +
+              "(the default). Fix the source, derive the column, or configure " +
+              "null_values = DEFAULT (with default_value) or HIVE.")
+        df
+    }
+  }
+
+  /** Drops affected partitions that ended with zero surviving rows. Tuples
+    * containing NULL partition values cannot be addressed by ALTER TABLE
+    * DROP PARTITION and are logged instead (HIVE null policy only). */
+  private def dropEmptiedPartitions(
+    fullTable: String,
+    partCols: Seq[String],
+    affectedParts: DataFrame,
+    merged: DataFrame
+  ): Unit = {
+    val written = merged.select(partCols.map(col): _*).distinct()
+    val emptied = affectedParts.exceptAll(written).limit(1001).collect()
+    if (emptied.length > 1000)
+      logger.warn(s"[CuratedService] More than 1000 affected partition(s) of $fullTable were " +
+        "emptied in one run — dropping the first 1000; re-run retention or repeat the run to " +
+        "clear the remainder (this volume usually indicates a misconfigured batch)")
+    emptied.take(1000).foreach { row =>
+      val values = partCols.indices.map(i => Option(row.get(i)))
+      if (values.exists(_.isEmpty))
+        logger.warn(s"[CuratedService] Affected partition with NULL value(s) emptied but not " +
+          s"droppable via ALTER TABLE (${partCols.mkString(",")}); rows were overwritten away, " +
+          "the empty default partition may linger")
+      else {
+        val spec = partCols.zip(values.map(_.get)).map { case (c, v) =>
+          s"$c='${v.toString.replace("'", "''")}'"
+        }.mkString(", ")
+        logger.info(s"[CuratedService] Dropping emptied partition ($spec) of $fullTable")
+        spark.sql(s"ALTER TABLE $fullTable DROP IF EXISTS PARTITION ($spec)")
+      }
     }
   }
 }

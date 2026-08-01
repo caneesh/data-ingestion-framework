@@ -451,8 +451,75 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   // ---------------------------------------------------------------------------
+  // 8a: composite business keys — every key column participates in the match
+  // (kills the keys.take(1) mutation class: single-key fixtures cannot)
+  // ---------------------------------------------------------------------------
+
+  test("composite business keys match on ALL columns, not a prefix") {
+    val s = spark
+    import s.implicits._
+    val compConf = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_comp
+        |format = parquet
+        |merge {
+        |  keys = ["src_sys_nm", "member_id"]
+        |  freshness { column = "src_modified_ts", tie_breakers = ["src_seq"] }
+        |}
+        |""".stripMargin)
+    def comp(rows: Seq[(String, String, String, String, Int)]) =
+      rows.toDF("src_sys_nm", "member_id", "name", "src_modified_ts", "src_seq")
+        .withColumn("src_modified_ts", col("src_modified_ts").cast("timestamp"))
+    val svc = new CuratedService(spark, compConf)
+
+    // Same member_id under two systems: distinct composite keys, must NOT collapse
+    svc.process(comp(Seq(
+      ("SYS_A", "M1", "a_m1", "2026-01-01 10:00:00", 1),
+      ("SYS_B", "M1", "b_m1", "2026-01-01 10:00:00", 1)
+    )), "INCR", ctx("mrun-comp-1"), None, None)
+    assert(spark.table("m_curated.members_comp").count() == 2,
+      "two systems sharing a member_id are DIFFERENT composite keys")
+
+    // An update addressed to (SYS_A, M1) must touch only that tuple — a
+    // prefix-only or single-column match would also update SYS_B's row
+    val r = svc.process(comp(Seq(("SYS_A", "M1", "a_m1_v2", "2026-01-01 12:00:00", 2))),
+      "INCR", ctx("mrun-comp-2"), None, None).get
+    assert(r.updateCount == 1 && r.insertCount == 0)
+    val rows = spark.table("m_curated.members_comp").collect()
+      .map(x => (x.getAs[String]("src_sys_nm"), x.getAs[String]("name"))).toMap
+    assert(rows("SYS_A") == "a_m1_v2", "the addressed composite key must update")
+    assert(rows("SYS_B") == "b_m1", "the sibling composite key must be untouched")
+  }
+
+  // ---------------------------------------------------------------------------
   // 8b: reject replay semantics — a replayed run REPLACES its reject slice
   // ---------------------------------------------------------------------------
+
+  test("re-splitting the same run does not double-append raw-stage rejects") {
+    val s = spark
+    import s.implicits._
+    val guarded = new RejectService(spark,
+      Some(ConfigFactory.parseString(
+        """{ enabled = true, database = "m_audit", table = "ingest_rejects",
+          |  rules = [ { name = "blank_id", condition = "member_id IS NULL",
+          |              error_code = "R900", category = "MISSING_KEY" } ] }""".stripMargin)),
+      None, logger)
+    val df = Seq((null.asInstanceOf[String], "orphan", "f1", "file1.csv", 0L))
+      .toDF("member_id", "name", "file_id", "source_file", "row_idx")
+    val rctx = RunContext("mrun-resplit-1", "members_feed", "INCR", "I")
+
+    guarded.split(df, rctx)
+    val after1 = spark.table("m_audit.ingest_rejects")
+      .filter(col("run_id") === "mrun-resplit-1" && col("error_code") === "R900").count()
+    assert(after1 == 1)
+    // A crashed-and-retried run re-enters split() with the SAME run id: the
+    // idempotency guard must skip the append, never duplicate the rows
+    guarded.split(df, rctx)
+    val after2 = spark.table("m_audit.ingest_rejects")
+      .filter(col("run_id") === "mrun-resplit-1" && col("error_code") === "R900").count()
+    assert(after2 == 1, s"replaying the same run must not double-append rejects (got $after2)")
+  }
 
   test("a replay with a different reject set replaces the previous attempt's rows") {
     val s = spark

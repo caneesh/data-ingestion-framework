@@ -104,8 +104,10 @@ object KafkaSource extends Source with WatermarkAdvancing {
   }
 
   /** Shared batch/streaming decode: tombstone flag FIRST (before payload
-    * parsing), then spec-named metadata columns; retention configurable. */
-  private[kafka] def decode(rawDf: DataFrame, sourceConf: Config): DataFrame = {
+    * parsing), then spec-named metadata columns; retention configurable.
+    * Public: it is a pure transform over the kafka reader's frame shape —
+    * the streaming runner and the (broker-less) tests both use it. */
+  def decode(rawDf: DataFrame, sourceConf: Config): DataFrame = {
     val withMeta = rawDf
       .withColumn("kafka_tombstone", col("value").isNull)
       .withColumn("kafka_topic", col("topic"))

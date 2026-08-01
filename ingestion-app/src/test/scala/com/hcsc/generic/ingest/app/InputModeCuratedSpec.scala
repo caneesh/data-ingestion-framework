@@ -207,6 +207,43 @@ class InputModeCuratedSpec extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   // ---------------------------------------------------------------------------
+  // KafkaSource.decode — the actual source decode path (no broker required:
+  // decode is a pure DataFrame transform over the kafka reader's shape)
+  // ---------------------------------------------------------------------------
+
+  test("KafkaSource.decode stamps metadata, captures tombstones pre-parse, honors retention") {
+    val s = spark
+    import s.implicits._
+    val raw = Seq(
+      ("k1", """{"member_id":"M1","name":"alice"}""", "member-events", 0, 100L),
+      ("k2", null.asInstanceOf[String], "member-events", 1, 200L) // tombstone
+    ).toDF("key", "value", "topic", "partition", "offset")
+      .withColumn("timestamp", org.apache.spark.sql.functions.lit("2026-01-01 10:00:00").cast("timestamp"))
+
+    val conf = com.typesafe.config.ConfigFactory.parseString(
+      """value.format = "json"
+        |value.schema = "{\"type\":\"struct\",\"fields\":[{\"name\":\"member_id\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"
+        |""".stripMargin)
+    val decoded = com.hcsc.generic.ingest.kafka.KafkaSource.decode(raw, conf)
+
+    val cols = decoded.columns.toSet
+    assert(Set("kafka_topic", "kafka_partition", "kafka_offset", "kafka_timestamp",
+      "kafka_tombstone").subsetOf(cols), s"spec-named metadata columns required, got $cols")
+    val byKey = decoded.collect().map(r => r.getAs[String]("key") -> r).toMap
+    assert(!byKey("k1").getAs[Boolean]("kafka_tombstone"))
+    assert(byKey("k1").getAs[String]("member_id") == "M1" && byKey("k1").getAs[String]("name") == "alice")
+    assert(byKey("k2").getAs[Boolean]("kafka_tombstone"),
+      "a null VALUE must be flagged as tombstone BEFORE JSON parsing nulls everything")
+    assert(byKey("k2").getAs[Long]("kafka_offset") == 200L)
+
+    val dropped = com.hcsc.generic.ingest.kafka.KafkaSource.decode(raw,
+      com.typesafe.config.ConfigFactory.parseString("retain_kafka_metadata = false")
+        .withFallback(conf))
+    assert(!dropped.columns.exists(_.startsWith("kafka_")),
+      "retain_kafka_metadata=false must drop every kafka_* column")
+  }
+
+  // ---------------------------------------------------------------------------
   // Offset codec + ledger (no broker required)
   // ---------------------------------------------------------------------------
 

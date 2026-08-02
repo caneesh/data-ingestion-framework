@@ -152,6 +152,18 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(hash.forall(h => h != null && h.length == 64), "record_hash must be a SHA-256 hex string")
   }
 
+  test("a successful run whose curated stage is disabled does not advance the watermark") {
+    // Second detector for the advance-gate bypass mutation (previously hung
+    // on the --stage raw test alone): the run SUCCEEDS end to end, curated
+    // simply produced no publish — the window must stay open.
+    val disabledEntity = "claims_feed_curated_off"
+    val disabled = feedConf("enabled = false")
+    new IngestPipeline(spark, disabled,
+      Cli(entity = disabledEntity, mode = "FULL", runId = Some("jrun-coff-1")), logger).run()
+    assert(InMemoryWatermarkStore.latest(disabledEntity).isEmpty,
+      "curated produced no publish: the watermark must NOT advance on this successful run")
+  }
+
   test("configuration compatibility (CFG) failures stop the run before extraction") {
     // Incremental JDBC into a keyless state-deriving curated layer would
     // keep only the latest window (CFG_009).

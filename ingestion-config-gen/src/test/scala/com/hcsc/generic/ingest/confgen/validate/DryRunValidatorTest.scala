@@ -42,7 +42,11 @@ class DryRunValidatorTest extends AnyFunSuite {
     val report = DryRunValidator.validate(
       ConfigFactory.parseString("""entity = "x", source { type = "jdbc" }"""))
     assert(report.errors.exists(_.contains("raw.database")))
-    assert(report.errors.exists(_.contains("url")) || !report.ok)
+    // Each missing field must be reported INDEPENDENTLY — a disjunction with
+    // !report.ok was unfalsifiable once any other error existed.
+    assert(report.errors.exists(_.contains("url")),
+      s"missing source.url must be reported by name, got: ${report.errors.mkString("; ")}")
+    assert(!report.ok)
   }
 
   test("unresolvable secret references validate structurally but warn") {

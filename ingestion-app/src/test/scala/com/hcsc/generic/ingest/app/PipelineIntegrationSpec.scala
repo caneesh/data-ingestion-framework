@@ -382,6 +382,16 @@ class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     import org.apache.spark.sql.functions.col
     val rawSlice = spark.table("p_raw.member").filter(col("run_id") === runId)
     assert(rawSlice.count() == 1)
+    // The ledger must record the curated FAILURE explicitly — --resume and
+    // operators both trust this status (second detector for the
+    // FAILED->SUCCESS audit mutation, which previously hung on one test)
+    val curatedStatuses = spark.table("p_audit.ingest_run_audit")
+      .filter(col("run_id") === runId && col("stage") === "curated")
+      .select("status").collect().map(_.getString(0)).toSet
+    assert(curatedStatuses.contains("FAILED"),
+      s"the failed curated stage must be ledgered FAILED, got $curatedStatuses")
+    assert(!curatedStatuses.contains("SUCCESS"),
+      "a failed publish must never be ledgered SUCCESS")
 
     // Resume with fixed config: raw is skipped (no duplicate append), curated
     // replays from the RAW slice, file completes to processed.

@@ -81,6 +81,20 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     """{ enabled = true, database = "m_audit", table = "ingest_rejects" }""")
 
   private def service = new CuratedService(spark, curatedConf)
+
+  /** A CuratedService bound to its own per-test table so each test arranges
+    * its own curated state instead of chaining on a shared table. */
+  private def svcFor(table: String): CuratedService = new CuratedService(spark,
+    ConfigFactory.parseString(
+      s"""
+        |database = m_curated
+        |table = $table
+        |format = parquet
+        |merge {
+        |  keys = ["member_id"]
+        |  freshness { column = "src_modified_ts", tie_breakers = ["src_seq"] }
+        |}
+        |""".stripMargin))
   private def rejects = new RejectService(spark, Some(rejectsConf), None, logger)
   private def ctx(runId: String) = RunContext(runId, "members_feed", "INCR", "I")
 
@@ -130,15 +144,19 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   // ---------------------------------------------------------------------------
 
   test("late-arriving older record is ignored and does not restamp the target") {
+    val svc = svcFor("members_t2")
+    svc.process(batch(Seq(("M1", "alice_v2", "2026-01-01 11:00:00", 2))),
+      "INCR", ctx("mrun-2-seed"), None, None).get
+
     val stale = batch(Seq(("M1", "alice_stale", "2026-01-01 09:00:00", 9)))
 
-    val result = service.process(stale, "INCR", ctx("mrun-2"), None, Some(rejects)).get
+    val result = svc.process(stale, "INCR", ctx("mrun-2"), None, Some(rejects)).get
 
     assert(result.ignoredCount == 1)
     assert(result.insertCount == 0)
     assert(result.updateCount == 0)
 
-    val m1 = curatedRow("M1")
+    val m1 = curatedRowIn("members_t2", "M1")
     assert(m1.getAs[String]("name") == "alice_v2", "stale record must not overwrite newer curated row")
     assert(m1.getAs[String]("last_modified_op") == "I",
       "an ignored stale row must not restamp the target as updated")
@@ -149,15 +167,18 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   // ---------------------------------------------------------------------------
 
   test("newer record updates curated, stamps 'U' and inherits create_timestamp") {
-    val originalCreate = curatedRow("M1").getAs[Timestamp]("create_timestamp")
+    val svc = svcFor("members_t3")
+    svc.process(batch(Seq(("M1", "alice_v2", "2026-01-01 11:00:00", 2))),
+      "INCR", ctx("mrun-3-seed"), None, None).get
+    val originalCreate = curatedRowIn("members_t3", "M1").getAs[Timestamp]("create_timestamp")
 
     val fresh = batch(Seq(("M1", "alice_new", "2026-01-01 12:00:00", 5)))
-    val result = service.process(fresh, "INCR", ctx("mrun-3"), None, Some(rejects)).get
+    val result = svc.process(fresh, "INCR", ctx("mrun-3"), None, Some(rejects)).get
 
     assert(result.updateCount == 1)
     assert(result.ignoredCount == 0)
 
-    val m1 = curatedRow("M1")
+    val m1 = curatedRowIn("members_t3", "M1")
     assert(m1.getAs[String]("name") == "alice_new")
     assert(m1.getAs[String]("last_modified_op") == "U")
     assert(m1.getAs[Timestamp]("create_timestamp") == originalCreate,
@@ -169,12 +190,16 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   // ---------------------------------------------------------------------------
 
   test("equal freshness and tie-breakers deterministically keep the target row") {
+    val svc = svcFor("members_t4")
+    svc.process(batch(Seq(("M1", "alice_new", "2026-01-01 12:00:00", 5))),
+      "INCR", ctx("mrun-4-seed"), None, None).get
+
     val challenger = batch(Seq(("M1", "alice_challenger", "2026-01-01 12:00:00", 5)))
-    val result = service.process(challenger, "INCR", ctx("mrun-4"), None, Some(rejects)).get
+    val result = svc.process(challenger, "INCR", ctx("mrun-4"), None, Some(rejects)).get
 
     assert(result.ignoredCount == 1)
     assert(result.updateCount == 0)
-    assert(curatedRow("M1").getAs[String]("name") == "alice_new",
+    assert(curatedRowIn("members_t4", "M1").getAs[String]("name") == "alice_new",
       "an exact tie must keep the existing curated row")
   }
 
@@ -183,18 +208,24 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   // ---------------------------------------------------------------------------
 
   test("mixed batch inserts new keys while ignoring stale ones") {
+    val svc = svcFor("members_t5")
+    svc.process(batch(Seq(
+      ("M1", "alice_new", "2026-01-01 12:00:00", 5),
+      ("M2", "bob_v1", "2026-01-01 10:00:00", 1)
+    )), "INCR", ctx("mrun-5-seed"), None, None).get
+
     val mixed = batch(Seq(
       ("M3", "carol_v1", "2026-01-01 10:00:00", 1), // brand new key
       ("M2", "bob_stale", "2026-01-01 09:00:00", 1) // older than curated bob_v1@10:00
     ))
-    val result = service.process(mixed, "INCR", ctx("mrun-5"), None, Some(rejects)).get
+    val result = svc.process(mixed, "INCR", ctx("mrun-5"), None, Some(rejects)).get
 
     assert(result.insertCount == 1)
     assert(result.ignoredCount == 1)
     assert(result.updateCount == 0)
-    assert(spark.table("m_curated.members").count() == 3)
-    assert(curatedRow("M2").getAs[String]("name") == "bob_v1")
-    assert(curatedRow("M3").getAs[String]("name") == "carol_v1")
+    assert(spark.table("m_curated.members_t5").count() == 3) // M1 + M2 seeds, M3 inserted
+    assert(curatedRowIn("members_t5", "M2").getAs[String]("name") == "bob_v1")
+    assert(curatedRowIn("members_t5", "M3").getAs[String]("name") == "carol_v1")
   }
 
   // ---------------------------------------------------------------------------
@@ -202,13 +233,17 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   // ---------------------------------------------------------------------------
 
   test("curated counts account for every incoming row") {
+    val svc = svcFor("members_t6")
+    svc.process(batch(Seq(("M1", "alice_v2", "2026-01-01 11:00:00", 2))),
+      "INCR", ctx("mrun-6-seed"), None, None).get
+
     val df = batch(Seq(
       ("M4", "dave_v1", "2026-01-01 10:00:00", 1),
       ("M4", "dave_v2", "2026-01-01 11:00:00", 2), // dedup loser
-      ("M1", "alice_stale2", "2026-01-01 08:00:00", 1), // ignored (stale)
+      ("M1", "alice_stale2", "2026-01-01 08:00:00", 1), // ignored (stale vs seed @11:00)
       (null.asInstanceOf[String], "orphan2", "2026-01-01 10:00:00", 1) // quarantined
     ))
-    val result = service.process(df, "INCR", ctx("mrun-6"), None, Some(rejects)).get
+    val result = svc.process(df, "INCR", ctx("mrun-6"), None, Some(rejects)).get
 
     val accounted = result.insertCount + result.updateCount + result.ignoredCount +
       result.nullKeyCount + result.dedupedCount

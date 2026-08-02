@@ -17,17 +17,25 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
         |  plan_hios_id VARCHAR(20),
         |  amount INT,
         |  modified_ts TIMESTAMP
-        |)""".stripMargin,
-      "INSERT INTO members VALUES ('S001','H1',10,'2026-01-01 10:00:00')",
-      "INSERT INTO members VALUES ('S002','H2',20,'2026-02-01 10:00:00')",
-      "INSERT INTO members VALUES ('S003','H3',30,'2026-03-01 10:00:00')"
-    )
+        |)""".stripMargin)
+    seedMembers()
   }
 
   override def beforeEach(): Unit = {
     super.beforeEach()
+    seedMembers()
     InMemoryWatermarkStore.clear()
   }
+
+  /** Resets `members` to the canonical three seed rows so every test starts
+    * from the same state regardless of what earlier tests inserted. */
+  private def seedMembers(): Unit =
+    H2TestDatabase.execute(
+      "DELETE FROM members",
+      "INSERT INTO members VALUES ('S001','H1',10,'2026-01-01 10:00:00')",
+      "INSERT INTO members VALUES ('S002','H2',20,'2026-02-01 10:00:00')",
+      "INSERT INTO members VALUES ('S003','H3',30,'2026-03-01 10:00:00')"
+    )
 
   private def conf(extra: String): Config =
     ConfigFactory.parseString(H2TestDatabase.sourceHocon(extra))
@@ -157,19 +165,20 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
 
     // A row arrives AFTER the window was captured, before the commit
     H2TestDatabase.execute("INSERT INTO members VALUES ('S_LATE','HL',999,'2030-01-01 00:00:00')")
+    try {
+      // Commit uses the CAPTURED upper, not the extracted/current max — the
+      // late row stays beyond the committed watermark for the next run
+      JdbcSource.advanceWatermark(spark, incremental, "bounded_feed", "run-b1", df)
+      val committed = InMemoryWatermarkStore.latest("bounded_feed").get.values.head
+      assert(!committed.startsWith("2030"), s"committed=$committed must be the captured upper")
 
-    // Commit uses the CAPTURED upper, not the extracted/current max — the
-    // late row stays beyond the committed watermark for the next run
-    JdbcSource.advanceWatermark(spark, incremental, "bounded_feed", "run-b1", df)
-    val committed = InMemoryWatermarkStore.latest("bounded_feed").get.values.head
-    assert(!committed.startsWith("2030"), s"committed=$committed must be the captured upper")
-
-    val next = JdbcSource.read(spark, incremental)
-    assert(next.count() == 1)
-    assert(next.selectExpr("subscriber_id").collect().head.getString(0) == "S_LATE")
-    assert(extracted >= 4)
-
-    H2TestDatabase.execute("DELETE FROM members WHERE subscriber_id = 'S_LATE'")
+      val next = JdbcSource.read(spark, incremental)
+      assert(next.count() == 1)
+      assert(next.selectExpr("subscriber_id").collect().head.getString(0) == "S_LATE")
+      assert(extracted == 3, "the captured window covers exactly the pre-insert seed rows")
+    } finally {
+      H2TestDatabase.execute("DELETE FROM members WHERE subscriber_id = 'S_LATE'")
+    }
   }
 
   test("concurrent watermark advancement is detected (JDBC_005)") {
@@ -213,8 +222,10 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
         |  watermark_store { type = "memory" }
         |}
       """.stripMargin)
+    // This test arranges its own fourth row; beforeEach resets the table
+    H2TestDatabase.execute("INSERT INTO members VALUES ('S004','H4',40,'2026-04-01 10:00:00')")
     val df = JdbcSource.read(spark, incremental)
-    assert(df.count() == 3) // amounts 20, 30, 40 (S004 added by earlier test)
+    assert(df.count() == 3) // amounts 20, 30, 40 pass the initial_value=15 floor
     JdbcSource.advanceWatermark(spark, incremental, "numeric_feed", "run-1", df)
     assert(InMemoryWatermarkStore.latest("numeric_feed").get.values.head == "40")
   }
@@ -541,6 +552,9 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
         |}
       """.stripMargin)
 
+    // Arrange a distinctive row max (2026-04-01) well behind the clock upper;
+    // beforeEach resets the table afterwards
+    H2TestDatabase.execute("INSERT INTO members VALUES ('S004','H4',40,'2026-04-01 10:00:00')")
     val df = JdbcSource.read(spark, incremental)
     assert(JdbcSource.lastWindow("discard_feed", None).isDefined)
 
@@ -629,6 +643,9 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
   }
 
   test("spark partitioned reads return complete data") {
+    // Arrange a fourth row (amount 40) so the data spans partition ranges;
+    // beforeEach resets the table afterwards
+    H2TestDatabase.execute("INSERT INTO members VALUES ('S004','H4',40,'2026-04-01 10:00:00')")
     val df = JdbcSource.read(spark, conf(
       """
         |table = "members"

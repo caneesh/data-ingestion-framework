@@ -43,6 +43,12 @@ class FileSourceTest extends AnyFunSuite with SharedSparkSession with BeforeAndA
     val cols = df.columns.toSet
     assert(cols.contains("first_name"))
     assert(cols.contains("last_name"))
+    // Cell values under the NORMALIZED names — a column transposition or
+    // row-order bug must fail, not just a missing-column bug.
+    val byFirst = df.collect().map(r => r.getAs[String]("first_name") ->
+      ((r.getAs[String]("last_name"), r.getAs[String]("age")))).toMap
+    assert(byFirst("Alice") == (("Smith", "30")), s"got $byFirst")
+    assert(byFirst("Bob") == (("Jones", "25")))
     assert(cols.contains("age"))
     assert(df.count() == 2)
   }
@@ -93,6 +99,11 @@ class FileSourceTest extends AnyFunSuite with SharedSparkSession with BeforeAndA
     val cols = df.columns.toSet
     assert(cols.contains("subscriber_id"))
     assert(cols.contains("hios_id"))
+    // Positional assignment must land the FIRST field under subscriber_id
+    // and the SECOND under hios_id — swapped positions must fail.
+    val rows = df.collect().map(r =>
+      r.getAs[String]("subscriber_id") -> r.getAs[String]("hios_id")).toMap
+    assert(rows("S001") == "H123" && rows("S002") == "H456", s"got $rows")
     assert(df.count() == 2)
   }
 

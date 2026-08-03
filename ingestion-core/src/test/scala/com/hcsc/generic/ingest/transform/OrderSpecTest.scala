@@ -2,6 +2,31 @@ package com.hcsc.generic.ingest.transform
 
 import org.scalatest.funsuite.AnyFunSuite
 
+class OrderSpecLogicalTypeTest extends org.scalatest.funsuite.AnyFunSuite with SharedSparkSession {
+
+  test("'as <type>' parses and orders by the LOGICAL type, storage untouched") {
+    val spec = OrderSpec.parse("seq desc as bigint")
+    assert(spec.compareAs.contains("bigint") && !spec.ascending)
+    val s = spark
+    import s.implicits._
+    // Lexically "9" > "10"; numerically 10 > 9 — the cast must win
+    val df = Seq(("a", "9"), ("b", "10")).toDF("id", "seq")
+    val winner = df.orderBy(spec.toColumn("seq")).collect().head.getString(0)
+    assert(winner == "b", "desc as bigint must rank 10 above 9 despite string storage")
+    assert(df.schema("seq").dataType == org.apache.spark.sql.types.StringType,
+      "the physical column type is untouched")
+  }
+
+  test("invalid or misplaced 'as' fails at parse time (HDR_020)") {
+    val bad = intercept[IllegalArgumentException] { OrderSpec.parse("seq as not_a_type") }
+    assert(bad.getMessage.contains("HDR_020"))
+    val misplaced = intercept[IllegalArgumentException] { OrderSpec.parse("seq as bigint desc") }
+    assert(misplaced.getMessage.contains("HDR_020"))
+    // plain specs unchanged
+    assert(OrderSpec.parse("seq desc nulls_first").compareAs.isEmpty)
+  }
+}
+
 class OrderSpecTest extends AnyFunSuite with SharedSparkSession {
 
   test("bare names keep the historical default: descending, nulls last") {

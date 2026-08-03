@@ -107,7 +107,18 @@ final class CuratedTransform(spark: SparkSession) {
     * is arbitrary and feeds should configure dedup.order_by or
     * merge.freshness.column.
     */
-  def deduplicate(df: DataFrame, keys: Seq[String], orderBy: Seq[String]): DataFrame = {
+  def deduplicate(df: DataFrame, keys: Seq[String], orderBy: Seq[String]): DataFrame =
+    deduplicate(df, keys, orderBy, Map.empty)
+
+  /** overrides: lowercase configured column name -> logical comparison
+    * expression (pre-direction) — lets the freshness column order by its
+    * declared comparison type while physical storage stays untouched. */
+  def deduplicate(
+    df: DataFrame,
+    keys: Seq[String],
+    orderBy: Seq[String],
+    overrides: Map[String, org.apache.spark.sql.Column]
+  ): DataFrame = {
     if (keys.isEmpty) return df
     if (orderBy.isEmpty) {
       logger.warn("[CuratedTransform] Deduplicating with NO ordering columns; " +
@@ -126,7 +137,10 @@ final class CuratedTransform(spark: SparkSession) {
           "refusing nondeterministic deduplication"
       )
     val existingOrder = specs.flatMap(s =>
-      df.columns.find(_.equalsIgnoreCase(s.column)).map(s.toColumn))
+      df.columns.find(_.equalsIgnoreCase(s.column)).map { actual =>
+        overrides.get(s.column.toLowerCase)
+          .map(s.applyDirection).getOrElse(s.toColumn(actual))
+      })
     // Rows tied on every order_by column previously produced an arbitrary
     // winner (partition-layout dependent). row_idx — when present from RAW
     // metadata — is a defined final tie-break, so one computed frame always

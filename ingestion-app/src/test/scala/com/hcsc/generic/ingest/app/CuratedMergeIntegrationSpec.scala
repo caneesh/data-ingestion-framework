@@ -479,6 +479,67 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   // ---------------------------------------------------------------------------
+  // 6d2: logical comparison types — all-string storage, typed semantics
+  // ---------------------------------------------------------------------------
+
+  test("all-string storage with compare_format/as: comparisons are typed, storage stays string") {
+    val s = spark
+    import s.implicits._
+    val strConf = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_allstr
+        |format = parquet
+        |merge {
+        |  keys = ["member_id"]
+        |  freshness {
+        |    column = "modified"
+        |    compare_format = "M/d/yyyy"          # string stored, parsed for EVERY comparison
+        |    tie_breakers = ["seq desc as bigint"] # numeric-string tie-break
+        |  }
+        |}
+        |""".stripMargin)
+    val svc = new CuratedService(spark, strConf)
+    def strBatch(rows: Seq[(String, String, String, String)]) =
+      rows.toDF("member_id", "name", "modified", "seq")
+
+    // In-batch dedup must be typed too: lexically "9/1/2025" > "12/1/2025",
+    // chronologically December wins
+    val r1 = svc.process(strBatch(Seq(
+      ("S1", "september", "9/1/2025", "1"),
+      ("S1", "december", "12/1/2025", "1")
+    )), "INCR", ctx("mrun-ls-1"), None, None).get
+    assert(r1.dedupedCount == 1)
+    val row = curatedRowIn("members_allstr", "S1")
+    assert(row.getAs[String]("name") == "december",
+      "dedup must pick the CHRONOLOGICAL winner, not the lexical one")
+    assert(spark.table("m_curated.members_allstr").schema("modified").dataType ==
+      org.apache.spark.sql.types.StringType, "physical storage stays string")
+
+    // Cross-run: a lexically-larger but chronologically OLDER record must lose
+    val r2 = svc.process(strBatch(Seq(("S1", "stale_sept", "9/2/2025", "1"))),
+      "INCR", ctx("mrun-ls-2"), None, None).get
+    assert(r2.ignoredCount == 1 && r2.updateCount == 0,
+      "9/2/2025 is lexically > 12/1/2025 but chronologically older — must be ignored")
+    assert(curatedRowIn("members_allstr", "S1").getAs[String]("name") == "december")
+
+    // Numeric-string tie-breaker: same date, seq "10" vs stored "1" — 10 wins
+    val r3 = svc.process(strBatch(Seq(("S1", "newer_seq", "12/1/2025", "10"))),
+      "INCR", ctx("mrun-ls-3"), None, None).get
+    assert(r3.updateCount == 1,
+      "'10' must outrank '1' under 'as bigint' (lexically '1' vs '10' ties on prefix)")
+    assert(curatedRowIn("members_allstr", "S1").getAs[String]("name") == "newer_seq")
+
+    // Unparseable freshness value: fail closed, never a silent NULL loser
+    val e = intercept[IllegalArgumentException] {
+      svc.process(strBatch(Seq(("S2", "bad", "not-a-date", "1"))),
+        "INCR", ctx("mrun-ls-4"), None, None)
+    }
+    assert(e.getMessage.contains("CUR_008"))
+    assert(e.getMessage.contains("M/d/yyyy"))
+  }
+
+  // ---------------------------------------------------------------------------
   // 6e: fail-closed freshness (CUR_008) — no silent last-write-wins
   // ---------------------------------------------------------------------------
 

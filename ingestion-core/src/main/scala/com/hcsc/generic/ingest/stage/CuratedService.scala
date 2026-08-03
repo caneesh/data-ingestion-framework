@@ -35,7 +35,28 @@ final case class CuratedResult(
   * plus deterministic tie-breakers — each optionally carrying direction and
   * null ordering ("col asc nulls_first"), defaulting to descending nulls
   * last. Remaining exact ties keep the target. */
-final case class FreshnessSpec(column: String, tieBreakers: Seq[String])
+final case class FreshnessSpec(
+  column: String,
+  tieBreakers: Seq[String],
+  /** Logical comparison type (compare_as): the freshness value is CAST for
+    * every comparison — the window contest, the same-hash version-advance
+    * check, dedup — while physical storage keeps the user's chosen type
+    * (e.g. an all-string layout). */
+  compareAs: Option[String] = None,
+  /** Datetime parse pattern (compare_format, e.g. "M/d/yyyy"): parses the
+    * string via to_timestamp(col, fmt) instead of a bare cast. */
+  compareFormat: Option[String] = None
+) {
+  /** The comparison expression over the ACTUAL column name. */
+  def compareExpr(actualColumn: String): org.apache.spark.sql.Column = {
+    import org.apache.spark.sql.functions.{col, to_timestamp}
+    compareFormat match {
+      case Some(fmt) => to_timestamp(col(actualColumn), fmt)
+      case None => compareAs.fold(col(actualColumn))(t => col(actualColumn).cast(t))
+    }
+  }
+  def hasLogicalType: Boolean = compareAs.isDefined || compareFormat.isDefined
+}
 
 /** Explicit delete strategy (spec §8: delete handling cannot be inferred). */
 sealed trait DeleteSpec
@@ -311,7 +332,15 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           val persisted = valid.persist()
           persistedFrames += persisted
           val count = persisted.count()
-          (transform.deduplicate(persisted, keys, ordering), nullCount, pass, passCount, count)
+          // Logical comparison type for the freshness term: the dedup
+          // winner must be chosen by the SAME typed comparison as the merge
+          // contest, even when storage is all-string.
+          val dedupOverrides: Map[String, org.apache.spark.sql.Column] =
+            freshness.filter(_.hasLogicalType).flatMap(f =>
+              persisted.columns.find(_.equalsIgnoreCase(f.column))
+                .map(a => Map(f.column.toLowerCase -> f.compareExpr(a)))).getOrElse(Map.empty)
+          (transform.deduplicate(persisted, keys, ordering, dedupOverrides),
+            nullCount, pass, passCount, count)
         }
 
       if (keys.nonEmpty && deletes.isEmpty)
@@ -440,7 +469,15 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       require(!CuratedService.FrameworkAuditColumns.contains(column.toLowerCase),
         s"curated.merge.freshness.column '$column' collides with a framework audit column; " +
           "designate the source-provided freshness column instead")
-      FreshnessSpec(column, ConfigUtils.stringList(f, "tie_breakers"))
+      val compareAs = ConfigUtils.optString(f, "compare_as").map(_.toLowerCase)
+      compareAs.foreach { t =>
+        try org.apache.spark.sql.types.DataType.fromDDL(t)
+        catch { case e: Exception => throw new IllegalArgumentException(
+          s"CUR_008 CURATED_FRESHNESS_TYPE_INVALID: compare_as '$t' is not a valid Spark type", e) }
+      }
+      FreshnessSpec(column, ConfigUtils.stringList(f, "tie_breakers"),
+        compareAs = compareAs,
+        compareFormat = ConfigUtils.optString(f, "compare_format"))
     }
 
   /** Dedup ordering: freshness spec first (it also decides the cross-run
@@ -614,9 +651,25 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       case _: org.apache.spark.sql.types.StructType => false
       case _ => true
     }
-    require(orderable,
+    // With a declared LOGICAL type (compare_as / compare_format) the
+    // comparison runs over the cast, so the physical type only needs to be
+    // castable — the all-string layout is fully supported.
+    require(orderable || f.hasLogicalType,
       s"CUR_008 CURATED_FRESHNESS_TYPE_INVALID: freshness column '$fActual' has non-orderable " +
-        s"type ${fType.simpleString}; use a timestamp, numeric or string version column")
+        s"type ${fType.simpleString}; use a timestamp, numeric or string version column, or " +
+        "declare freshness.compare_as / compare_format for a logical comparison type")
+    // Comparison-cast honesty: a value the logical type cannot parse
+    // becomes NULL and would silently lose every contest — fail instead.
+    if (f.hasLogicalType) {
+      val incomingActual = incoming.columns.find(_.equalsIgnoreCase(f.column)).get
+      val broken = incoming.filter(
+        col(incomingActual).isNotNull && f.compareExpr(incomingActual).isNull).limit(1).count()
+      require(broken == 0,
+        s"CUR_008 CURATED_FRESHNESS_TYPE_INVALID: incoming '$incomingActual' values are not " +
+          s"parseable as ${f.compareFormat.map(fmt => s"format '$fmt'").getOrElse(f.compareAs.get)} — " +
+          "an unparseable version would silently lose every freshness contest; fix the data or " +
+          "the declared comparison type")
+    }
     Some(f)
   }
 
@@ -966,7 +1019,8 @@ final class CuratedService(spark: SparkSession, conf: Config) {
                 .toDF((keyCols.map(k => s"__vk_$k") ++ versionCols.map(v => s"__vv_$v")): _*)
               val vkCond = keyCols.map(k => col(k) <=> col(s"__vk_$k")).reduce(_ && _)
               val advanced = contested.join(hintKeys(iVer), vkCond, "inner")
-                .filter(col(s"__vv_$fActual") > col(fActual)) // strictly newer source version
+                // strictly newer source version, under the LOGICAL type
+                .filter(f.compareExpr(s"__vv_$fActual") > f.compareExpr(fActual))
                 .select(contested.columns.map(c =>
                   if (versionCols.exists(_.equalsIgnoreCase(c))) col(s"__vv_$c").as(c)
                   else col(c)): _*)
@@ -982,7 +1036,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           // last); tie-breakers may declare direction and null ordering
           // ("col asc nulls_first") and default to the same desc_nulls_last.
           val freshnessCol = union.columns.find(_.equalsIgnoreCase(f.column))
-            .map(c => col(c).desc_nulls_last).toSeq
+            .map(c => f.compareExpr(c).desc_nulls_last).toSeq
           val tieBreakCols = f.tieBreakers
             .map(com.hcsc.generic.ingest.transform.OrderSpec.parse)
             .flatMap(s => union.columns.find(_.equalsIgnoreCase(s.column)).map(s.toColumn))

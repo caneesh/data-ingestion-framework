@@ -325,3 +325,28 @@ See docs/DECOUPLING_DESIGN.md for the full design. Quick reference:
 - Failures raise PIPE_005 and leave failed batches pending; PIPE_006 =
   driver preconditions (ledger + enabled curated); PIPE_007 =
   --replay-source-system without a source_system RAW column.
+
+### Control-M scheduling: one process or two
+
+Declare the choice per feed — CFG_016 validates consistency and the entry
+point refuses mismatched invocations (so the scheduler cannot silently
+double-process a feed):
+
+- **COUPLED** (default): `ingestion.execution = COUPLED` (or absent).
+  One Control-M job → `scripts/run_ingest.sh <conf> <entity> [FULL|INCR]`.
+  Raw then curated in one process; watermark advances after curated.
+- **DECOUPLED**: `ingestion.execution = DECOUPLED` +
+  `watermark { advance_after = RAW }` (required for incremental sources).
+  Two independent Control-M jobs:
+  1. `scripts/run_raw.sh <conf> <entity> [FULL|INCR]` — extract, land RAW,
+     advance the watermark. Schedule as often as the source needs.
+  2. `scripts/run_curated_pending.sh <conf> <entity>` — drain pending
+     batches to curated. Schedule independently (no dependency required;
+     a dependency on job 1 is also fine).
+  A DECOUPLED feed REJECTS `--stage all` (CFG_016) — batches would be
+  double-processed by the scheduled curated job.
+
+Exit codes for Control-M: 0 = success, including a clean "nothing pending"
+no-op; non-zero = failure. Failed curated batches stay PENDING, so
+re-running the same job after a failure resumes exactly where it stopped —
+both jobs are safe to rerun unconditionally.

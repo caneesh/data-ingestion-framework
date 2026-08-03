@@ -137,6 +137,9 @@ object FeedCompatibilityValidator {
       errors += s"CFG_014 deletes.mode ${deleteMode.get} is a declared capability that is not " +
         "implemented; use IGNORE, SOFT or FULL_SNAPSHOT_ABSENCE"
 
+    // Execution declaration consistency (CFG_016)
+    errors ++= ExecutionMode.configProblems(feed)
+
     // Decoupled pending driver settings (CFG_015)
     val pendingConf = ConfigUtils.optConfig(feed, "curated")
       .flatMap(c => ConfigUtils.optConfig(c, "pending"))

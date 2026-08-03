@@ -37,6 +37,10 @@ object IngestMain {
       val sessionTz = ConfigUtils.optString(baseConf, "app.spark.session_time_zone").getOrElse("UTC")
       spark.sqlContext.setConf("spark.sql.session.timeZone", sessionTz)
 
+      // Scheduler safety: a DECOUPLED feed rejects the coupled invocation
+      // so Control-M cannot double-process batches its curated job drains.
+      com.hcsc.generic.ingest.config.ExecutionMode.validateInvocation(cli, feedConf)
+
       if (cli.validateOnly) {
         new IngestPipeline(spark, feedConf, cli, logger).validateOnly(cli.explainMapping)
       } else cli.stage.toLowerCase match {

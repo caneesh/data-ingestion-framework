@@ -109,6 +109,28 @@ feeds.claims {
 | CFG_014 | FULL_SNAPSHOT_ABSENCE with source-side filtering / without `confirm_complete_extract` / unimplemented delete capabilities |
 | CFG_015 | invalid `curated.pending.on_failure` or negative `max_batches` |
 | CFG_016 | `ingestion.execution = DECOUPLED` without `watermark.advance_after = RAW` (incremental sources) or without the run ledger; DECOUPLED feed invoked with `--stage all` |
+| CFG_017 | `freshness.compare_as` not a valid Spark type; `compare_as` and `compare_format` both declared; unparseable `tie_breakers` / `dedup.order_by` ordering syntax |
+
+## Logical comparison types
+
+Physical storage keeps whatever type the user chooses (e.g. an all-string
+layout); the configuration declares the type every COMPARISON uses:
+
+```hocon
+curated.merge.freshness {
+  column         = "last_modified"
+  compare_as     = "timestamp"      # bare cast, comparison only — OR:
+  # compare_format = "M/d/yyyy"     # datetime parse pattern (mutually exclusive)
+  tie_breakers   = ["seq desc as bigint"]   # 'as <type>' per entry
+}
+curated.dedup { order_by = ["batch_no asc as bigint"] }  # same syntax
+```
+
+The declared type governs the merge contest, the same-hash version-advance
+check and in-batch dedup uniformly. A value the logical type cannot parse
+fails the run (CUR_008) — it never silently becomes a NULL that loses
+every contest. `column_types` remains the separate option that CHANGES the
+stored type.
 
 ## Execution shape (Control-M)
 

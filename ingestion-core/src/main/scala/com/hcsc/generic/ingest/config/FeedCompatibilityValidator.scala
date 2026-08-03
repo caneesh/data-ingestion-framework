@@ -137,6 +137,35 @@ object FeedCompatibilityValidator {
       errors += s"CFG_014 deletes.mode ${deleteMode.get} is a declared capability that is not " +
         "implemented; use IGNORE, SOFT or FULL_SNAPSHOT_ABSENCE"
 
+    // Logical comparison types (CFG_017): fail configuration, not the merge
+    val freshnessConf = ConfigUtils.optConfig(feed, "curated")
+      .flatMap(c => ConfigUtils.optConfig(c, "merge"))
+      .flatMap(m => ConfigUtils.optConfig(m, "freshness"))
+    freshnessConf.foreach { fr =>
+      val compareAs = ConfigUtils.optString(fr, "compare_as")
+      val compareFormat = ConfigUtils.optString(fr, "compare_format")
+      if (compareAs.isDefined && compareFormat.isDefined)
+        errors += "CFG_017 curated.merge.freshness declares BOTH compare_as and compare_format; " +
+          "use compare_format for datetime patterns, compare_as for bare casts — not both"
+      compareAs.foreach { t =>
+        try org.apache.spark.sql.types.DataType.fromDDL(t)
+        catch { case _: Exception =>
+          errors += s"CFG_017 curated.merge.freshness.compare_as '$t' is not a valid Spark type" }
+      }
+      ConfigUtils.stringList(fr, "tie_breakers").foreach { tb =>
+        try com.hcsc.generic.ingest.transform.OrderSpec.parse(tb)
+        catch { case e: IllegalArgumentException =>
+          errors += s"CFG_017 curated.merge.freshness.tie_breakers entry '$tb': ${e.getMessage}" }
+      }
+    }
+    ConfigUtils.optConfig(feed, "curated").foreach { c =>
+      ConfigUtils.stringList(c, "dedup.order_by").foreach { ob =>
+        try com.hcsc.generic.ingest.transform.OrderSpec.parse(ob)
+        catch { case e: IllegalArgumentException =>
+          errors += s"CFG_017 curated.dedup.order_by entry '$ob': ${e.getMessage}" }
+      }
+    }
+
     // Execution declaration consistency (CFG_016)
     errors ++= ExecutionMode.configProblems(feed)
 

@@ -108,6 +108,29 @@ class FeedCompatibilityValidatorTest extends AnyFunSuite {
         |curated { merge { keys = [] } }""".stripMargin).isEmpty)
   }
 
+  test("logical comparison types validate at config time (CFG_017)") {
+    assert(errorsOf(
+      """curated { merge { freshness { column = "ts", compare_as = "not_a_type" } } }""")
+      .exists(e => e.contains("CFG_017") && e.contains("not_a_type")))
+    assert(errorsOf(
+      """curated { merge { freshness { column = "ts", compare_as = "timestamp",
+        |  compare_format = "M/d/yyyy" } } }""".stripMargin)
+      .exists(e => e.contains("CFG_017") && e.contains("not both")))
+    assert(errorsOf(
+      """curated { merge { freshness { column = "ts",
+        |  tie_breakers = ["seq as bigintt"] } } }""".stripMargin)
+      .exists(e => e.contains("CFG_017") && e.contains("bigintt")))
+    assert(errorsOf(
+      """curated { dedup { order_by = ["seq wrongtoken"] }
+        |  merge { freshness { column = "ts" } } }""".stripMargin)
+      .exists(e => e.contains("CFG_017") && e.contains("wrongtoken")))
+    // The valid shapes pass
+    assert(!errorsOf(
+      """curated { merge { freshness { column = "ts", compare_format = "M/d/yyyy",
+        |  tie_breakers = ["seq desc as bigint"] } } }""".stripMargin)
+      .exists(_.contains("CFG_017")))
+  }
+
   test("multiple incompatibilities are all reported") {
     val errors = errorsOf(
       """source { type = "file", extraction { strategy = "TIMESTAMP" } }

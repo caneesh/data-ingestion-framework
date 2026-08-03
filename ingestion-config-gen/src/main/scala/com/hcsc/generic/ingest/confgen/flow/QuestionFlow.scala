@@ -162,8 +162,31 @@ object CommonQuestions {
     Question("curated.merge.keys", G.Destination, "Merge keys (primary keys)",
       help = "Empty = append-only. With keys, INCR runs merge/upsert on them. @file, CSV or JSON accepted.",
       kind = K.ListKind, required = false, appliesWhen = _.isTrue("curated.enabled")),
-    Question("curated.dedup.order_by", G.Destination, "Dedup order-by columns",
-      help = "Latest record wins within a merge key, ordered by these columns (descending).",
+    // Keyed merges REQUIRE freshness (CUR_008 fails closed at run time
+    // otherwise): the wizard produces safe configs by construction; legacy
+    // last-write-wins remains a deliberate hand-edit, never generated.
+    Question("curated.merge.freshness.column", G.Destination, "Freshness column",
+      help = "SOURCE-provided version column that decides merge winners (highest wins). " +
+        "Required for keyed feeds: without it the incremental merge fails closed (CUR_008).",
+      validate = V.nonEmpty,
+      appliesWhen = a => a.isTrue("curated.enabled") && a.items("curated.merge.keys").nonEmpty),
+    Question("curated.merge.freshness.compare_as", G.Destination, "Freshness comparison type",
+      help = "LOGICAL type for comparisons only (timestamp, bigint, decimal(10,2), ...). " +
+        "Storage keeps its physical type — use for all-string layouts. Empty = compare as stored.",
+      required = false,
+      appliesWhen = a => a.isTrue("curated.enabled") && a.items("curated.merge.keys").nonEmpty),
+    Question("curated.merge.freshness.compare_format", G.Destination, "Freshness datetime format",
+      help = "Datetime parse pattern (e.g. M/d/yyyy) when the string value needs parsing " +
+        "rather than a bare cast. Empty = none. Unparseable values fail (CUR_008).",
+      required = false,
+      appliesWhen = a => a.isTrue("curated.enabled") && a.items("curated.merge.keys").nonEmpty),
+    Question("curated.merge.freshness.tie_breakers", G.Destination, "Freshness tie-breakers",
+      help = "Columns breaking equal-freshness ties. Each entry: 'col [asc|desc] " +
+        "[nulls_first|nulls_last] [as <type>]' — 'as bigint' compares numeric strings numerically.",
+      kind = K.ListKind, required = false,
+      appliesWhen = a => a.isTrue("curated.enabled") && a.items("curated.merge.keys").nonEmpty),
+    Question("curated.dedup.order_by", G.Destination, "Extra dedup order-by columns",
+      help = "ADDITIONAL ordering after freshness + tie-breakers (same syntax, incl. 'as <type>').",
       kind = K.ListKind, required = false,
       appliesWhen = a => a.isTrue("curated.enabled") && a.items("curated.merge.keys").nonEmpty)
   )

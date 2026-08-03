@@ -60,7 +60,11 @@ class WizardEndToEndTest extends AnyFunSuite {
     "hdfs:///tmp/cur/claims", // curated path
     "",                  // curated format
     "claim_id",          // merge keys
-    "modified_ts"        // dedup order by
+    "modified_ts",       // freshness column (required for keyed feeds, CUR_008)
+    "",                  // freshness compare_as (empty = compare as stored)
+    "",                  // freshness compare_format
+    "seq desc as bigint", // freshness tie-breakers (logical-type syntax)
+    ""                   // extra dedup order by
   )
 
   test("JDBC incremental session: generated feed passes JdbcSourceConfig.parse") {
@@ -83,6 +87,10 @@ class WizardEndToEndTest extends AnyFunSuite {
     assert(feed.getString("raw.table") == "claims_feed")
     assert(feed.getString("curated.table") == "claims_feed")
     assert(feed.getStringList("curated.merge.keys").get(0) == "claim_id")
+    // Keyed feeds are generated SAFE by construction: freshness present
+    // (CUR_008 would fail closed without it), logical-type tie-breaker kept
+    assert(feed.getString("curated.merge.freshness.column") == "modified_ts")
+    assert(feed.getStringList("curated.merge.freshness.tie_breakers").get(0) == "seq desc as bigint")
     assert(feed.getString("raw.partitioning.derive.ingest_dt.expr").contains("current_timestamp"))
     // Meta answers never leak into the configuration
     assert(!feed.root().keySet().contains("_perf"))

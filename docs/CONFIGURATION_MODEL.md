@@ -101,6 +101,34 @@ feeds.claims {
 | CFG_006 | `rejects.use_contract_nullability` without a `schema` block |
 | CFG_007 | `reconciliation.on_mismatch = FAIL` with audit disabled |
 | CFG_008 | JDBC `source.incremental` watermarks on a file source |
+| CFG_009 | incremental feed into a keyless state-deriving curated layer |
+| CFG_010 | ingestion pattern declaring an unsupported capability |
+| CFG_011 | ingestion pattern contradicting the feed configuration |
+| CFG_012 | BACKFILL / RAW_REPLAY combined with `watermark.advance_after = RAW` |
+| CFG_013 | invalid `raw.delivery_mode`, or DEDUPLICATED_APPEND without a source-version identity |
+| CFG_014 | FULL_SNAPSHOT_ABSENCE with source-side filtering / without `confirm_complete_extract` / unimplemented delete capabilities |
+| CFG_015 | invalid `curated.pending.on_failure` or negative `max_batches` |
+| CFG_016 | `ingestion.execution = DECOUPLED` without `watermark.advance_after = RAW` (incremental sources) or without the run ledger; DECOUPLED feed invoked with `--stage all` |
+
+## Execution shape (Control-M)
+
+```hocon
+ingestion {
+  execution = COUPLED          # default: one job runs raw then curated
+  # execution = DECOUPLED      # two jobs: --stage raw / --stage curated --pending
+}
+curated {
+  pending {                    # decoupled curated driver knobs
+    max_batches = 0            # 0 = unlimited per pass
+    on_failure  = "STOP"       # STOP | CONTINUE (PIPE_005 summarizes either way)
+  }
+}
+```
+
+DECOUPLED requires `watermark { advance_after = RAW }` for incremental
+sources and the run ledger (`audit.database`) — the ledger is the curated
+job's batch checkpoint. See docs/DECOUPLING_DESIGN.md and the runbook's
+Control-M section; wrapper scripts live in `scripts/`.
 
 CDC-events example and a file-feed example live in `application.conf`'s
 commented blocks; the interactive generator (`ingestion-config-gen`)

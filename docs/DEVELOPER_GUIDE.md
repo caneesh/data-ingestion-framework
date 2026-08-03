@@ -388,16 +388,29 @@ spark-submit \
 | `--entity` | Feed name under `feeds { }`. Required. |
 | `--mode` | `FULL` (overwrite) or `INCR` (watermark + keyed merge). Default `FULL`. |
 | `--conf-path` | Standalone HOCON file instead of the bundled `application.conf`. |
-| `--stage` | `all` (default), `raw`, or `curated` / `curated-only` / `c` to rebuild CURATED from existing RAW. |
+| `--stage` | `all` (default), `raw`, `retention`, or `curated` / `curated-only` / `c` to rebuild CURATED from existing RAW. |
 | `--run-id` | Stable run identifier (letters, digits, `_`, `-`); reaches staging tables and audit records. |
 | `--resume` | Resume a failed run; requires `--run-id` of the run to resume. |
 | `--resume-ingest-dt` | Resume scoped to a specific RAW ingest date. |
 | `--file-id` | Restrict processing to one registered file. |
 | `--raw-flag` | Override the RAW file-type flag (defaults: `F` for FULL, `I` for INCR). |
-| `--dry-run` | Read and validate everything, write nothing. |
+| `--dry-run` | Read and validate everything, write nothing. Not combinable with batch selectors (a dry-run replay would checkpoint unpublished batches). |
 | `--force-reprocess` | Override the duplicate-file registry decision. |
 | `--validate-only` | Static config/contract validation, no Spark reads. |
 | `--explain-mapping` | With `--validate-only`: print the header-to-column mapping. |
+
+Batch selectors (`--stage curated` only; mutually exclusive with each
+other and with `--run-id`/`--resume-ingest-dt`) drive the decoupled
+curated batch driver — each selected RAW batch replays under the governed
+per-run path and checkpoints via its own curated SUCCESS ledger row:
+
+| Flag | Selects |
+|------|---------|
+| `--pending` | RAW-successful batches not yet curated (the normal decoupled curated job). |
+| `--replay-failed` | Pending batches with at least one failed curated attempt. |
+| `--replay-last N` | Last N RAW-successful batches regardless of curated state (forced rebuild; content-idempotent under the freshness merge). |
+| `--replay-from D` / `--replay-to D` | RAW-success date range (`yyyy-MM-dd`, on ledger event time). |
+| `--replay-source-system X` | Filter by RAW `source_system` lineage; composable with `--pending` or a date range. |
 
 Set the session timezone explicitly with `app.spark.session_time_zone` if
 you cannot use the default — all framework-stamped timestamps are UTC
@@ -414,10 +427,23 @@ batch-level guards prevent double loads. Files that fail validation land in
 quarantine with a recorded reason, not in RAW.
 
 - **Retry a failed run:** re-run with the same `--run-id` and `--resume`.
-- **Rebuild CURATED only:** `--stage curated-only` replays from existing
-  RAW under the same entity lock.
+- **Rebuild CURATED only:** `--stage curated --run-id <id>` replays one
+  batch from existing RAW under the same entity lock; `--stage curated
+  --pending` drains every un-curated batch; `--replay-failed` retries the
+  failed ones.
 - **Reprocess a known duplicate:** `--force-reprocess` (or the
   `REPROCESS_WITH_APPROVAL` policy).
+- **One process or two (Control-M):** declare `ingestion.execution =
+  COUPLED` (default, one job: `scripts/run_ingest.sh`) or `DECOUPLED`
+  (two independent jobs: `scripts/run_raw.sh` with
+  `watermark { advance_after = RAW }`, plus
+  `scripts/run_curated_pending.sh`). CFG_016 validates the combination
+  and a DECOUPLED feed refuses `--stage all` so a scheduler cannot
+  double-process batches. See docs/DECOUPLING_DESIGN.md and the
+  runbook's Control-M section.
+- **Batch status:** query the `ingest_batch_control` view
+  (`ddl/ingest_batch_control_view.sql`) — one row per batch;
+  `curated_done` is the checkpoint truth, `retry_count` counts failures.
 
 Every failure carries a coded, greppable prefix:
 

@@ -83,3 +83,15 @@ checkpoints → advance_after=RAW (pre-existing) + EXISTS ledger checkpoint;
 --replay-failed / --resume; 7 replay → selector set; 8 audit →
 per-batch ledger counts + reconciliation identity (pre-existing);
 9 recovery → matrix above; 10 review → post-implementation review pass.
+
+## Execution declaration (Control-M)
+
+`ingestion { execution = COUPLED | DECOUPLED }` (default COUPLED) is the
+operator-facing switch. It adds no third behavior — it validates the
+combination (CFG_016: DECOUPLED needs `advance_after = RAW` for
+incremental sources and the run ledger) and makes a DECOUPLED feed refuse
+`--stage all`, so a scheduler cannot double-process batches its curated
+job drains. Wrapper scripts: `scripts/run_ingest.sh` (coupled),
+`scripts/run_raw.sh` + `scripts/run_curated_pending.sh` (decoupled pair);
+exit 0 = success including empty-pending no-ops, non-zero = failure with
+failed batches left pending — unconditional reruns are safe.

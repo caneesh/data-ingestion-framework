@@ -71,6 +71,13 @@ class AuditPendingQueriesTest extends AnyFunSuite with SharedSparkSession {
     assert(audit.hasStageSuccess("G", "apq_feed", Stages.Curated),
       "a failed replay attempt must not un-checkpoint a curated-done batch")
     assert(!audit.hasStageSuccess("D", "apq_feed", Stages.Raw))
+    // dry-run SUCCESS rows published nothing: they neither checkpoint a
+    // batch nor prove a raw slice exists
+    audit.recordStage(ctx("H"), Stages.Curated, StageStatus.Success, message = "dry-run")
+    assert(!audit.hasStageSuccess("H", "apq_feed", Stages.Curated),
+      "a dry-run curated SUCCESS must not checkpoint the batch")
+    assert(!audit.hasStageSuccess("E", "apq_feed", Stages.Raw),
+      "a dry-run raw SUCCESS must not satisfy the replay guard")
     // contrast: latest-wins view differs, deliberately
     assert(audit.stageStatus("G", "apq_feed", Stages.Curated).contains(StageStatus.Failed))
   }

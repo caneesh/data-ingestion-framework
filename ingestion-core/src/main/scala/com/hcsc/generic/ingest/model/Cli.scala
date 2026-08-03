@@ -140,6 +140,11 @@ object CliParser {
         "batch selectors (--pending, --replay-*) require --stage curated")
       require(cli.runId.isEmpty && cli.resumeIngestDt.isEmpty,
         "batch selectors cannot be combined with --run-id or --resume-ingest-dt")
+      // A dry-run replay records SUCCESS while publishing NOTHING — under a
+      // selector that would permanently checkpoint unpublished batches.
+      require(!cli.dryRun,
+        "batch selectors cannot be combined with --dry-run: a dry-run replay would " +
+          "checkpoint batches as curated-done without publishing them")
     }
     cli.replayLast.foreach(n => require(n > 0, "--replay-last must be a positive integer"))
     Seq(cli.replayFrom -> "--replay-from", cli.replayTo -> "--replay-to").foreach {

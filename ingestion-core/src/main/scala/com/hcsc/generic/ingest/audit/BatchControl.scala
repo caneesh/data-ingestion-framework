@@ -50,12 +50,19 @@ final class BatchControl(spark: SparkSession, feedConf: Config) {
         struct(col("event_ts").as("ts"), col("terminal").as("t"), field.as("v"))))
         .getField("v")
 
+    // run_mode/window from the FIRST raw SUCCESS row (struct-min on
+    // event_ts) — a later re-invocation under a different mode must not
+    // swap in its metadata.
+    def firstRawSuccess(field: org.apache.spark.sql.Column) =
+      min(when(col("stage") === "raw" && col("status") === "SUCCESS",
+        struct(col("event_ts").as("ts"), field.as("v")))).getField("v")
+
     ev.groupBy(col("run_id").as("batch_id"))
       .agg(
         first(col("entity")).as("entity"),
-        max(when(col("stage") === "raw", optCol("run_mode"))).as("run_mode"),
-        max(when(col("stage") === "raw", optCol("window_start"))).as("extract_window_start"),
-        max(when(col("stage") === "raw", optCol("window_end"))).as("extract_window_end"),
+        firstRawSuccess(optCol("run_mode")).as("run_mode"),
+        firstRawSuccess(optCol("window_start")).as("extract_window_start"),
+        firstRawSuccess(optCol("window_end")).as("extract_window_end"),
         latest("raw", col("status")).as("raw_status"),
         latest("curated", col("status")).as("curated_status"),
         max(when(col("stage") === "curated" && col("status") === "SUCCESS", 1).otherwise(0))

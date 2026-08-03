@@ -55,6 +55,13 @@ class CliPendingFlagsTest extends AnyFunSuite {
     }
   }
 
+  test("selectors reject --dry-run: a dry-run replay would checkpoint unpublished batches") {
+    val e = intercept[IllegalArgumentException] {
+      CliParser.parse(Array("--entity", "e", "--stage", "curated", "--pending", "--dry-run"))
+    }
+    assert(e.getMessage.contains("dry-run"))
+  }
+
   test("single-shot --run-id and --resume-ingest-dt remain valid without selectors") {
     val cli = CliParser.parse(Array("--entity", "e", "--stage", "curated", "--run-id", "r1"))
     assert(!cli.batchSelector && cli.runId.contains("r1"))

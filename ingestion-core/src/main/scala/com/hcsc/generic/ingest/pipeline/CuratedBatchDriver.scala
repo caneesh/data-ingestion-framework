@@ -70,7 +70,15 @@ final class CuratedBatchDriver(
     var succeeded = List.empty[String]
     var failed = List.empty[(String, Throwable)]
     batches.foreach { b =>
-      val mode = b.runMode.filter(_.nonEmpty).getOrElse(cli.mode)
+      // FAIL CLOSED on an unrecorded mode (pre-migration ledger): defaulting
+      // to the CLI's mode — which itself defaults to FULL — would replay one
+      // incremental batch as a FULL_OVERWRITE and silently replace the whole
+      // curated table with that single slice.
+      val mode = b.runMode.filter(_.nonEmpty).getOrElse(
+        throw new IllegalStateException(
+          s"PIPE_008 batch ${b.runId} has no recorded run_mode (pre-migration ledger row); " +
+            "the driver cannot infer FULL vs INCR safely. Replay it explicitly with " +
+            s"--stage curated --run-id ${b.runId} --mode <FULL|INCR>, then rerun the driver."))
       try {
         new IngestPipeline(spark, feedConf,
           cli.copy(runId = Some(b.runId), mode = mode, resume = false,
@@ -89,6 +97,13 @@ final class CuratedBatchDriver(
               s"${succeeded.size} succeeded, 1 failed, " +
               s"${batches.size - succeeded.size - 1} not attempted " +
               "(on_failure=STOP; the failed batch stays pending — rerun after fixing)", e)
+        case e: Throwable =>
+          // Fatal errors (OOM etc.) must still leave the operator the
+          // partial-progress summary before propagating unwrapped.
+          logger.error(s"[CuratedBatchDriver] FATAL error at batch ${b.runId}: " +
+            s"${succeeded.size} succeeded, ${batches.size - succeeded.size - 1} not attempted; " +
+            "completed batches are checkpointed, the rest stay pending")
+          throw e
       }
     }
     if (failed.nonEmpty)

@@ -325,7 +325,10 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
     spark.table(runTable)
       .filter(col("run_id") === runId && col("entity") === entity &&
         col("stage") === stage &&
-        col("status") === com.hcsc.generic.ingest.runtime.StageStatus.Success)
+        col("status") === com.hcsc.generic.ingest.runtime.StageStatus.Success &&
+        // A dry-run SUCCESS wrote NOTHING: it must neither checkpoint a
+        // batch as curated-done nor prove a raw slice exists.
+        col("message") =!= "dry-run")
       .limit(1).count() > 0
   }
 
@@ -351,10 +354,13 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
           col("status") === com.hcsc.generic.ingest.runtime.StageStatus.Success &&
           col("message") =!= "dry-run")
         .groupBy(col("run_id"))
-        .agg(min(col("event_ts")).as("raw_success_ts"),
-          max(optCol("run_mode")).as("run_mode"),
-          max(optCol("window_start")).as("window_start"),
-          max(optCol("window_end")).as("window_end"))
+        // run_mode/window come from the SAME row as the first commit
+        // (struct-min keyed on event_ts) — a later re-invocation under a
+        // different mode must not swap in its metadata.
+        .agg(min(struct(col("event_ts").as("ts"), optCol("run_mode").as("m"),
+          optCol("window_start").as("ws"), optCol("window_end").as("we"))).as("s"))
+        .select(col("run_id"), col("s.ts").as("raw_success_ts"), col("s.m").as("run_mode"),
+          col("s.ws").as("window_start"), col("s.we").as("window_end"))
         .orderBy(col("raw_success_ts").asc)
         .collect()
         .map(r => PendingBatch(
@@ -370,7 +376,9 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
   private def runIdsWith(entity: String, stage: String, status: String): Set[String] = {
     import org.apache.spark.sql.functions.col
     batchFrame(entity).fold(Set.empty[String]) { runs =>
-      runs.filter(col("stage") === stage && col("status") === status)
+      // dry-run rows checkpoint nothing (see hasStageSuccess)
+      runs.filter(col("stage") === stage && col("status") === status &&
+          col("message") =!= "dry-run")
         .select("run_id").distinct().collect().map(_.getString(0)).toSet
     }
   }

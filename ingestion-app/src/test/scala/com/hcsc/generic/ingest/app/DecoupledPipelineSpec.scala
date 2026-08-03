@@ -186,6 +186,18 @@ class DecoupledPipelineSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(audit.pendingBatches(entity).isEmpty)
   }
 
+  test("a batch with no recorded run_mode fails closed (PIPE_008), never defaults to FULL") {
+    // Pre-migration ledger row: raw SUCCESS with empty run_mode. Defaulting
+    // to the CLI mode (FULL) would FULL_OVERWRITE the table with one slice.
+    audit.recordStage(RunContext("run-nomode", entity, "", "I"), Stages.Raw, StageStatus.Success)
+    val e = intercept[IllegalStateException] { driver("--pending").run() }
+    assert(e.getMessage.contains("PIPE_008"))
+    assert(e.getMessage.contains("run-nomode"))
+    // clean up so later selectors aren't poisoned
+    audit.recordStage(RunContext("run-nomode", entity, "INCR", "I"),
+      Stages.Curated, StageStatus.Success)
+  }
+
   test("preconditions: driver refuses to run without a ledger or with curated disabled") {
     val noLedger = ConfigFactory.parseString("""audit { enabled = false }""").withFallback(feedConf)
     val cli = CliParser.parse(Array("--entity", entity, "--stage", "curated", "--pending"))

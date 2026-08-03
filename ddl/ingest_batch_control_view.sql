@@ -19,9 +19,12 @@ WITH ev AS (
 SELECT
   run_id AS batch_id,
   entity,
-  MAX(CASE WHEN stage = 'raw' THEN run_mode END)      AS run_mode,
-  MAX(CASE WHEN stage = 'raw' THEN window_start END)  AS extract_window_start,
-  MAX(CASE WHEN stage = 'raw' THEN window_end END)    AS extract_window_end,
+  MIN(CASE WHEN stage = 'raw' AND status = 'SUCCESS'
+        THEN named_struct('ts', event_ts, 'v', run_mode) END).v      AS run_mode,
+  MIN(CASE WHEN stage = 'raw' AND status = 'SUCCESS'
+        THEN named_struct('ts', event_ts, 'v', window_start) END).v  AS extract_window_start,
+  MIN(CASE WHEN stage = 'raw' AND status = 'SUCCESS'
+        THEN named_struct('ts', event_ts, 'v', window_end) END).v    AS extract_window_end,
   MAX(CASE WHEN stage = 'raw'
         THEN named_struct('ts', event_ts, 't', terminal, 'v', status) END).v     AS raw_status,
   MAX(CASE WHEN stage = 'curated'

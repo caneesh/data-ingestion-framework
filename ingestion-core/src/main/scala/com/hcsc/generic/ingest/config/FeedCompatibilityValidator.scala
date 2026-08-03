@@ -137,6 +137,19 @@ object FeedCompatibilityValidator {
       errors += s"CFG_014 deletes.mode ${deleteMode.get} is a declared capability that is not " +
         "implemented; use IGNORE, SOFT or FULL_SNAPSHOT_ABSENCE"
 
+    // Decoupled pending driver settings (CFG_015)
+    val pendingConf = ConfigUtils.optConfig(feed, "curated")
+      .flatMap(c => ConfigUtils.optConfig(c, "pending"))
+    pendingConf.foreach { p =>
+      ConfigUtils.optString(p, "on_failure").map(_.toUpperCase).foreach { v =>
+        if (!Seq("STOP", "CONTINUE").contains(v))
+          errors += s"CFG_015 curated.pending.on_failure '$v' must be STOP or CONTINUE"
+      }
+      ConfigUtils.optInt(p, "max_batches").foreach { n =>
+        if (n < 0) errors += "CFG_015 curated.pending.max_batches must be >= 0 (0 = unlimited)"
+      }
+    }
+
     errors.result()
   }
 }

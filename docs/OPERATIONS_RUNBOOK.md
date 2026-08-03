@@ -310,3 +310,18 @@ append-only history. Do **not** truncate them as routine cleanup — they are th
 forensic record for restart safety and reconciliation. Apply a retention policy
 only with explicit approval and after confirming no in-flight run depends on
 recent rows (watermarks and file registry especially).
+
+## Decoupled Raw / Curated operation
+
+See docs/DECOUPLING_DESIGN.md for the full design. Quick reference:
+
+- Raw job: `--stage raw` + feed `watermark { advance_after = RAW }`
+  (required in decoupled operation — without it the window re-reads forever).
+- Curated job: `--stage curated --pending` (or `--replay-failed`,
+  `--replay-last N`, `--replay-from/--replay-to`, `--replay-source-system X`).
+- Batch status: query the `ingest_batch_control` view
+  (ddl/ingest_batch_control_view.sql) — `curated_done` is the checkpoint
+  truth; `retry_count` counts FAILED events.
+- Failures raise PIPE_005 and leave failed batches pending; PIPE_006 =
+  driver preconditions (ledger + enabled curated); PIPE_007 =
+  --replay-source-system without a source_system RAW column.

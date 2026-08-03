@@ -13,8 +13,19 @@ case class Cli(
   dryRun: Boolean = false,
   forceReprocess: Boolean = false,
   validateOnly: Boolean = false,
-  explainMapping: Boolean = false
-)
+  explainMapping: Boolean = false,
+  // Decoupled curated batch selectors (--stage curated only)
+  pending: Boolean = false,
+  replayLast: Option[Int] = None,
+  replayFrom: Option[String] = None,
+  replayTo: Option[String] = None,
+  replayFailed: Boolean = false,
+  replaySourceSystem: Option[String] = None
+) {
+  /** True when any decoupled batch selector is present. */
+  def batchSelector: Boolean =
+    pending || replayLast.isDefined || replayFrom.isDefined || replayTo.isDefined || replayFailed
+}
 
 object CliParser {
   def parse(args: Array[String]): Cli = {
@@ -67,6 +78,24 @@ object CliParser {
         case "--explain-mapping" =>
           cli = cli.copy(explainMapping = true)
           index += 1
+        case "--pending" =>
+          cli = cli.copy(pending = true)
+          index += 1
+        case "--replay-last" =>
+          cli = cli.copy(replayLast = Some(value("--replay-last").toInt))
+          index += 2
+        case "--replay-from" =>
+          cli = cli.copy(replayFrom = Some(value("--replay-from")))
+          index += 2
+        case "--replay-to" =>
+          cli = cli.copy(replayTo = Some(value("--replay-to")))
+          index += 2
+        case "--replay-failed" =>
+          cli = cli.copy(replayFailed = true)
+          index += 1
+        case "--replay-source-system" =>
+          cli = cli.copy(replaySourceSystem = Some(value("--replay-source-system")))
+          index += 2
         case unknown =>
           throw new IllegalArgumentException(s"Unknown argument: $unknown")
       }
@@ -92,6 +121,34 @@ object CliParser {
         "--run-id may contain only letters, digits, underscore and hyphen (max 128 chars)"
       )
     }
+
+    // Decoupled curated batch selectors: --stage curated only, mutually
+    // exclusive with each other and with the single-shot selectors;
+    // --replay-source-system is a FILTER composable with --pending or a
+    // date range (or standing alone = pending for that system).
+    val curatedStage = Seq("curated", "curated-only", "c").contains(cli.stage.toLowerCase)
+    val exclusive = Seq(
+      cli.pending -> "--pending",
+      cli.replayLast.isDefined -> "--replay-last",
+      (cli.replayFrom.isDefined || cli.replayTo.isDefined) -> "--replay-from/--replay-to",
+      cli.replayFailed -> "--replay-failed"
+    ).filter(_._1).map(_._2)
+    require(exclusive.size <= 1,
+      s"batch selectors are mutually exclusive; got: ${exclusive.mkString(", ")}")
+    if (cli.batchSelector || cli.replaySourceSystem.isDefined) {
+      require(curatedStage,
+        "batch selectors (--pending, --replay-*) require --stage curated")
+      require(cli.runId.isEmpty && cli.resumeIngestDt.isEmpty,
+        "batch selectors cannot be combined with --run-id or --resume-ingest-dt")
+    }
+    cli.replayLast.foreach(n => require(n > 0, "--replay-last must be a positive integer"))
+    Seq(cli.replayFrom -> "--replay-from", cli.replayTo -> "--replay-to").foreach {
+      case (Some(d), flag) => require(d.matches("\\d{4}-\\d{2}-\\d{2}"),
+        s"$flag must be a yyyy-MM-dd date, got '$d'")
+      case _ => ()
+    }
+    for (f <- cli.replayFrom; t <- cli.replayTo)
+      require(f <= t, s"--replay-from ($f) must not be after --replay-to ($t)")
     cli.copy(mode = mode)
   }
 }

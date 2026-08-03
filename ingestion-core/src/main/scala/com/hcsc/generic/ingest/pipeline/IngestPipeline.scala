@@ -118,12 +118,12 @@ final class IngestPipeline(
           // SUCCESS — replaying a run whose raw stage never completed would
           // publish a PARTIAL slice that later --resume trusts as complete.
           if (audit.enabled) {
-            val rawStatus = audit.stageStatus(rid, ctx.entity, Stages.Raw)
-            require(rawStatus.contains(StageStatus.Success),
-              s"PIPE_003 curated replay from run_id=$rid requires that run's raw stage to be " +
-                s"SUCCESS in the ledger (found: ${rawStatus.getOrElse("no record")}). A partial " +
-                "RAW slice must not be published as a complete curated build; re-run or --resume " +
-                "the original run first.")
+            // EXISTS-based: a raw SUCCESS is a monotone fact — a resumed
+            // run's later SKIPPED row must not make its batch unreplayable.
+            require(audit.hasStageSuccess(rid, ctx.entity, Stages.Raw),
+              s"PIPE_003 curated replay from run_id=$rid requires a raw SUCCESS row for that " +
+                "run in the ledger (none found). A partial RAW slice must not be published as " +
+                "a complete curated build; re-run or --resume the original run first.")
           } else
             logger.warn(s"[Pipeline] Replaying run_id=$rid WITHOUT a ledger check " +
               "(audit disabled): cannot verify the RAW slice is complete")

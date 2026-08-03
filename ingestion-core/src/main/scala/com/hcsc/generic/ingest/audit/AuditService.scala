@@ -53,6 +53,17 @@ final case class RunAuditRecord(
   window_end: String
 )
 
+/** One RAW batch as seen by the decoupled curated driver: identity, the
+  * mode it was extracted under, and its extract window (empty strings on
+  * pre-migration ledgers). */
+final case class PendingBatch(
+  runId: String,
+  runMode: Option[String],
+  windowStart: String,
+  windowEnd: String,
+  rawSuccessTs: Timestamp
+)
+
 final case class ReconciliationRecord(
   run_id: String,
   entity: String,
@@ -302,6 +313,95 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
       .headOption
       .map(r => (r.getString(0), r.getString(1)))
   }
+
+  /** EXISTS-based success check: true iff the ledger holds ANY SUCCESS row
+    * for (run, entity, stage). Unlike stageStatus's latest-wins convention,
+    * a SUCCESS here is a monotone fact — later SKIPPED rows (resume) or
+    * FAILED replay attempts never un-record it. This is the batch
+    * CHECKPOINT predicate for decoupled curated processing. */
+  def hasStageSuccess(runId: String, entity: String, stage: String): Boolean = {
+    if (!enabled || !spark.catalog.tableExists(runTable)) return false
+    import org.apache.spark.sql.functions.col
+    spark.table(runTable)
+      .filter(col("run_id") === runId && col("entity") === entity &&
+        col("stage") === stage &&
+        col("status") === com.hcsc.generic.ingest.runtime.StageStatus.Success)
+      .limit(1).count() > 0
+  }
+
+  /** One RAW batch eligible for (or selected into) curated batch
+    * processing. runMode/window fields empty on pre-migration ledgers. */
+  private def batchFrame(entity: String): Option[org.apache.spark.sql.DataFrame] = {
+    if (!enabled || !spark.catalog.tableExists(runTable)) return None
+    Some(spark.table(runTable).filter(
+      org.apache.spark.sql.functions.col("entity") === entity))
+  }
+
+  /** RAW-successful runs (real data — dry-run SUCCESS rows excluded, they
+    * write nothing) aggregated one row per run_id, ordered by ascending
+    * raw-SUCCESS event_ts. The entity lock serializes raw runs, so this is
+    * extraction commit order; window values are opaque serialized strings
+    * and are never used for ordering. */
+  private def rawSuccessBatches(entity: String): Seq[PendingBatch] = {
+    import org.apache.spark.sql.functions._
+    batchFrame(entity).fold(Seq.empty[PendingBatch]) { runs =>
+      val cols = runs.columns.map(_.toLowerCase).toSet
+      def optCol(n: String) = if (cols.contains(n)) col(n) else lit("")
+      runs.filter(col("stage") === com.hcsc.generic.ingest.runtime.Stages.Raw &&
+          col("status") === com.hcsc.generic.ingest.runtime.StageStatus.Success &&
+          col("message") =!= "dry-run")
+        .groupBy(col("run_id"))
+        .agg(min(col("event_ts")).as("raw_success_ts"),
+          max(optCol("run_mode")).as("run_mode"),
+          max(optCol("window_start")).as("window_start"),
+          max(optCol("window_end")).as("window_end"))
+        .orderBy(col("raw_success_ts").asc)
+        .collect()
+        .map(r => PendingBatch(
+          runId = r.getAs[String]("run_id"),
+          runMode = Option(r.getAs[String]("run_mode")).filter(_.nonEmpty),
+          windowStart = Option(r.getAs[String]("window_start")).getOrElse(""),
+          windowEnd = Option(r.getAs[String]("window_end")).getOrElse(""),
+          rawSuccessTs = r.getAs[Timestamp]("raw_success_ts")))
+        .toSeq
+    }
+  }
+
+  private def runIdsWith(entity: String, stage: String, status: String): Set[String] = {
+    import org.apache.spark.sql.functions.col
+    batchFrame(entity).fold(Set.empty[String]) { runs =>
+      runs.filter(col("stage") === stage && col("status") === status)
+        .select("run_id").distinct().collect().map(_.getString(0)).toSet
+    }
+  }
+
+  /** Checkpoint 2 of decoupled operation: RAW-successful batches with NO
+    * curated SUCCESS yet, in extraction commit order. */
+  def pendingBatches(entity: String): Seq[PendingBatch] = {
+    val curatedDone = runIdsWith(entity, com.hcsc.generic.ingest.runtime.Stages.Curated,
+      com.hcsc.generic.ingest.runtime.StageStatus.Success)
+    rawSuccessBatches(entity).filterNot(b => curatedDone.contains(b.runId))
+  }
+
+  /** Pending batches whose curated stage has FAILED at least once. */
+  def failedBatches(entity: String): Seq[PendingBatch] = {
+    val curatedFailed = runIdsWith(entity, com.hcsc.generic.ingest.runtime.Stages.Curated,
+      com.hcsc.generic.ingest.runtime.StageStatus.Failed)
+    pendingBatches(entity).filter(b => curatedFailed.contains(b.runId))
+  }
+
+  /** Last N RAW-successful batches regardless of curated state (forced
+    * rebuild; content-idempotent under the freshness merge). */
+  def lastRawSuccessBatches(entity: String, n: Int): Seq[PendingBatch] =
+    rawSuccessBatches(entity).takeRight(n)
+
+  /** RAW-successful batches whose raw SUCCESS date (event_ts, session zone)
+    * falls in [from, to] inclusive. */
+  def rawSuccessBatchesBetween(entity: String, from: java.time.LocalDate, to: java.time.LocalDate): Seq[PendingBatch] =
+    rawSuccessBatches(entity).filter { b =>
+      val d = b.rawSuccessTs.toLocalDateTime.toLocalDate
+      !d.isBefore(from) && !d.isAfter(to)
+    }
 
   /** Latest recorded status for a stage of a given run, used by --resume.
     * Terminal statuses win over STARTED when timestamps tie. */

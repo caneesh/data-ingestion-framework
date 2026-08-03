@@ -42,8 +42,13 @@ object IngestMain {
       } else cli.stage.toLowerCase match {
         case "curated" | "curated-only" | "c" =>
           // Governed replay path: real run context, entity lock, ledger,
-          // rejects and contract validation — never the watermark.
-          new IngestPipeline(spark, feedConf, cli, logger).curatedReplay()
+          // rejects and contract validation — never the watermark. With a
+          // batch selector (--pending / --replay-*) the driver sequences
+          // one governed replay per selected RAW batch.
+          if (cli.batchSelector || cli.replaySourceSystem.isDefined)
+            new com.hcsc.generic.ingest.pipeline.CuratedBatchDriver(spark, feedConf, cli, logger).run()
+          else
+            new IngestPipeline(spark, feedConf, cli, logger).curatedReplay()
         case "retention" =>
           // Config-driven purge of raw partitions, reject/audit rows and
           // watermark history; honors --dry-run. Runs under the entity lock

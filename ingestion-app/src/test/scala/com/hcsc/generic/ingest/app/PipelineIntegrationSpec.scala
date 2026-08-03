@@ -473,7 +473,8 @@ class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
         baseCli.copy(runId = Some("run-rawfailed-1"), stage = "curated"), logger).curatedReplay()
     }
     assert(e.getMessage.contains("PIPE_003"))
-    assert(e.getMessage.contains("FAILED"))
+    assert(e.getMessage.contains("raw SUCCESS"),
+      "the EXISTS-based guard must state that no raw SUCCESS row exists")
   }
 
   test("--stage curated without --run-id or --resume-ingest-dt fails with guidance") {

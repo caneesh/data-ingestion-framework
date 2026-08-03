@@ -311,6 +311,56 @@ forensic record for restart safety and reconciliation. Apply a retention policy
 only with explicit approval and after confirming no in-flight run depends on
 recent rows (watermarks and file registry especially).
 
+## 7. Entity run locks (PIPE_001)
+
+Every run (coupled, curated replay, retention) takes an entity-level lease
+before writing and holds it through the watermark commit. Two providers,
+selected by `concurrency.provider`:
+
+| Provider | Guarantee | Use for |
+|----------|-----------|---------|
+| `HIVE` (default, `LockService`) | **Best-effort only.** Hive appends are not transactional; the claim → settle → re-read protocol shrinks the race window to the settle interval but does **not** eliminate it — two claims within one settle interval (plus driver clock skew) can both win. | Dev/test, and production where a single scheduler already serializes runs of one entity. |
+| `JDBC` (`JdbcRunLock`) | **Atomic.** Single-statement UPDATE compare-and-set on a relational control table (`ingestion_lock`, one row per entity); of N concurrent acquirers exactly one wins. | Production with real concurrent submission. |
+
+```hocon
+concurrency {
+  lock     = REQUIRED            # or OFF (loud warning, no protection)
+  provider = JDBC                # default HIVE
+  jdbc {
+    url           = "jdbc:sqlserver://..."   # required
+    user          = "..."                    # optional
+    password      = "..."                    # optional; never logged
+    driver        = "..."                    # optional driver class
+    table         = "ingestion_lock"         # default
+    lease_minutes = 240                      # default 4h
+  }
+}
+```
+
+Operational facts:
+
+- **Heartbeat:** after acquiring, the pipeline renews the lease from a daemon
+  thread every `lease/3` (default: every 80 min for the 4 h lease), so a
+  healthy run can miss two beats before its lease lapses. There are no
+  stage-boundary renewals anymore — the heartbeat replaced them.
+- **Ownership loss aborts before damage:** if any renewal fails, the run does
+  not stop mid-stage; it aborts with
+  `PIPE_001 lease ownership lost mid-run; aborting before publish/watermark`
+  at the next danger point — before the curated publish and before the
+  watermark advance. Nothing was published by the aborted run at that point;
+  re-run it once the competing holder finishes.
+- **Crashed holder:** the lease expires after `lease_minutes`; a new run then
+  takes over automatically. To free it earlier: HIVE provider — use
+  `forceRelease` / append a RELEASE row; JDBC provider — `UPDATE
+  ingestion_lock SET holder_run_id = NULL WHERE entity_name = '<entity>'`.
+- **JDBC clock caveat:** lease-expiry comparisons run on the database's
+  `CURRENT_TIMESTAMP` (one clock for all competitors), but the stored expiry
+  is computed from the acquiring JVM's clock — JVM↔DB skew stretches or
+  shrinks the effective lease by the skew. Keep clocks NTP-synced.
+- **SQL Server:** pre-create `ingestion_lock` with `DATETIME2` columns; the
+  auto-create DDL is ANSI (H2/dev) and SQL Server's `TIMESTAMP` type is a
+  rowversion, not a datetime.
+
 ## Decoupled Raw / Curated operation
 
 See docs/DECOUPLING_DESIGN.md for the full design. Quick reference:

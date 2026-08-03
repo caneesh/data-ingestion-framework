@@ -79,7 +79,7 @@ object IngestMain {
       entity = cli.entity, mode = cli.mode,
       rawFlag = cli.rawFlag.getOrElse(""), dryRun = cli.dryRun)
     val audit = com.hcsc.generic.ingest.audit.AuditService(spark, feedConf)
-    val lock = com.hcsc.generic.ingest.lock.LockService.fromConfig(spark, feedConf, logger)
+    val lock = com.hcsc.generic.ingest.lock.RunLock.fromConfig(spark, feedConf, logger)
     val held = if (cli.dryRun) None else lock.map { l => l.acquire(ctx.entity, ctx.runId); l }
     try {
       val results = new com.hcsc.generic.ingest.retention.RetentionService(spark, feedConf, logger)

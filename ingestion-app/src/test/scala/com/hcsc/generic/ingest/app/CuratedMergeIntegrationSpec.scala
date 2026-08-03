@@ -381,6 +381,191 @@ class CuratedMergeIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(curatedRowIn("members_hash", "H1").getAs[String]("name") == "changed")
   }
 
+  test("null_handling.policy = ALLOW requires the explicit growth acknowledgment (CUR_009)") {
+    val allowNoAck = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_allow
+        |format = parquet
+        |merge {
+        |  keys = ["member_id"]
+        |  freshness { column = "src_modified_ts" }
+        |  null_handling { policy = "ALLOW" }
+        |}
+        |""".stripMargin)
+    val e = intercept[IllegalArgumentException] {
+      new CuratedService(spark, allowNoAck)
+        .process(batch(Seq((null.asInstanceOf[String], "keyless", "2026-01-01 10:00:00", 1))),
+          "INCR", ctx("mrun-al-1"), None, None)
+    }
+    assert(e.getMessage.contains("CUR_009"))
+
+    val allowAck = ConfigFactory.parseString(
+      """merge.null_handling.acknowledge_unmerged_growth = true""").withFallback(allowNoAck)
+    val r = new CuratedService(spark, allowAck)
+      .process(batch(Seq((null.asInstanceOf[String], "keyless", "2026-01-01 10:00:00", 1))),
+        "INCR", ctx("mrun-al-2"), None, None).get
+    assert(r.passthroughCount == 1, "acknowledged ALLOW admits keyless rows, counted")
+  }
+
+  // ---------------------------------------------------------------------------
+  // 6d: source-version advancement — same content, newer version (CUR P0)
+  // ---------------------------------------------------------------------------
+
+  test("same hash with a newer source version advances version metadata without a business update") {
+    val vConf = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_ver
+        |format = parquet
+        |merge {
+        |  keys = ["member_id"]
+        |  freshness { column = "src_modified_ts", tie_breakers = ["src_seq"] }
+        |}
+        |""".stripMargin)
+    val svc = new CuratedService(spark, vConf)
+    def hashed(rows: Seq[(String, String, String, Int)], hash: String) =
+      batch(rows).withColumn("record_hash", org.apache.spark.sql.functions.lit(hash))
+
+    // Scenario A seed: version 10:00, hash ABC
+    svc.process(hashed(Seq(("V1", "content", "2026-01-01 10:00:00", 1)), "ABC"),
+      "INCR", ctx("mrun-va-1"), None, None)
+    val before = curatedRowIn("members_ver", "V1")
+
+    // Same hash, NEWER version 11:00: metadata must advance, nothing else
+    val rA = svc.process(hashed(Seq(("V1", "content", "2026-01-01 11:00:00", 2)), "ABC"),
+      "INCR", ctx("mrun-va-2"), None, None).get
+    assert(rA.updateCount == 0 && rA.insertCount == 0,
+      "a version-only advance is not a business update")
+    assert(rA.ignoredCount == 1, "counted as business-unchanged")
+    val after = curatedRowIn("members_ver", "V1")
+    // Compare instants (Timestamp.toString renders in the JVM zone, not UTC)
+    assert(after.getAs[java.sql.Timestamp]("src_modified_ts")
+      .after(before.getAs[java.sql.Timestamp]("src_modified_ts")),
+      "the OBSERVED source version must advance beyond the seed's 10:00")
+    assert(after.getAs[Int]("src_seq") == 2, "tie-breaker version columns advance too")
+    assert(after.getAs[String]("name") == "content", "business content untouched")
+    assert(after.getAs[String]("last_modified_op") == before.getAs[String]("last_modified_op"),
+      "no business-change restamp")
+    assert(after.getAs[java.sql.Timestamp]("last_modified_ts") ==
+      before.getAs[java.sql.Timestamp]("last_modified_ts"),
+      "framework processing timestamp is not restamped by a version-only advance")
+
+    // Scenario B: a LATE stale changed row (10:30, different hash) must NOT
+    // beat the already-observed 11:00 version
+    val rB = svc.process(hashed(Seq(("V1", "stale_change", "2026-01-01 10:30:00", 1)), "XYZ"),
+      "INCR", ctx("mrun-va-3"), None, None).get
+    assert(rB.ignoredCount == 1 && rB.updateCount == 0)
+    assert(curatedRowIn("members_ver", "V1").getAs[String]("name") == "content",
+      "the in-between stale change must not overwrite: 11:00 was already observed")
+
+    // Scenario C: same hash, same version — pure no-op, no regression
+    val advancedTs = after.getAs[java.sql.Timestamp]("src_modified_ts")
+    val rC = svc.process(hashed(Seq(("V1", "content", "2026-01-01 11:00:00", 2)), "ABC"),
+      "INCR", ctx("mrun-va-4"), None, None).get
+    assert(rC.ignoredCount == 1 && rC.updateCount == 0)
+    assert(curatedRowIn("members_ver", "V1").getAs[java.sql.Timestamp]("src_modified_ts")
+      == advancedTs, "same hash + same version: no metadata regression, no change")
+
+    // Scenario D: newer version AND different hash — a real update
+    val rD = svc.process(hashed(Seq(("V1", "changed", "2026-01-01 12:00:00", 3)), "NEW"),
+      "INCR", ctx("mrun-va-5"), None, None).get
+    assert(rD.updateCount == 1 && rD.ignoredCount == 0)
+    val fin = curatedRowIn("members_ver", "V1")
+    assert(fin.getAs[String]("name") == "changed")
+    assert(fin.getAs[java.sql.Timestamp]("src_modified_ts").after(advancedTs),
+      "a real update advances the version past the observed 11:00")
+    assert(fin.getAs[String]("last_modified_op") == "U")
+  }
+
+  // ---------------------------------------------------------------------------
+  // 6e: fail-closed freshness (CUR_008) — no silent last-write-wins
+  // ---------------------------------------------------------------------------
+
+  test("an incremental merge without freshness fails closed (CUR_008), LWW needs double opt-in") {
+    val noFresh = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_nofresh
+        |format = parquet
+        |merge { keys = ["member_id"] }
+        |""".stripMargin)
+    val svc = new CuratedService(spark, noFresh)
+    // Initial FULL-style publish (table absent) is fine — no merge happens
+    svc.process(batch(Seq(("F1", "v1", "2026-01-01 10:00:00", 1))), "INCR", ctx("mrun-fc-1"), None, None)
+    // The INCREMENTAL merge against the existing table must refuse
+    val e = intercept[IllegalStateException] {
+      svc.process(batch(Seq(("F1", "v2", "2026-01-01 11:00:00", 2))), "INCR", ctx("mrun-fc-2"), None, None)
+    }
+    assert(e.getMessage.contains("CUR_008") && e.getMessage.contains("CURATED_FRESHNESS_MISSING"))
+
+    // LWW without the acknowledgment flag: still refused
+    val lwwNoAck = ConfigFactory.parseString("""merge.strategy = "LAST_WRITE_WINS"""")
+      .withFallback(noFresh)
+    val e2 = intercept[IllegalArgumentException] {
+      new CuratedService(spark, lwwNoAck)
+        .process(batch(Seq(("F1", "v2", "2026-01-01 11:00:00", 2))), "INCR", ctx("mrun-fc-3"), None, None)
+    }
+    assert(e2.getMessage.contains("allow_unsafe_legacy_merge"))
+
+    // Full double opt-in: legacy LWW runs (and, being LWW, the late write wins)
+    val lww = ConfigFactory.parseString(
+      """merge { strategy = "LAST_WRITE_WINS", allow_unsafe_legacy_merge = true }""")
+      .withFallback(noFresh)
+    val r = new CuratedService(spark, lww)
+      .process(batch(Seq(("F1", "v2", "2026-01-01 09:00:00", 0))), "INCR", ctx("mrun-fc-4"), None, None).get
+    assert(r.updateCount == 1)
+    assert(curatedRowIn("members_nofresh", "F1").getAs[String]("name") == "v2",
+      "explicit LWW is run-order wins, documented unsafe")
+  }
+
+  test("missing freshness or tie-breaker columns fail closed with named errors") {
+    val vConf = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_fcols
+        |format = parquet
+        |merge { keys = ["member_id"], freshness { column = "src_modified_ts", tie_breakers = ["src_seq"] } }
+        |""".stripMargin)
+    val svc = new CuratedService(spark, vConf)
+    svc.process(batch(Seq(("C1", "v1", "2026-01-01 10:00:00", 1))), "INCR", ctx("mrun-mc-1"), None, None)
+
+    // Freshness column missing from INCOMING
+    val s = spark
+    import s.implicits._
+    val noFreshCol = Seq(("C1", "v2", 2)).toDF("member_id", "name", "src_seq")
+    val e1 = intercept[IllegalStateException] {
+      svc.process(noFreshCol, "INCR", ctx("mrun-mc-2"), None, None)
+    }
+    assert(e1.getMessage.contains("CURATED_FRESHNESS_COLUMN_MISSING"))
+    assert(e1.getMessage.contains("incoming"))
+
+    // Tie-breaker missing from INCOMING
+    val noTie = Seq(("C1", "v2", "2026-01-01 11:00:00")).toDF("member_id", "name", "src_modified_ts")
+      .withColumn("src_modified_ts", col("src_modified_ts").cast("timestamp"))
+    val e2 = intercept[IllegalStateException] {
+      svc.process(noTie, "INCR", ctx("mrun-mc-3"), None, None)
+    }
+    assert(e2.getMessage.contains("CURATED_TIE_BREAKER_COLUMN_MISSING"))
+
+    // Freshness column missing from the TARGET (pre-created without it)
+    spark.sql("CREATE TABLE m_curated.members_notgt (member_id STRING, name STRING) USING PARQUET")
+    spark.sql("INSERT INTO m_curated.members_notgt VALUES ('T1', 'old')")
+    val tgtConf = ConfigFactory.parseString(
+      """
+        |database = m_curated
+        |table = members_notgt
+        |format = parquet
+        |merge { keys = ["member_id"], freshness { column = "src_modified_ts" } }
+        |""".stripMargin)
+    val e3 = intercept[IllegalStateException] {
+      new CuratedService(spark, tgtConf)
+        .process(batch(Seq(("T1", "new", "2026-01-01 11:00:00", 1))), "INCR", ctx("mrun-mc-4"), None, None)
+    }
+    assert(e3.getMessage.contains("CURATED_FRESHNESS_COLUMN_MISSING"))
+    assert(e3.getMessage.contains("target"))
+  }
+
   // ---------------------------------------------------------------------------
   // 7b: drift hardening — casts must not silently null values (CUR_002)
   // ---------------------------------------------------------------------------

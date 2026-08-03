@@ -11,15 +11,23 @@ import java.sql.Timestamp
 final class PipelineLockException(message: String) extends RuntimeException(message)
 
 /**
-  * Best-effort entity-level run lease preventing two pipeline runs of the
-  * same entity from extracting overlapping windows and interleaving curated
-  * INSERT OVERWRITEs (lost updates).
+  * BEST-EFFORT (HIVE provider) entity-level run lease preventing two
+  * pipeline runs of the same entity from extracting overlapping windows and
+  * interleaving curated INSERT OVERWRITEs (lost updates).
   *
-  * Same non-transactional caveat as the watermark store: Hive appends are
-  * not atomic, so the claim protocol is claim -> settle -> re-read. Two
-  * claims landing in the same settle window are resolved deterministically
-  * (earliest claim wins; ties by run id), shrinking the unprotected window
-  * from an entire pipeline run to the settle interval.
+  * GUARANTEES — STATED HONESTLY: Hive appends are not transactional, so
+  * this provider CANNOT guarantee mutual exclusion. The claim protocol is
+  * claim -> settle -> re-read: competing claims that land in the same
+  * settle window are resolved deterministically (earliest claim wins; ties
+  * by run id), which SHRINKS the unprotected window from an entire pipeline
+  * run down to the settle interval — but does NOT eliminate it. Two claims
+  * appended within one settle interval, combined with clock skew between
+  * the drivers, can BOTH conclude they won. This is acceptable for
+  * dev/test and single-scheduler deployments (where the scheduler already
+  * serializes runs of one entity); production deployments with real
+  * concurrent submission should use the JDBC provider
+  * (`concurrency.provider = JDBC`, [[JdbcRunLock]]), whose single-statement
+  * UPDATE compare-and-set is truly atomic.
   *
   * A crashed run's lease expires after lease_minutes (default 4h); an
   * operator can release earlier via forceRelease (or by appending a RELEASE
@@ -27,6 +35,7 @@ final class PipelineLockException(message: String) extends RuntimeException(mess
   *
   * concurrency {
   *   lock = REQUIRED | OFF        # default REQUIRED
+  *   provider = HIVE              # this class; JDBC selects JdbcRunLock
   *   database = "ingest_audit"    # defaults to audit.database
   *   table = "ingest_run_locks"
   *   lease_minutes = 240
@@ -37,14 +46,14 @@ final class LockService(
   spark: SparkSession,
   database: String,
   table: String,
-  leaseMillis: Long,
+  val leaseMillis: Long,
   settleMillis: Long,
   logger: Logger,
   /** concurrency.wait_ms: total budget to WAIT for a held entity instead of
     * failing fast (the default, 0). The claim is retried until the budget
     * runs out; the last contention error propagates unchanged. */
   waitMillis: Long = 0L
-) {
+) extends RunLock {
   require(database.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"lock database '$database' is not a safe SQL identifier")
   require(table.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"lock table '$table' is not a safe SQL identifier")
 
@@ -196,11 +205,14 @@ final class LockService(
 object LockService {
 
   /**
-    * Lock resolution: OFF disables loudly; otherwise the lock table lives in
-    * concurrency.database, falling back to audit.database (so audited feeds
-    * are protected without extra config). A feed with neither database is
-    * left unlocked with a warning — an explicit concurrency block without a
-    * resolvable database is a configuration error.
+    * HIVE-provider lock resolution (kept for compatibility — new call sites
+    * should go through the provider-selecting [[RunLock.fromConfig]], which
+    * delegates here for provider=HIVE): OFF disables loudly; otherwise the
+    * lock table lives in concurrency.database, falling back to
+    * audit.database (so audited feeds are protected without extra config).
+    * A feed with neither database is left unlocked with a warning — an
+    * explicit concurrency block without a resolvable database is a
+    * configuration error.
     */
   def fromConfig(spark: SparkSession, feedConf: Config, logger: Logger): Option[LockService] = {
     val conc = ConfigUtils.optConfig(feedConf, "concurrency")

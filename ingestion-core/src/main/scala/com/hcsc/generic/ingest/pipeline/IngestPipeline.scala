@@ -63,10 +63,13 @@ final class IngestPipeline(
   def run(): Unit = {
     // Entity-level run lease: acquired BEFORE any extraction, held through
     // the watermark commit — two concurrent runs of one entity would extract
-    // overlapping windows and erase each other's curated writes.
-    val lock = com.hcsc.generic.ingest.lock.LockService.fromConfig(spark, feedConf, logger)
+    // overlapping windows and erase each other's curated writes. A daemon
+    // heartbeat renews the lease every lease/3; the danger points (curated
+    // publish, watermark advance) abort when ownership was lost mid-run.
+    val lock = com.hcsc.generic.ingest.lock.RunLock.fromConfig(spark, feedConf, logger)
     val held = if (ctx.dryRun) None else lock.map { l => l.acquire(ctx.entity, ctx.runId); l }
-    try runInternal(held)
+    val heartbeat = held.map(startHeartbeat)
+    try runInternal(heartbeat)
     catch {
       case e: Throwable =>
         // A failed run's in-memory read window must not linger: it would
@@ -83,6 +86,7 @@ final class IngestPipeline(
         throw e
     }
     finally {
+      heartbeat.foreach(hb => try hb.stop() catch { case _: Exception => () })
       held.foreach(l =>
         try l.release(ctx.entity, ctx.runId)
         catch { case e: Exception => logger.warn(s"[Pipeline] Lock release failed: ${e.getMessage}") })
@@ -90,6 +94,23 @@ final class IngestPipeline(
       cached.clear()
     }
   }
+
+  /** Starts the daemon lease heartbeat for an acquired lock. lease/3 means a
+    * healthy run can miss two beats before its lease actually lapses. */
+  private def startHeartbeat(l: com.hcsc.generic.ingest.lock.RunLock): com.hcsc.generic.ingest.lock.LockHeartbeat = {
+    val hb = new com.hcsc.generic.ingest.lock.LockHeartbeat(
+      l, ctx.entity, ctx.runId, math.max(l.leaseMillis / 3, 1000L), logger)
+    hb.start()
+    hb
+  }
+
+  /** Danger-point gate: a run whose heartbeat lost the lease must abort
+    * BEFORE the curated publish / watermark advance — continuing would mean
+    * two writers on one entity. */
+  private def ensureOwnership(heartbeat: Option[com.hcsc.generic.ingest.lock.LockHeartbeat]): Unit =
+    if (heartbeat.exists(_.ownershipLost))
+      throw new com.hcsc.generic.ingest.lock.PipelineLockException(
+        "PIPE_001 lease ownership lost mid-run; aborting before publish/watermark")
 
   /**
     * --stage curated: rebuilds curated from an existing RAW slice — either
@@ -100,8 +121,9 @@ final class IngestPipeline(
     * new-source progress). Replaces the audit-less legacy curated-only path.
     */
   def curatedReplay(): Unit = {
-    val lock = com.hcsc.generic.ingest.lock.LockService.fromConfig(spark, feedConf, logger)
+    val lock = com.hcsc.generic.ingest.lock.RunLock.fromConfig(spark, feedConf, logger)
     val held = if (ctx.dryRun) None else lock.map { l => l.acquire(ctx.entity, ctx.runId); l }
+    val heartbeat = held.map(startHeartbeat)
     try {
       requireLedger()
       validateFeedCompatibility()
@@ -145,6 +167,10 @@ final class IngestPipeline(
       val curatedConf =
         if (feedConf.hasPath("curated")) Some(feedConf.getConfig("curated")) else None
 
+      // The replay's one danger point: publishing curated while another run
+      // owns the entity. Abort here when the heartbeat lost the lease.
+      ensureOwnership(heartbeat)
+
       val result = runStage(Stages.Curated, skippable = false) {
         val r = new CuratedStageRunner(spark, curatedConf, logger)
           .run(slice, ctx.mode, ctx, contract, Some(rejectService))
@@ -159,6 +185,7 @@ final class IngestPipeline(
       logger.info(s"==== Curated replay success entity=${ctx.entity} runId=${ctx.runId} " +
         "(watermark intentionally untouched) ====")
     } finally {
+      heartbeat.foreach(hb => try hb.stop() catch { case _: Exception => () })
       held.foreach(l =>
         try l.release(ctx.entity, ctx.runId)
         catch { case e: Exception => logger.warn(s"[Pipeline] Lock release failed: ${e.getMessage}") })
@@ -240,7 +267,7 @@ final class IngestPipeline(
           problems.map(p => s"  - $p").mkString("\n"))
   }
 
-  private def runInternal(heldLock: Option[com.hcsc.generic.ingest.lock.LockService]): Unit = {
+  private def runInternal(heartbeat: Option[com.hcsc.generic.ingest.lock.LockHeartbeat]): Unit = {
     logger.info(s"==== Pipeline start entity=${ctx.entity} mode=${ctx.mode} runId=${ctx.runId} " +
       s"dryRun=${ctx.dryRun} resume=${ctx.resume} ====")
     requireLedger()
@@ -286,11 +313,10 @@ final class IngestPipeline(
 
     val acceptedDf = rawOutcome.accepted
 
-    // The lease was sized for a stage, not the whole run: renew between
-    // stages so a long extraction cannot silently outlive the lock. A failed
-    // renewal (entity claimed by another run after our lease expired) aborts
-    // BEFORE the curated write.
-    heldLock.foreach(_.renew(ctx.entity, ctx.runId))
+    // The heartbeat has been renewing the lease in the background since
+    // acquire (every lease/3). Danger point 1: a run whose heartbeat lost
+    // the lease must abort BEFORE the curated write.
+    ensureOwnership(heartbeat)
 
     // ---- Stage: curated + publish -------------------------------------------
     // curatedOutcome distinguishes three states the watermark gate needs:
@@ -328,9 +354,10 @@ final class IngestPipeline(
     // (--stage raw, curated.enabled=false, or a missing curated block).
     // Feeds that are intentionally raw-only declare watermark.advance_after=RAW.
     if (!ctx.dryRun) {
-      // Renew once more before the watermark commit — the single most
-      // dangerous write to make while another run holds the entity.
-      heldLock.foreach(_.renew(ctx.entity, ctx.runId))
+      // Danger point 2: check ownership once more before the watermark
+      // commit — the single most dangerous write to make while another run
+      // holds the entity.
+      ensureOwnership(heartbeat)
       val sourceType = ConfigUtils.optString(sourceConf, "type").getOrElse("file")
       SourceRegistry.resolve(sourceType) match {
         case w: com.hcsc.generic.ingest.source.WatermarkAdvancing =>
@@ -517,11 +544,25 @@ final class IngestPipeline(
             .flatMap(c => ConfigUtils.optConfig(c, "merge"))
             .map(m => ConfigUtils.stringList(m, "keys")))
           .getOrElse(Seq.empty)
+        // Operation semantics honest to source capability: timestamp
+        // polling cannot see insert-vs-update, so non-delete rows default
+        // to UPSERT; sources with real operations configure the value;
+        // legacy 'I' stays available behind an explicit flag.
+        val nonDeleteOp = ConfigUtils.optString(rawConf, "source_operation_default")
+          .map(_.toUpperCase)
+          .getOrElse(
+            if (ConfigUtils.optBoolean(rawConf, "source_operation_legacy_insert").getOrElse(false)) "I"
+            else "UPSERT")
+        require(Seq("UPSERT", "SNAPSHOT", "UNKNOWN", "INSERT", "UPDATE", "I").contains(nonDeleteOp),
+          s"RAW_004 raw.source_operation_default '$nonDeleteOp' must be UPSERT, SNAPSHOT, " +
+            "UNKNOWN, INSERT, UPDATE or I (legacy)")
         RawMetadata.addExtended(withMeta0, com.hcsc.generic.ingest.transform.ExtendedLineage(
           sourceModifiedColumn = modifiedColumn,
           softDeleteIndicator = softDelete,
           primaryKeyColumns = primaryKey,
-          nullFileId = staged.isEmpty && !sourceType.equalsIgnoreCase("file")))
+          nullFileId = staged.isEmpty && !sourceType.equalsIgnoreCase("file"),
+          nonDeleteOperation = nonDeleteOp,
+          keyJson = ConfigUtils.optBoolean(rawConf, "source_key_json").getOrElse(false)))
       }
     val withMeta1 = ctx.fileIdFilter match {
       case Some(fileId) if staged.isEmpty => withMetaExt.filter(col("file_id") === lit(fileId))

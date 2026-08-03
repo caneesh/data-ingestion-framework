@@ -143,6 +143,25 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       }
     }
 
+    // Freshness columns must exist in the INCOMING data before any hygiene
+    // touches them — named CUR_008 failure instead of the later generic
+    // dedup error (fail closed, precisely).
+    if (keys.nonEmpty && !mergeConf.flatMap(m => ConfigUtils.optString(m, "strategy"))
+        .exists(_.equalsIgnoreCase("LAST_WRITE_WINS")))
+      freshness.foreach { f =>
+        (f.column +: f.tieBreakers.map(t =>
+          com.hcsc.generic.ingest.transform.OrderSpec.parse(t).column)).foreach { c =>
+          if (!prepared.columns.exists(_.equalsIgnoreCase(c))) {
+            val kind = if (c.equalsIgnoreCase(f.column)) "CURATED_FRESHNESS_COLUMN_MISSING"
+              else "CURATED_TIE_BREAKER_COLUMN_MISSING"
+            throw new IllegalStateException(
+              s"CUR_008 $kind: column '$c' is missing from the incoming data for $fullTable. " +
+                "The merge cannot compare versions it cannot see — fix the configuration or " +
+                "the incoming data")
+          }
+        }
+      }
+
     // merge.require_ordering = true: refuse the nondeterministic
     // dropDuplicates fallback outright — a keyed feed must declare
     // freshness or dedup.order_by. Default false (legacy fallback + warn).
@@ -240,6 +259,17 @@ final class CuratedService(spark: SparkSession, conf: Config) {
             .flatMap(m => ConfigUtils.optString(m, "null_handling.policy")).map(_.toUpperCase)
           nullPolicy.foreach(p => require(Seq("QUARANTINE", "ALLOW", "FAIL_RUN").contains(p),
             s"curated.merge.null_handling.policy '$p' must be QUARANTINE, ALLOW or FAIL_RUN"))
+          // ALLOW on a current-state table accumulates unmergeable keyless
+          // rows forever: require an explicit second acknowledgment so the
+          // growth is a decision, not an accident. QUARANTINE stays the
+          // safe default.
+          if (nullPolicy.contains("ALLOW"))
+            require(mergeConf.flatMap(m =>
+              ConfigUtils.optBoolean(m, "null_handling.acknowledge_unmerged_growth")).getOrElse(false),
+              "CUR_009 null_handling.policy = ALLOW admits keyless rows that can never be " +
+                "merged or updated — they accumulate in the current-state table indefinitely. " +
+                "Acknowledge this explicitly with " +
+                "null_handling.acknowledge_unmerged_growth = true, or use QUARANTINE (default).")
           val dropNull = nullPolicy match {
             case Some("ALLOW") => false
             case Some(_)       => true
@@ -262,9 +292,20 @@ final class CuratedService(spark: SparkSession, conf: Config) {
               val p = nullKeyed.persist()
               persistedFrames += p
               val c = p.count()
-              if (c > 0)
-                logger.info(s"[CuratedService] $c null-key row(s) pass through unmerged " +
-                  "(drop_null_keys=false); they are appended, never deduplicated")
+              if (c > 0) {
+                logger.warn(s"[CuratedService] $c null-key row(s) pass through UNMERGED " +
+                  "(keyless rows append forever and can never be updated; QUARANTINE is the " +
+                  "safe default)")
+                // Keyless duplicate-content signal: identical hashes among
+                // keyless rows are pure accumulation with zero information.
+                p.columns.find(_.equalsIgnoreCase(
+                  com.hcsc.generic.ingest.transform.RecordHash.Column)).foreach { h =>
+                  val dupes = p.groupBy(col(h)).count().filter(col("count") > 1).count()
+                  if (dupes > 0)
+                    logger.warn(s"[CuratedService] $dupes duplicate record_hash value(s) " +
+                      "among the keyless passthrough rows — identical content accumulating")
+                }
+              }
               (0L, if (c == 0) None else Some(p), c)
             }
           val persisted = valid.persist()
@@ -294,11 +335,11 @@ final class CuratedService(spark: SparkSession, conf: Config) {
         case CuratedPublishMode.Merge =>
           publishIncremental(hygienic, passthrough, nullKeyCount, passthroughCount, inputCount,
             keys, freshness, deletes, fullTable, request, ctx, contract,
-            partitionSpec, partitionOverwrite = false)
+            mergeConf, partitionSpec, partitionOverwrite = false)
         case CuratedPublishMode.PartitionOverwrite =>
           publishIncremental(hygienic, passthrough, nullKeyCount, passthroughCount, inputCount,
             keys, freshness, deletes, fullTable, request, ctx, contract,
-            partitionSpec, partitionOverwrite = true)
+            mergeConf, partitionSpec, partitionOverwrite = true)
       }
 
       // unchanged/rewrite metrics (§11): ignoredStale counts stale + hash-
@@ -520,6 +561,65 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       case _ => df
     }
 
+  /** Fail-closed merge-strategy gate (CUR_008): FRESHNESS (default)
+    * requires a fully usable freshness configuration — column present in
+    * INCOMING and TARGET, tie-breakers present in both, orderable types.
+    * Anything less fails BEFORE publishing instead of silently degrading
+    * to last-write-wins. Legacy LWW survives only behind
+    * merge { strategy = "LAST_WRITE_WINS", allow_unsafe_legacy_merge = true }.
+    * Returns Some(freshness) for the freshness contest, None for approved
+    * legacy LWW. */
+  private def resolveMergeStrategy(
+    incoming: DataFrame,
+    target: DataFrame,
+    freshness: Option[FreshnessSpec],
+    mergeConf: Option[Config],
+    fullTable: String
+  ): Option[FreshnessSpec] = {
+    val strategy = mergeConf.flatMap(m => ConfigUtils.optString(m, "strategy"))
+      .map(_.toUpperCase).getOrElse("FRESHNESS")
+    require(Seq("FRESHNESS", "LAST_WRITE_WINS").contains(strategy),
+      s"CUR_008 curated.merge.strategy '$strategy' must be FRESHNESS or LAST_WRITE_WINS")
+    if (strategy == "LAST_WRITE_WINS") {
+      require(mergeConf.flatMap(m =>
+        ConfigUtils.optBoolean(m, "allow_unsafe_legacy_merge")).getOrElse(false),
+        "CUR_008 curated.merge.strategy = LAST_WRITE_WINS is UNSAFE for a current-snapshot " +
+          "table (a late-arriving OLDER record overwrites newer curated rows) and requires " +
+          "merge.allow_unsafe_legacy_merge = true to acknowledge that explicitly")
+      logger.warn("[CuratedService] LAST_WRITE_WINS legacy merge explicitly enabled: run " +
+        "order, not source freshness, decides winners")
+      return None
+    }
+    val f = freshness.getOrElse(throw new IllegalStateException(
+      "CUR_008 CURATED_FRESHNESS_MISSING: the incremental merge requires " +
+        "curated.merge.freshness.column (the source-version column that decides winners). " +
+        "Configure it, or opt into the legacy behavior explicitly with " +
+        "merge { strategy = \"LAST_WRITE_WINS\", allow_unsafe_legacy_merge = true }."))
+    def requireIn(df: DataFrame, where: String, name: String, kind: String): String =
+      df.columns.find(_.equalsIgnoreCase(name)).getOrElse(throw new IllegalStateException(
+        s"CUR_008 $kind: column '$name' is missing from the $where for $fullTable. " +
+          "The merge cannot compare versions it cannot see — fix the configuration or the " +
+          (if (where == "target") "target schema (backfill the column or run an explicit FULL_OVERWRITE once)"
+           else "incoming data")))
+    requireIn(incoming, "incoming data", f.column, "CURATED_FRESHNESS_COLUMN_MISSING")
+    val fActual = requireIn(target, "target", f.column, "CURATED_FRESHNESS_COLUMN_MISSING")
+    f.tieBreakers.map(t => com.hcsc.generic.ingest.transform.OrderSpec.parse(t).column).foreach { t =>
+      requireIn(incoming, "incoming data", t, "CURATED_TIE_BREAKER_COLUMN_MISSING")
+      requireIn(target, "target", t, "CURATED_TIE_BREAKER_COLUMN_MISSING")
+    }
+    val fType = target.schema(fActual).dataType
+    val orderable = fType match {
+      case _: org.apache.spark.sql.types.MapType => false
+      case _: org.apache.spark.sql.types.ArrayType => false
+      case _: org.apache.spark.sql.types.StructType => false
+      case _ => true
+    }
+    require(orderable,
+      s"CUR_008 CURATED_FRESHNESS_TYPE_INVALID: freshness column '$fActual' has non-orderable " +
+        s"type ${fType.simpleString}; use a timestamp, numeric or string version column")
+    Some(f)
+  }
+
   /** The row-level "this is a tombstone" predicate, shared by the marking
     * step and the record_hash pre-filter exemption. None when deletes are
     * not SOFT or the indicator is absent from the frame. */
@@ -676,6 +776,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     request: PublishRequest,
     ctx: RunContext,
     contract: Option[SchemaContract],
+    mergeConf: Option[Config] = None,
     partitionSpec: CuratedPartitionSpec = CuratedPartitioning.Unpartitioned,
     partitionOverwrite: Boolean = false
   ): CuratedResult = {
@@ -810,13 +911,11 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       val contestedKeyCount = contestedKeys.count()
       val insertCount = totalIncoming - contestedKeyCount
 
-      val freshnessUsable = freshness.filter { f =>
-        val present = target.columns.exists(_.equalsIgnoreCase(f.column))
-        if (!present)
-          logger.warn(s"[CuratedService] merge.freshness.column '${f.column}' is not a column of " +
-            s"$fullTable; falling back to last-write-wins replacement until the target carries it")
-        present
-      }
+      // FAIL CLOSED (CUR_008): the incremental merge of a current-snapshot
+      // table must never silently degrade to last-write-wins — that would
+      // let a late-arriving OLDER record overwrite newer curated rows.
+      // Legacy LWW survives only behind an explicit double opt-in.
+      val freshnessUsable = resolveMergeStrategy(incoming, target, freshness, mergeConf, fullTable)
 
       val (replacement, updateCount, ignoredCount, deletesNewKeys, deletesContested) = freshnessUsable match {
         case Some(f) =>
@@ -830,7 +929,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           // ignoredCount through the normal winner arithmetic.
           val hashCol = target.columns
             .find(_.equalsIgnoreCase(com.hcsc.generic.ingest.transform.RecordHash.Column))
-          val challengers = hashCol match {
+          val (challengers, versionAdvances) = hashCol match {
             case Some(h) =>
               val kh = keyCols :+ h
               val tgtKeyHash = contested.select(kh.map(col): _*).distinct()
@@ -840,17 +939,44 @@ final class CuratedService(spark: SparkSession, conf: Config) {
               // indicator is not a business column, so a tombstone hashes
               // identically to the live target row it deletes — filtering it
               // would silently swallow the delete.
-              softDeletePredicate(alignedIncoming, deletes) match {
-                case Some(isDel) =>
-                  val del = coalesce(isDel, lit(false))
-                  alignedIncoming.filter(!del).join(hintKeys(tgtKeyHash), sameContent, "left_anti")
-                    .unionByName(alignedIncoming.filter(del))
-                case None =>
-                  alignedIncoming.join(hintKeys(tgtKeyHash), sameContent, "left_anti")
+              val live = softDeletePredicate(alignedIncoming, deletes) match {
+                case Some(isDel) => alignedIncoming.filter(!coalesce(isDel, lit(false)))
+                case None => alignedIncoming
               }
-            case None => alignedIncoming
+              val tombstones = softDeletePredicate(alignedIncoming, deletes)
+                .map(isDel => alignedIncoming.filter(coalesce(isDel, lit(false))))
+              val changed = live.join(hintKeys(tgtKeyHash), sameContent, "left_anti")
+
+              // SOURCE-VERSION ADVANCEMENT: a same-hash incoming row with a
+              // STRICTLY NEWER freshness value means the source produced a
+              // new version of unchanged content. Dropping it would leave
+              // the target's version metadata stale, letting a later record
+              // with an in-between version (different hash) wrongly win.
+              // Publish the TARGET row (business content and audit stamps
+              // untouched — no 'U', no restamp) carrying the incoming
+              // version columns; it competes tagged 'T' and outranks both
+              // the stale target row and any in-between challenger.
+              val fActual = target.columns.find(_.equalsIgnoreCase(f.column)).get
+              val versionCols = (fActual +: f.tieBreakers
+                .map(t => com.hcsc.generic.ingest.transform.OrderSpec.parse(t).column)
+                .flatMap(c => target.columns.find(_.equalsIgnoreCase(c)))).distinct
+              val sameHash = live.join(hintKeys(tgtKeyHash), sameContent, "left_semi")
+              val iVer = sameHash
+                .select((keyCols.map(col) ++ versionCols.map(col)): _*)
+                .toDF((keyCols.map(k => s"__vk_$k") ++ versionCols.map(v => s"__vv_$v")): _*)
+              val vkCond = keyCols.map(k => col(k) <=> col(s"__vk_$k")).reduce(_ && _)
+              val advanced = contested.join(hintKeys(iVer), vkCond, "inner")
+                .filter(col(s"__vv_$fActual") > col(fActual)) // strictly newer source version
+                .select(contested.columns.map(c =>
+                  if (versionCols.exists(_.equalsIgnoreCase(c))) col(s"__vv_$c").as(c)
+                  else col(c)): _*)
+
+              (tombstones.fold(changed)(t => changed.unionByName(t)), Some(advanced))
+            case None => (alignedIncoming, None)
           }
           val union = contested.withColumn(src, lit("T"))
+            .unionByName(versionAdvances.fold(contested.filter(lit(false)))(identity)
+              .withColumn(src, lit("T")))
             .unionByName(challengers.withColumn(src, lit("I")))
           // The freshness column itself is always highest-wins (desc, nulls
           // last); tie-breakers may declare direction and null ordering
@@ -881,10 +1007,8 @@ final class CuratedService(spark: SparkSession, conf: Config) {
             winnersI.join(hintKeys(contestedKeys), ckCond, "left_anti"), deletes)
           (winners.drop(src), updates, ignored, deletesNew, deletesWon - deletesNew)
         case None =>
-          if (freshness.isEmpty)
-            logger.warn("[CuratedService] No curated.merge.freshness configured: the incremental " +
-              "merge is last-write-wins by run order — a late-arriving OLDER record will overwrite " +
-              "a newer curated row. Configure merge.freshness.column to enable freshness comparison.")
+          // Reachable ONLY via merge.strategy = LAST_WRITE_WINS with
+          // allow_unsafe_legacy_merge = true (resolveMergeStrategy).
           val deletesAll = deleteMarkCount(alignedIncoming, deletes)
           val deletesNew = deleteMarkCount(
             alignedIncoming.join(hintKeys(contestedKeys), ckCond, "left_anti"), deletes)

@@ -157,3 +157,22 @@ Hive-format targets as datasource tables first), then switch to
 one `FULL_OVERWRITE` rebuild; or revert the config and restore from the
 previous snapshot tag — the raw layer is untouched by any of this and can
 always replay curated via `--stage curated`.
+
+## INSERT OVERWRITE scaling honesty (350-column current-snapshot tables)
+
+The MERGE publish rewrites the full table per run; PARTITION_OVERWRITE
+rewrites affected partitions. Expected behavior at scale (unbenchmarked
+estimates — a reproducible wide-data benchmark is recorded as follow-up
+work, not shipped):
+
+| Rows × 350 cols | MERGE (full rewrite) | PARTITION_OVERWRITE |
+|---|---|---|
+| 1M | comfortable (seconds–minutes) | comfortable |
+| 10M | workable; run time grows linearly with history | comfortable when deltas are partition-localized |
+| 100M | full rewrite per run becomes the dominant cost and an operational risk window | viable IF partitioning matches delta locality; otherwise degrades toward full rewrite |
+
+At the 100M+ scale the honest answer remains a transactional format with
+row-level MERGE (plan item #19) — O(delta) instead of O(table), plus
+multi-partition atomicity. Interim levers: PARTITION_OVERWRITE with a
+delta-aligned layout, `max_affected_partitions`, and the key-only
+projections already used for the contest joins.

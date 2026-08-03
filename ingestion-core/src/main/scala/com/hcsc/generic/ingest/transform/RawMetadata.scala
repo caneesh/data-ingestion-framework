@@ -2,6 +2,7 @@ package com.hcsc.generic.ingest.transform
 
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.functions._
+import scala.collection.JavaConverters._
 
 /** Source identity and extraction-window lineage stamped onto every RAW
   * record. For JDBC feeds the extract window is the serialized watermark
@@ -26,7 +27,17 @@ final case class ExtendedLineage(
   sourceModifiedColumn: Option[String],
   softDeleteIndicator: Option[(String, Seq[String])],
   primaryKeyColumns: Seq[String],
-  nullFileId: Boolean
+  nullFileId: Boolean,
+  /** Operation stamped on NON-delete rows. Timestamp polling cannot
+    * distinguish insert from update, so the honest default is UPSERT;
+    * SNAPSHOT/UNKNOWN for other capabilities; INSERT/UPDATE only when the
+    * source genuinely provides operations (CDC); legacy 'I' behind
+    * raw.source_operation_legacy_insert = true. */
+  nonDeleteOperation: String = "UPSERT",
+  /** Also stamp source_primary_key_json (readable form) alongside the
+    * collision-safe hash — only when security policy allows key values in
+    * RAW (raw.source_key_json = true). */
+  keyJson: Boolean = false
 )
 
 object RawMetadata {
@@ -51,8 +62,13 @@ object RawMetadata {
     // Stamped only when raw.lineage_extended = true:
     "source_modified_ts" -> "string",
     "source_operation" -> "string",
-    "source_primary_key" -> "string"
+    "source_primary_key" -> "string",
+    "source_primary_key_json" -> "string" // only with raw.source_key_json = true
   )
+
+  /** Version prefix of the persisted source_primary_key hash algorithm
+    * (v1 = SHA-256 over canonical ordered-struct JSON, nulls serialized). */
+  val SourceKeyAlgorithmVersion = "v1"
 
   val ColumnNames: Set[String] = ColumnTypes.map(_._1).toSet
 
@@ -107,19 +123,33 @@ object RawMetadata {
     val operation = ext.softDeleteIndicator.flatMap { case (indicator, values) =>
       actual(indicator).map { c =>
         when(lower(trim(col(c).cast("string")))
-          .isin(values.map(_.trim.toLowerCase): _*), "D").otherwise("I")
+          .isin(values.map(_.trim.toLowerCase): _*), "D").otherwise(ext.nonDeleteOperation)
       }
-    }.getOrElse(lit("I"))
+    }.getOrElse(lit(ext.nonDeleteOperation))
 
+    // COLLISION-SAFE source key (algorithm v1): SHA-256 over the canonical
+    // JSON of the ordered key struct. JSON field order = configured column
+    // order; ignoreNullFields=false keeps null distinct from empty string
+    // ("k":null vs "k":""); JSON string escaping makes delimiter characters
+    // inside values harmless (the legacy '|' concat collapsed
+    // ["A|B","C"] and ["A","B|C"], and null vs ""). Timestamps/decimals
+    // serialize through Spark's locale-independent JSON formatting.
     val presentKeys = ext.primaryKeyColumns.flatMap(actual)
+    val keyStruct = if (presentKeys.isEmpty) lit(null)
+      else to_json(struct(presentKeys.map(col): _*),
+        Map("ignoreNullFields" -> "false").asJava)
     val primaryKey =
       if (presentKeys.isEmpty) lit(null).cast("string")
-      else concat_ws("|", presentKeys.map(c => coalesce(col(c).cast("string"), lit(""))): _*)
+      else concat(lit(s"${RawMetadata.SourceKeyAlgorithmVersion}:"), sha2(keyStruct, 256))
 
-    val stamped = df
+    val stamped0 = df
       .withColumn("source_modified_ts", modified)
       .withColumn("source_operation", operation)
       .withColumn("source_primary_key", primaryKey)
+    val stamped =
+      if (ext.keyJson && presentKeys.nonEmpty)
+        stamped0.withColumn("source_primary_key_json", keyStruct)
+      else stamped0
 
     // Sources without physical files (JDBC, Kafka) historically stamped a
     // constant sha2("") as file_id — meaningless and easy to mistake for a

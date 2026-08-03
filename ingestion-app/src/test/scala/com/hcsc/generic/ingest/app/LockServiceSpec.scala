@@ -1,6 +1,6 @@
 package com.hcsc.generic.ingest.app
 
-import com.hcsc.generic.ingest.lock.{LockService, PipelineLockException}
+import com.hcsc.generic.ingest.lock.{JdbcRunLock, LockService, PipelineLockException, RunLock}
 import com.typesafe.config.ConfigFactory
 import java.nio.file.{Files, Path}
 import org.apache.log4j.Logger
@@ -151,5 +151,34 @@ class LockServiceSpec extends AnyFunSuite with BeforeAndAfterAll {
         ConfigFactory.parseString("""concurrency { settle_ms = 0 }"""), logger)
     }
     assert(e.getMessage.contains("PIPE_001"))
+  }
+
+  test("RunLock.fromConfig: HIVE is the default provider; JDBC selects JdbcRunLock; OFF disables") {
+    // Default provider (no concurrency.provider): the Hive LockService,
+    // resolved exactly as before via the audit database fallback.
+    val hive = RunLock.fromConfig(spark,
+      ConfigFactory.parseString("""audit { database = l_audit }"""), logger)
+    assert(hive.exists(_.isInstanceOf[LockService]))
+
+    val explicitHive = RunLock.fromConfig(spark,
+      ConfigFactory.parseString("""concurrency { provider = HIVE, database = l_audit }"""), logger)
+    assert(explicitHive.exists(_.isInstanceOf[LockService]))
+
+    // JDBC provider: built without opening a connection; default lease 240m.
+    val jdbc = RunLock.fromConfig(spark, ConfigFactory.parseString(
+      """concurrency { provider = JDBC, jdbc { url = "jdbc:h2:mem:runlock_wiring" } }"""), logger)
+    assert(jdbc.exists(_.isInstanceOf[JdbcRunLock]))
+    assert(jdbc.get.leaseMillis == 240L * 60000L)
+
+    // OFF wins over any provider.
+    val off = RunLock.fromConfig(spark, ConfigFactory.parseString(
+      """concurrency { lock = OFF, provider = JDBC }"""), logger)
+    assert(off.isEmpty)
+
+    val bad = intercept[IllegalArgumentException] {
+      RunLock.fromConfig(spark,
+        ConfigFactory.parseString("""concurrency { provider = ZOOKEEPER }"""), logger)
+    }
+    assert(bad.getMessage.contains("PIPE_001"))
   }
 }

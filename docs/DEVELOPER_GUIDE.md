@@ -114,7 +114,7 @@ Optional blocks add production hardening as you need it:
 | `idempotency` | SHA-256 file registry with a `SKIP \| REJECT \| REPROCESS_WITH_APPROVAL` duplicate policy |
 | `rejects` | Record-level rules routed to a reject table with count/percent thresholds |
 | `audit` | Control totals and reconciliation |
-| `lock` | Run-level entity locking |
+| `lock` | Run-level entity locking (`concurrency` block). Two providers: `HIVE` (default) is **best-effort** — claim/settle/re-read shrinks but does not close the race window; fine for dev/test or a single scheduler. `JDBC` (`concurrency { provider = JDBC, jdbc { url = ... } }`) is an **atomic** compare-and-set on a relational control table — use it in production. A daemon heartbeat renews the lease every `lease/3`; a run that loses ownership aborts with PIPE_001 before the curated publish and the watermark advance. |
 
 ---
 

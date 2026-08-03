@@ -302,8 +302,11 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       .collect().head
     assert(row.getString(0) != null && row.getString(0).startsWith("2026-01-01 09:00:00"),
       "source_modified_ts copies the designated watermark column")
-    assert(row.getString(1) == "I")
-    assert(row.getString(2) == "C001", "source_primary_key derives from merge keys")
+    assert(row.getString(1) == "UPSERT",
+      "timestamp polling cannot distinguish insert from update — the honest default is UPSERT " +
+        "(legacy 'I' via raw.source_operation_legacy_insert = true)")
+    assert(row.getString(2).startsWith("v1:") && row.getString(2).length == 67,
+      "source_primary_key is the versioned collision-safe hash over the merge keys")
     assert(row.getString(3) == null, "JDBC rows carry no constant file_id under extended lineage")
   }
 

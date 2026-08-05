@@ -1,24 +1,32 @@
--- SmartIQ_PDP CURATED — framework-compatible revision of the workbook DDL.
--- Changes vs the delivered curated_ddl.sql (verified 2026-08-04):
---  * file_name ADDED — it is the business key (2026-08 decision) and the
---    merge REQUIRES its keys in the target ('Merge keys missing from
---    target' otherwise). This also resolves the workbook's open item 1.
---  * record_hash ADDED (audit-tab recommendation): without it in the
---    TARGET, alignment drops the incoming hash and the no-change skip +
---    same-hash version advance silently never operate.
---  * src_form_guid/curated_load_ts REMOVED: the framework does not
---    populate foreign audit columns (they would be eternally NULL);
---    framework audit columns added instead.
---  * PARTITIONED BY load_dt REMOVED — twice over: this table is
---    latest-per-key (every update would move partitions, pure churn), and
---    the framework REJECTS a full-replace publish into a partitioned
---    Hive-format (STORED AS) table (CUR_006). Unpartitioned STORED AS
---    PARQUET is fully supported.
---  * last_modified_datetime stays STRING per the all-string contract —
---    the feed config declares freshness.compare_as = timestamp, so every
---    comparison is chronological while storage stays string.
+-- SmartIQ_PDP CURATED (v2, 2026-08-04) — framework-compatible.
+-- CONSUMER REQUEST: ALL 364 source columns now land in curated (was 357).
+-- The 7 columns the original business tab dropped — FileName, FormGuid,
+-- Form, UserEmailId, FirstName, LastName, Matrix — are carried; file_name
+-- is additionally the BUSINESS KEY of the merge.
+-- PRIVACY: UserEmailId/FirstName/LastName (submitter identity) now persist
+-- in curated. They are tagged sensitivity = PII in the schema contract so
+-- reject payloads mask them, but the curated TABLE itself holds them in the
+-- clear — confirm with Privacy and restrict table access accordingly.
+-- Other deltas vs the delivered curated_ddl.sql:
+--  * record_hash + framework audit columns ADDED (without record_hash in the
+--    TARGET the no-change skip and same-hash version advance never operate);
+--    src_form_guid/curated_load_ts REMOVED (the framework never populates
+--    foreign audit columns — they would stay NULL forever).
+--  * PARTITIONED BY load_dt REMOVED: CUR_006 rejects full-replace publishes
+--    into partitioned Hive-format tables, and a latest-per-key table would
+--    move rows between partitions on every update.
+--  * last_modified_datetime stays STRING per the all-string contract; the
+--    feed declares freshness.compare_as = timestamp so every comparison is
+--    chronological (unparseable values fail CUR_008, never lose silently).
 CREATE EXTERNAL TABLE IF NOT EXISTS ${DB}.curated_smartiq_pdp (
+  `file_name` STRING COMMENT 'src: FileName | BUSINESS KEY (2026-08 decision)',
+  `form_guid` STRING COMMENT 'src: FormGuid | added to curated 2026-08 (consumer: all columns)',
+  `form` STRING COMMENT 'src: Form | added to curated 2026-08 (consumer: all columns)',
   `last_modified_datetime` STRING COMMENT 'src: LastModifiedDatetime | canonical: LastModifiedDatetime',
+  `user_email_id` STRING COMMENT 'src: UserEmailId | added to curated 2026-08 (consumer: all columns)',
+  `first_name` STRING COMMENT 'src: FirstName | added to curated 2026-08 (consumer: all columns)',
+  `last_name` STRING COMMENT 'src: LastName | added to curated 2026-08 (consumer: all columns)',
+  `matrix` STRING COMMENT 'src: Matrix | added to curated 2026-08 (consumer: all columns)',
   `funding_type` STRING COMMENT 'src: FundingType | canonical: FundingType',
   `spending_account` STRING COMMENT 'src: SpendingAccount | canonical: HSAIndicator',
   `network` STRING COMMENT 'src: Network | canonical: Network',
@@ -375,8 +383,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS ${DB}.curated_smartiq_pdp (
   `ai_acc_info_non_erisa_designation` STRING COMMENT 'src: AI.AccInfo.NonErisaDesignation',
   `nspoi_keep_well` STRING COMMENT 'src: NSPOI.KeepWell',
   `nspoi_network_configuration` STRING COMMENT 'src: NSPOI.NetworkConfiguration | canonical: RetailNetwork',
-  `file_name` STRING COMMENT 'src: FileName | BUSINESS KEY (2026-08 decision)',
-  `record_hash` STRING COMMENT 'business-content hash: no-change skip + version advance',
+  `record_hash` STRING COMMENT 'business-content hash: no-change skip + same-hash version advance',
   `create_timestamp` TIMESTAMP COMMENT 'framework audit: first publish of this key',
   `last_modified_ts` TIMESTAMP COMMENT 'framework audit: last publishing run',
   `last_modified_op` STRING COMMENT 'framework audit: I/U/D'

@@ -33,3 +33,26 @@ column must exist in both DDLs, the identity columns must be PII-tagged,
 the merge key and freshness column must exist in the curated target,
 `record_hash` must be present, and the curated table must stay
 unpartitioned. The example cannot silently drift from the framework.
+
+## 2026-08-05 — real Hive database names + table-identity fix
+
+- Databases set to the actual targets: `membership_common_raw` and
+  `membership_common_curated` (both spellings confirmed as *membership*).
+- **Defect fixed:** the DDLs created `raw_smartiq_pdp` / `curated_smartiq_pdp`
+  while the feed config pointed at table `smartiq_pdp` — they would never
+  have matched, leaving the pre-created tables unused while the framework
+  silently created its own. Both DDLs now create `smartiq_pdp` (the zone
+  already lives in the database name, so the prefixes were redundant too).
+  `SmartIqMappingConfigTest` now asserts DDL table identity == feed config
+  `database.table`, so this cannot regress.
+- Storage decision recorded: **EXTERNAL, Parquet, non-ACID** for both zones.
+  Hive ACID is not viable here — Spark 3.5 cannot write Hive transactional
+  tables without the Hive Warehouse Connector, full-ACID requires ORC (these
+  are Parquet), and the framework issues no row-level DML for ACID to serve.
+  EXTERNAL also protects raw (the replay source) from an accidental DROP and
+  avoids the Hive 3 default where a plain CREATE TABLE is managed+transactional.
+  Accepted trade-off: readers can see a partial table during the curated
+  `INSERT OVERWRITE` swap. Real ACID/snapshot isolation is the Delta/Iceberg
+  decision (plan item #19), not Hive ACID.
+- `ingest_audit` (ledger, rejects, watermark store) left unchanged — confirm
+  whether it should also move under the membership_common_* naming.

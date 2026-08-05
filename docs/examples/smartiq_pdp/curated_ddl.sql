@@ -18,7 +18,7 @@
 --  * last_modified_datetime stays STRING per the all-string contract; the
 --    feed declares freshness.compare_as = timestamp so every comparison is
 --    chronological (unparseable values fail CUR_008, never lose silently).
-CREATE EXTERNAL TABLE IF NOT EXISTS ${DB}.curated_smartiq_pdp (
+CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_curated.smartiq_pdp (
   `file_name` STRING COMMENT 'src: FileName | BUSINESS KEY (2026-08 decision)',
   `form_guid` STRING COMMENT 'src: FormGuid | added to curated 2026-08 (consumer: all columns)',
   `form` STRING COMMENT 'src: Form | added to curated 2026-08 (consumer: all columns)',
@@ -389,4 +389,4 @@ CREATE EXTERNAL TABLE IF NOT EXISTS ${DB}.curated_smartiq_pdp (
   `last_modified_op` STRING COMMENT 'framework audit: I/U/D'
 )
 STORED AS PARQUET
-LOCATION '${LOCATION}/curated_smartiq_pdp';
+LOCATION '${LOCATION}/smartiq_pdp';

@@ -11,7 +11,7 @@
 --  * load_dt partition kept (matches raw.partitioning in the feed config).
 -- Alternative: skip this DDL entirely and let the framework create the
 -- table on first run, or set raw.metadata_columns = ALTER.
-CREATE EXTERNAL TABLE IF NOT EXISTS ${DB}.raw_smartiq_pdp (
+CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_raw.smartiq_pdp (
   `file_name` STRING COMMENT 'src: FileName',
   `form_guid` STRING COMMENT 'src: FormGuid',
   `form` STRING COMMENT 'src: Form',
@@ -395,4 +395,4 @@ CREATE EXTERNAL TABLE IF NOT EXISTS ${DB}.raw_smartiq_pdp (
 )
 PARTITIONED BY (`load_dt` STRING)
 STORED AS PARQUET
-LOCATION '${LOCATION}/raw_smartiq_pdp';
+LOCATION '${LOCATION}/smartiq_pdp';

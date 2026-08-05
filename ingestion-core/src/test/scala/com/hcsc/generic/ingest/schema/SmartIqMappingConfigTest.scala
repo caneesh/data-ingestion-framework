@@ -76,6 +76,25 @@ class SmartIqMappingConfigTest extends AnyFunSuite {
     assert((contractCols -- curatedDdl).isEmpty,
       s"columns missing from curated DDL: ${(contractCols -- curatedDdl).toSeq.sorted.take(10)}")
 
+    // The DDLs must create the EXACT tables the feed reads and writes —
+    // a prefixed DDL name (raw_smartiq_pdp) against a feed pointing at
+    // smartiq_pdp leaves the pre-created table unused and the framework
+    // silently creating its own.
+    def ddlTable(name: String): String = {
+      val f = new java.io.File(s"../docs/examples/smartiq_pdp/$name")
+      val src = scala.io.Source.fromFile(f)
+      try src.getLines()
+        .flatMap("(?i)CREATE\\s+EXTERNAL\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\S+)\\s*\\(".r
+          .findFirstMatchIn(_).map(_.group(1)))
+        .next() finally src.close()
+    }
+    assert(ddlTable("raw_ddl.sql") ==
+      s"${feed.getString("raw.database")}.${feed.getString("raw.table")}",
+      "raw DDL must create exactly the table the feed writes")
+    assert(ddlTable("curated_ddl.sql") ==
+      s"${feed.getString("curated.database")}.${feed.getString("curated.table")}",
+      "curated DDL must create exactly the table the feed publishes")
+
     // Merge keys and the freshness column must exist in the curated target,
     // else the merge fails at run time.
     assert(curatedDdl.contains("file_name") && curatedDdl.contains("last_modified_datetime"))

@@ -7,7 +7,7 @@ import com.hcsc.generic.ingest.kafka.KafkaSource
 import com.hcsc.generic.ingest.model.{Cli, CliParser}
 import com.hcsc.generic.ingest.pipeline.IngestPipeline
 import com.hcsc.generic.ingest.sink.HiveSink
-import com.typesafe.config.{Config, ConfigFactory}
+import com.typesafe.config.{Config, ConfigException, ConfigFactory, ConfigParseOptions}
 import org.apache.log4j.Logger
 import org.apache.spark.sql.SparkSession
 
@@ -21,18 +21,7 @@ object IngestMain {
 
     val cli = CliParser.parse(args)
 
-    val baseConf: Config = cli.confPath match {
-      // ABSOLUTE path deliberately: HOCON resolves `include` statements
-      // relative to the including file's PARENT directory, and a bare
-      // filename ("feed.conf" — the natural form in a YARN container where
-      // --files lands everything in the working directory) has a null
-      // parent. Includes then fall back to the classpath and fail with
-      // "include was not found". Absolutising guarantees a parent, so a
-      // split feed/schema config works regardless of how the path is
-      // written.
-      case Some(path) => ConfigFactory.parseFile(new File(path).getAbsoluteFile).resolve()
-      case None       => ConfigFactory.load().resolve()
-    }
+    val baseConf: Config = loadBaseConfig(cli.confPath)
 
     val feedConf = baseConf.getConfig(s"feeds.${cli.entity}")
 
@@ -79,6 +68,81 @@ object IngestMain {
       spark.stop()
     }
   }
+
+  /**
+    * Loads the base configuration, tolerating a BARE filename on either
+    * entry point.
+    *
+    * HOCON resolves `include` relative to the including file's PARENT
+    * directory. A bare filename — the natural form in a YARN container,
+    * where `--files` drops everything in the working directory — has a null
+    * parent (`new File("feed.conf").getParentFile == null`), so includes
+    * fall back to the classpath and the run dies with
+    * `ConfigException$IO: include was not found`.
+    *
+    * Both routes are absolutised: `--conf-path` directly, and the
+    * `config.file` system property that `ConfigFactory.load()` honours.
+    * Fixing only the former (as an earlier revision did) still left every
+    * `-Dconfig.file=<basename>` deployment broken.
+    *
+    * `allowMissing(false)` is deliberate: the default silently yields an
+    * EMPTY config for a mistyped path, and the operator then sees a
+    * confusing "No configuration setting found for key 'feeds'" instead of
+    * the actual problem, which is that the file was never shipped.
+    */
+  private[app] def loadBaseConfig(confPath: Option[String]): Config = confPath match {
+    case Some(path) =>
+      val file = new File(path).getAbsoluteFile
+      if (!file.isFile)
+        throw new IllegalArgumentException(
+          s"CFG_018: config file not found: '$path' (resolved to '$file'). " +
+            "In YARN cluster mode the file must be shipped with --files and " +
+            "referenced by its basename, e.g. --files /p/feed.conf --conf-path ./feed.conf")
+      logger.info(s"[Config] --conf-path='$path' resolved='$file' " +
+        s"includes resolve against '${file.getParent}'")
+      withIncludeDiagnostics(file.getParentFile) {
+        ConfigFactory.parseFile(file, ConfigParseOptions.defaults().setAllowMissing(false)).resolve()
+      }
+    case None =>
+      Option(System.getProperty("config.file")).map(_.trim).filter(_.nonEmpty).foreach { p =>
+        val absolute = new File(p).getAbsolutePath
+        if (absolute != p) {
+          System.setProperty("config.file", absolute)
+          ConfigFactory.invalidateCaches() // the property is read at load()
+        }
+      }
+      val effective = Option(System.getProperty("config.file")).map(new File(_))
+      logger.info(s"[Config] -Dconfig.file=${effective.map(_.toString).getOrElse("<unset>")} " +
+        s"cwd='${workingDir.getAbsolutePath}'")
+      withIncludeDiagnostics(effective.map(_.getParentFile).getOrElse(workingDir)) {
+        ConfigFactory.load().resolve()
+      }
+  }
+
+  private def workingDir: File = new File("").getAbsoluteFile
+
+  /**
+    * A failed `include` reports the missing NAME but never the directory it
+    * searched, which makes the single most common deployment error — the
+    * included schema file not shipped alongside the feed — near-undebuggable
+    * from a YARN log. Restate it with the search directory and what is
+    * actually there. Filenames only: no file contents are read, so nothing
+    * secret can reach the log.
+    */
+  private def withIncludeDiagnostics[T](searchDir: File)(load: => T): T =
+    try load
+    catch {
+      case e: ConfigException.IO =>
+        val present = Option(searchDir).flatMap(d => Option(d.list())) match {
+          case Some(names) if names.nonEmpty => names.sorted.mkString(", ")
+          case Some(_)                       => "<empty directory>"
+          case None                          => "<directory unreadable>"
+        }
+        throw new ConfigException.IO(e.origin(),
+          s"${e.getMessage} | searched directory '${Option(searchDir).map(_.getPath).getOrElse("<none>")}' " +
+            s"which contains: [$present]. An included file must be shipped too, e.g. " +
+            "--files /p/feed.conf,/p/feed-schema.conf", e)
+    }
 
   private def runRetention(spark: SparkSession, feedConf: Config, cli: Cli): Unit = {
     import com.hcsc.generic.ingest.runtime.{RunContext, StageStatus}

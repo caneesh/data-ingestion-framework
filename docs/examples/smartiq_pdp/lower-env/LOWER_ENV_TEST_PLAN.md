@@ -109,9 +109,11 @@ spark-submit --class com.hcsc.generic.ingest.app.IngestMain \
   --conf-path ./feed-smartiq-pdp-e2e.conf
 ```
 
-**Both files must be in `--files`** (the feed `include`s the schema), and
-the config is handed over with **`--conf-path`**, not `-Dconfig.file` — see
-the troubleshooting entry below for why.
+**Both files must be in `--files`** (the feed `include`s the schema) — this
+is the one part no code fix can cover, because a file that was never
+shipped cannot be found. The config is handed over with **`--conf-path`**;
+`-Dconfig.file` also works now but reports missing files less clearly. See
+the troubleshooting entry below.
 
 Explicit `--run-id` values matter: scenario 7 replays one by id. Use
 `--deploy-mode client` for the first attempt if executor connectivity is
@@ -203,15 +205,32 @@ including file. A **bare filename** — the natural form in a YARN container,
 where `--files` drops everything in the working directory — has no parent,
 so the include falls back to the classpath and is not found.
 
-Three things to check, in order:
-1. Is the schema file in `--files`? Both the feed and the schema must be
-   shipped; only the feed being present is the most common cause.
-2. Are you passing `--conf-path ./feed-...conf` rather than
-   `-Dconfig.file=feed-...conf`? The framework absolutises the
-   `--conf-path` value, which restores the parent directory and makes the
-   include resolve.
-3. Running an older jar? The absolutising fix landed 2026-08-06; before it,
-   a bare `-Dconfig.file` name could not resolve includes at all.
+From 2026-08-06 the framework absolutises the config path on **both**
+entry points (`--conf-path` and `-Dconfig.file`), so the bare-name case
+resolves by itself, and a failed include now reports the directory it
+searched and what is in it:
+
+```
+include was not found: 'smartiq-pdp-e2e-schema.conf' | searched directory
+'/data/.../container_.../' which contains: [feed-smartiq-pdp-e2e.conf,
+__spark_conf__, ...]. An included file must be shipped too, e.g.
+--files /p/feed.conf,/p/feed-schema.conf
+```
+
+Read that bracket list first — it answers the question directly. Then, in
+order:
+1. **Is the schema file in the list?** If only the feed is there it was
+   never shipped: add it to `--files` (comma-separated, no spaces). This is
+   the most common cause and the one the fix cannot repair.
+2. **Are you running a jar built before 2026-08-06?** An earlier revision
+   absolutised only the `--conf-path` value, so `-Dconfig.file=<basename>`
+   still failed, and the revision before that failed on both. `unzip -p
+   <jar> META-INF/MANIFEST.MF` or compare the jar's timestamp against your
+   last `mvn install`. Rebuild and re-upload before debugging anything else.
+3. **Does the driver log line appear?** The run now logs
+   `[Config] --conf-path='...' resolved='...' includes resolve against
+   '<dir>'` before parsing. If that line is absent from the driver log, the
+   jar is stale — see 2.
 
 A stack ending in `cleanupStagingDir` with *"Operation category READ is not
 supported in state standby"* is a **secondary** error from the shutdown

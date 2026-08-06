@@ -110,6 +110,7 @@ feeds.claims {
 | CFG_015 | invalid `curated.pending.on_failure` or negative `max_batches` |
 | CFG_016 | `ingestion.execution = DECOUPLED` without `watermark.advance_after = RAW` (incremental sources) or without the run ledger; DECOUPLED feed invoked with `--stage all` |
 | CFG_017 | `freshness.compare_as` not a valid Spark type; `compare_as` and `compare_format` both declared; unparseable `tie_breakers` / `dedup.order_by` ordering syntax |
+| CFG_018 | `--conf-path` names a file that does not exist (typically: not shipped with `--files`) |
 
 ## Logical comparison types
 

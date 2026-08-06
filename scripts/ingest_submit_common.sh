@@ -14,9 +14,11 @@
 #   INGEST_EXTRA_FILES=/path/smartiq-pdp-schema.conf \
 #     scripts/run_ingest.sh /path/feed-smartiq-pdp.conf smartiq_pdp INCR
 #
-# The config is handed to the app with --conf-path (not -Dconfig.file) so
-# the framework parses it as a file and resolves the include relative to
-# the container working directory, which is where --files lands them.
+# The config is handed to the app with --conf-path so the framework parses
+# it as a file and resolves the include relative to the container working
+# directory, which is where --files lands them. (-Dconfig.file is also
+# absolutised by the app as of 2026-08-06, but --conf-path is preferred:
+# it is explicit and reports a missing file as CFG_018.)
 set -euo pipefail
 
 submit_ingest() {

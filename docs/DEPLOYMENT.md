@@ -67,7 +67,34 @@ Enforced at parse time: `--entity` required; `--mode` ∈ {FULL, INCR};
 
 ---
 
-## 4. spark-submit examples
+## 4. Where the configuration lives
+
+The `.conf` files are **operational configuration, not application code**.
+They are not baked into the jar, so a feed can change without a rebuild.
+
+| Location | What goes there | Who owns it |
+|---|---|---|
+| An edge/gateway node directory, e.g. `/etc/ingest/<feed>/` | the feed `.conf` and any `include`d schema `.conf` | platform/ops, under change control |
+| Git (this repo, `docs/examples/<feed>/`) | the reviewed template the deployed copy is derived from | the feed's developer |
+| The YARN container working directory | a per-run COPY, placed there by `--files` | nobody — it is recreated every run and discarded |
+| Environment variables at submit time | host, database, table, and **all** credentials | the scheduler (Control-M) / secret store |
+
+Rules that follow from this split:
+
+- **Never put a credential in the `.conf`.** Passwords come from a secret
+  provider (`env`, CyberArk, Key Vault, Conjur) resolved at run time.
+- **Never point `--conf-path` at an HDFS path or a submit-side absolute
+  path in cluster mode.** The driver runs in a container that has neither.
+  Ship with `--files` and reference the basename (`./feed.conf`).
+- **Ship every included file.** `--files feed.conf,feed-schema.conf` — the
+  include resolves against the directory holding the feed config, which in
+  a container is where `--files` landed both.
+- Keep the deployed copy and the repo template in sync deliberately; the
+  repo copy is the reviewable artifact, the deployed copy is what runs.
+
+---
+
+## 5. spark-submit examples
 
 The reference invocation is `scripts/run_health_sherpa.sh`:
 
@@ -98,11 +125,16 @@ Notes on the pattern:
   resolves an include relative to the including file's directory, so the
   included file has to sit beside the feed config in the container working
   directory — which is exactly where `--files` puts it.
-- `-Dconfig.file=<basename>` also works for a **single self-contained**
-  config, but not for split configs: a bare filename has no parent
-  directory, so the include cannot be resolved and the run dies with
-  `ConfigException$IO: include was not found`. `--conf-path` is
-  absolutised by the framework and has no such limitation — prefer it.
+- `-Dconfig.file=<basename>` is also supported, including for split
+  configs — the framework absolutises it before Typesafe Config reads it.
+  Prefer `--conf-path` anyway: it is explicit, it fails with a named error
+  (CFG_018) when the file was not shipped, and it does not depend on
+  driver JVM options reaching the container. **A jar built before
+  2026-08-06 cannot resolve includes from a bare `-Dconfig.file` name.**
+- A **missing config file** is a hard error (CFG_018), not a silent
+  empty config; a **missing include** names the directory searched and
+  lists what is in it. Both are driver-side and happen before Spark work
+  begins, so they cost seconds, not a full run.
 - `spark.yarn.maxAppAttempts=1` is deliberate: the pipeline is restart-safe by
   design (see the runbook), but a blind YARN re-attempt can race a
   half-finished run. Prefer an explicit `--resume --run-id` re-run.
@@ -123,7 +155,7 @@ spark-submit --class com.hcsc.generic.ingest.app.IngestMain --master yarn \
 
 ---
 
-## 5. JDBC driver deployment (driver AND executors)
+## 6. JDBC driver deployment (driver AND executors)
 
 The JDBC driver class is loaded reflectively on the **driver** (health check /
 metadata / watermark capture, `health/JdbcHealthCheck.scala` →
@@ -157,7 +189,7 @@ Default driver class per dialect (`dialect/JdbcDialect.scala`):
 
 ---
 
-## 6. Azure SQL: firewall (driver vs. executor egress) and encryption
+## 7. Azure SQL: firewall (driver vs. executor egress) and encryption
 
 - **Firewall / egress:** the driver health check proves only the **driver's**
   network path to the database. Executors open their own connections during
@@ -184,7 +216,7 @@ Default driver class per dialect (`dialect/JdbcDialect.scala`):
 
 ---
 
-## 7. Secret provider deployment
+## 8. Secret provider deployment
 
 Credentials resolve through the `SecretProvider` abstraction
 (`auth/SecretProvider.scala`, `auth/CyberArkSecretProvider.scala`). Referenced
@@ -231,17 +263,17 @@ for the registration contract.
 
 ---
 
-## 8. Pre-production validation checklist
+## 9. Pre-production validation checklist
 
 Before the first production run in a new environment, verify:
 
 - Hive metastore connectivity (audit, watermark, registry, staging tables).
 - HDFS paths and permissions for the feed's `source.folders`
   (landing/inprogress/processed/quarantine/archive) and RAW/curated warehouse.
-- JDBC driver present on **driver and executors** (§5); run a
+- JDBC driver present on **driver and executors** (§6); run a
   `--validate-only` or a small `--dry-run` first.
-- Executor egress to the source database / Azure SQL firewall (§6).
-- Secret provider resolves on the hosts that need it (§7).
+- Executor egress to the source database / Azure SQL firewall (§7).
+- Secret provider resolves on the hosts that need it (§8).
 - Kafka client compatibility for Kafka feeds.
 
 Metrics counters accumulate in-process via `JdbcMetrics`

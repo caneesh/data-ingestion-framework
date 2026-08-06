@@ -404,10 +404,24 @@ HOCON resolves the include relative to the including file's directory:
 ```
 
 Only the driver reads the feed config, so no executor option is required.
-`-Dconfig.file=<basename>` works for a single self-contained file but
-*cannot* resolve includes (a bare filename has no parent directory) — the
-run fails with `ConfigException$IO: include was not found`. Prefer
-`--conf-path`, which the framework absolutises.
+
+`IngestMain.loadBaseConfig` absolutises the config path on **both** entry
+points — the `--conf-path` value and the `config.file` system property —
+because HOCON resolves an include relative to the including file's parent
+directory, and a bare filename has none (`new File("feed.conf")
+.getParentFile == null`). Without that, the include falls through to the
+classpath and the run dies with `ConfigException$IO: include was not
+found`. `ConfigLoadIncludeSpec` pins both routes plus the bare, `./`, and
+absolute spellings; the fix originally covered only `--conf-path`, which
+left every `-Dconfig.file=<basename>` deployment broken, so keep both
+branches covered when touching this.
+
+Two related failure modes are made loud there as well: a `--conf-path`
+naming a nonexistent file raises **CFG_018** rather than yielding an empty
+config (Typesafe Config's `allowMissing` default) and a confusing
+downstream `No configuration setting found for key 'feeds'`; and a failed
+include is re-thrown with the directory searched and a listing of its
+filenames, since the stock message names only what was missing.
 
 ### CLI reference
 

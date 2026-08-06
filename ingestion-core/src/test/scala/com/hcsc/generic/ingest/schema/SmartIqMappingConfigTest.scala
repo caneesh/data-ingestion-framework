@@ -110,4 +110,55 @@ class SmartIqMappingConfigTest extends AnyFunSuite {
     assert(!curatedStmt.contains("PARTITIONED BY"),
       "the latest-per-key curated table must be unpartitioned")
   }
+
+  test("lower-env E2E feed is a faithful subset of the production contract") {
+    val e2eFile = new java.io.File(
+      "../docs/examples/smartiq_pdp/lower-env/feed-smartiq-pdp-e2e.conf")
+    assume(e2eFile.exists() && feedFile.exists(), "docs tree not present")
+    val e2e = ConfigFactory.parseFile(e2eFile).resolve().getConfig("feeds.smartiq_pdp_e2e")
+    val prod = ConfigFactory.parseFile(feedFile).resolve().getConfig("feeds.smartiq_pdp")
+
+    val sub = SchemaContract.parse(e2e).getOrElse(fail("e2e contract must parse"))
+    val full = SchemaContract.parse(prod).getOrElse(fail("prod contract must parse"))
+    assert(sub.columns.size == 11, s"expected the 11-column subset, got ${sub.columns.size}")
+
+    // SUBSET, not variant: every e2e column must match the production
+    // contract's definition exactly (name, type, aliases, transform, PII).
+    sub.columns.foreach { c =>
+      val p = full.column(c.name).getOrElse(fail(s"${c.name} is not in the production contract"))
+      assert(c.dataType == p.dataType, s"${c.name}: type drifted from production")
+      assert(c.aliases == p.aliases, s"${c.name}: aliases drifted from production")
+      assert(c.transform == p.transform, s"${c.name}: transform drifted from production")
+      assert(c.sensitivity == p.sensitivity, s"${c.name}: sensitivity drifted from production")
+    }
+
+    // The mechanisms the subset exists to exercise
+    assert(sub.businessKeyColumns == Seq("file_name"))
+    assert(sub.incrementalColumns == Seq("last_modified_datetime"))
+    assert(sub.sensitiveColumns.map(_.toLowerCase).contains("user_email_id"),
+      "the PII column must stay tagged or the masking scenario proves nothing")
+    Seq("group_number", "ai_groupand_ba_numbers_section_number").foreach(c =>
+      assert(sub.column(c).isDefined, s"$c is needed for the composite-key scenario"))
+
+    // Isolation from production, and DDL/table agreement
+    assert(e2e.getString("entity") == "smartiq_pdp_e2e")
+    assert(e2e.getString("raw.table") != prod.getString("raw.table"),
+      "the test feed must not write the production raw table")
+    assert(e2e.getString("curated.table") != prod.getString("curated.table"),
+      "the test feed must not publish over the production curated table")
+
+    def ddlCols(name: String): Set[String] = {
+      val src = scala.io.Source.fromFile(
+        new java.io.File(s"../docs/examples/smartiq_pdp/lower-env/$name"))
+      try src.getLines().flatMap("^\\s*`([^`]+)`".r.findFirstMatchIn(_).map(_.group(1))).toSet
+      finally src.close()
+    }
+    val names = sub.columns.map(_.name).toSet
+    assert((names -- ddlCols("raw_ddl_e2e.sql")).isEmpty)
+    assert((names -- ddlCols("curated_ddl_e2e.sql")).isEmpty)
+    assert(ddlCols("curated_ddl_e2e.sql").contains("record_hash"))
+
+    assert(FeedCompatibilityValidator.validate(e2e).isEmpty,
+      s"e2e feed must pass CFG validation: ${FeedCompatibilityValidator.validate(e2e).mkString("; ")}")
+  }
 }

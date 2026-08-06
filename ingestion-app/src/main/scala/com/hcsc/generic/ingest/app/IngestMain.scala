@@ -22,7 +22,15 @@ object IngestMain {
     val cli = CliParser.parse(args)
 
     val baseConf: Config = cli.confPath match {
-      case Some(path) => ConfigFactory.parseFile(new File(path)).resolve()
+      // ABSOLUTE path deliberately: HOCON resolves `include` statements
+      // relative to the including file's PARENT directory, and a bare
+      // filename ("feed.conf" — the natural form in a YARN container where
+      // --files lands everything in the working directory) has a null
+      // parent. Includes then fall back to the classpath and fail with
+      // "include was not found". Absolutising guarantees a parent, so a
+      // split feed/schema config works regardless of how the path is
+      // written.
+      case Some(path) => ConfigFactory.parseFile(new File(path).getAbsoluteFile).resolve()
       case None       => ConfigFactory.load().resolve()
     }
 

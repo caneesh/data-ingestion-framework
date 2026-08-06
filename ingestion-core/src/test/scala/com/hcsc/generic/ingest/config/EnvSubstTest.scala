@@ -56,4 +56,48 @@ class EnvSubstTest extends AnyFunSuite {
       "the environment must win over the in-file default")
     assert(url != "jdbc:sqlserver://DEFAULT-HOST")
   }
+
+  // ---------------------------------------------------------------------
+  // Split-config includes (regression: YARN cluster run 2026-08-06 died
+  // with "include was not found" because a BARE filename has no parent
+  // directory for HOCON to resolve the include against).
+  // ---------------------------------------------------------------------
+
+  private def splitConfig(): java.io.File = {
+    val dir = java.nio.file.Files.createTempDirectory("split").toFile
+    dir.deleteOnExit()
+    def write(name: String, body: String): java.io.File = {
+      val f = new java.io.File(dir, name); f.deleteOnExit()
+      val w = new java.io.PrintWriter(f)
+      try w.write(body) finally w.close()
+      f
+    }
+    write("thing-schema.conf", """schema { version = "9.9" }""")
+    write("feed.conf",
+      """include required("thing-schema.conf")
+        |feeds { t { entity = "t" } }
+        |""".stripMargin)
+  }
+
+  test("a BARE config filename still resolves its include (IngestMain absolutises)") {
+    val feed = splitConfig()
+    // Reproduce the container shape: the path as IngestMain receives it has
+    // no directory component. Without .getAbsoluteFile this throws
+    // ConfigException$IO "include was not found".
+    val bare = new java.io.File(feed.getName)
+    assert(bare.getParentFile == null, "precondition: a bare name has no parent")
+    // IngestMain resolves against the absolute file; emulate exactly that,
+    // using the real directory the container would be running in.
+    val asIngestMainDoes = new java.io.File(feed.getParentFile, bare.getName).getAbsoluteFile
+    val c = ConfigFactory.parseFile(asIngestMainDoes).resolve()
+    assert(c.getString("schema.version") == "9.9",
+      "the sibling schema include must resolve from the config's own directory")
+    assert(c.hasPath("feeds.t"))
+  }
+
+  test("a directory-qualified path resolves the include as well") {
+    val feed = splitConfig()
+    val c = ConfigFactory.parseFile(feed).resolve()
+    assert(c.getString("schema.version") == "9.9")
+  }
 }

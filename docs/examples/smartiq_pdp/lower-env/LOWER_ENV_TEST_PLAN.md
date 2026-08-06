@@ -104,10 +104,14 @@ Conjur instead — swap the `password` provider block; the rest is unchanged.
 spark-submit --class com.hcsc.generic.ingest.app.IngestMain \
   --name ingest-smartiq_pdp_e2e --master yarn --deploy-mode cluster \
   --files feed-smartiq-pdp-e2e.conf,smartiq-pdp-e2e-schema.conf \
-  --driver-java-options "-Dconfig.file=feed-smartiq-pdp-e2e.conf" \
   ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar \
-  --entity smartiq_pdp_e2e --mode INCR --run-id e2e-1
+  --entity smartiq_pdp_e2e --mode INCR --run-id e2e-1 \
+  --conf-path ./feed-smartiq-pdp-e2e.conf
 ```
+
+**Both files must be in `--files`** (the feed `include`s the schema), and
+the config is handed over with **`--conf-path`**, not `-Dconfig.file` — see
+the troubleshooting entry below for why.
 
 Explicit `--run-id` values matter: scenario 7 replays one by id. Use
 `--deploy-mode client` for the first attempt if executor connectivity is
@@ -187,6 +191,34 @@ at a fresh table, clear the watermark row for the entity, and load the two
 rows in section 6 of the seed script. They share `GRP700` but differ by
 section — expect **two** curated rows. A single-column or prefix-only match
 would collapse them into one.
+
+## Troubleshooting
+
+**`include was not found: 'smartiq-pdp-e2e-schema.conf'`** (job dies with
+YARN exit code 13, `ApplicationMaster: User class threw exception ...
+ConfigException$IO`)
+
+HOCON resolves `include` relative to the *parent directory* of the
+including file. A **bare filename** — the natural form in a YARN container,
+where `--files` drops everything in the working directory — has no parent,
+so the include falls back to the classpath and is not found.
+
+Three things to check, in order:
+1. Is the schema file in `--files`? Both the feed and the schema must be
+   shipped; only the feed being present is the most common cause.
+2. Are you passing `--conf-path ./feed-...conf` rather than
+   `-Dconfig.file=feed-...conf`? The framework absolutises the
+   `--conf-path` value, which restores the parent directory and makes the
+   include resolve.
+3. Running an older jar? The absolutising fix landed 2026-08-06; before it,
+   a bare `-Dconfig.file` name could not resolve includes at all.
+
+A stack ending in `cleanupStagingDir` with *"Operation category READ is not
+supported in state standby"* is a **secondary** error from the shutdown
+hook against a standby HDFS NameNode — it hides the real failure above it.
+Always read the first `ERROR ApplicationMaster: User class threw exception`
+line, not the tail. Pull the whole log with
+`yarn logs -applicationId <appId>`.
 
 ## Notes and honest limits
 

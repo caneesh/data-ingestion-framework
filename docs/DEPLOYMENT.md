@@ -82,19 +82,27 @@ spark-submit \
   --conf spark.yarn.maxAppAttempts=1 \
   --conf spark.sql.shuffle.partitions=200 \
   --files "$CONF_FILE" \
-  --driver-java-options "-Dconfig.file=$(basename "$CONF_FILE")" \
-  --conf "spark.executor.extraJavaOptions=-Dconfig.file=$(basename "$CONF_FILE")" \
   ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar \
   --entity health_sherpa_member \
-  --mode FULL
+  --mode FULL \
+  --conf-path "./$(basename "$CONF_FILE")"
 ```
 
 Notes on the pattern:
 
-- The HOCON config is shipped with `--files "$CONF_FILE"` and located on both
-  driver and executors via `-Dconfig.file=<basename>` in both
-  `--driver-java-options` and `spark.executor.extraJavaOptions`. Keep both in
-  sync, or pass `--conf-path` explicitly instead.
+- The HOCON config is shipped with `--files "$CONF_FILE"` and located with
+  **`--conf-path`**. Only the DRIVER reads the feed config, so no executor
+  option is needed.
+- **Split configs** (a feed using `include required("<name>-schema.conf")`)
+  must ship *every* file: `--files "$CONF_FILE,$SCHEMA_FILE"`. HOCON
+  resolves an include relative to the including file's directory, so the
+  included file has to sit beside the feed config in the container working
+  directory — which is exactly where `--files` puts it.
+- `-Dconfig.file=<basename>` also works for a **single self-contained**
+  config, but not for split configs: a bare filename has no parent
+  directory, so the include cannot be resolved and the run dies with
+  `ConfigException$IO: include was not found`. `--conf-path` is
+  absolutised by the framework and has no such limitation — prefer it.
 - `spark.yarn.maxAppAttempts=1` is deliberate: the pipeline is restart-safe by
   design (see the runbook), but a blind YARN re-attempt can race a
   half-finished run. Prefer an explicit `--resume --run-id` re-run.
@@ -108,10 +116,9 @@ spark-submit --class com.hcsc.generic.ingest.app.IngestMain --master yarn \
   --deploy-mode cluster \
   --jars /opt/jdbc/mssql-jdbc-<ver>.jar \
   --files /etc/ingest/application.conf \
-  --driver-java-options "-Dconfig.file=application.conf" \
-  --conf "spark.executor.extraJavaOptions=-Dconfig.file=application.conf" \
   ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar \
-  --entity my_jdbc_feed --mode INCR --run-id 2026-07-26T00
+  --entity my_jdbc_feed --mode INCR --run-id 2026-07-26T00 \
+  --conf-path ./application.conf
 ```
 
 ---

@@ -360,9 +360,8 @@ spark-submit \
   --master 'local[*]' \
   --conf spark.sql.catalogImplementation=hive \
   --conf spark.sql.warehouse.dir=/tmp/local-warehouse \
-  --driver-java-options "-Dconfig.file=local.conf" \
   ingestion-app/target/ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar \
-  --entity my_feed --mode FULL
+  --entity my_feed --mode FULL --conf-path ./local.conf
 ```
 
 > **Local container TLS:** the throwaway container presents a self-signed
@@ -374,9 +373,10 @@ spark-submit \
 
 ## Step 8 — Submit to the cluster
 
-The reference invocation is `scripts/run_health_sherpa.sh`. The config file
-ships alongside the job via `--files` and is selected with `-Dconfig.file`;
-JDBC drivers ride in on `--jars`:
+The reference invocation is `scripts/run_health_sherpa.sh` (which delegates
+to `scripts/ingest_submit_common.sh`). The config ships alongside the job
+via `--files` and is selected with `--conf-path`; JDBC drivers ride in on
+`--jars`:
 
 ```bash
 spark-submit \
@@ -388,11 +388,26 @@ spark-submit \
   --conf spark.yarn.maxAppAttempts=1 \
   --jars /opt/jdbc/mssql-jdbc-<ver>.jar \
   --files /etc/ingest/application.conf \
-  --driver-java-options "-Dconfig.file=application.conf" \
-  --conf "spark.executor.extraJavaOptions=-Dconfig.file=application.conf" \
   ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar \
-  --entity claims_feed --mode INCR --run-id 2026-07-26T00
+  --entity claims_feed --mode INCR --run-id 2026-07-26T00 \
+  --conf-path ./application.conf
 ```
+
+**Split feed/schema configs** — a feed using
+`include required("<name>-schema.conf")` must ship *both* files, because
+HOCON resolves the include relative to the including file's directory:
+
+```bash
+  --files /etc/ingest/feed-claims.conf,/etc/ingest/claims-schema.conf \
+  ...
+  --conf-path ./feed-claims.conf
+```
+
+Only the driver reads the feed config, so no executor option is required.
+`-Dconfig.file=<basename>` works for a single self-contained file but
+*cannot* resolve includes (a bare filename has no parent directory) — the
+run fails with `ConfigException$IO: include was not found`. Prefer
+`--conf-path`, which the framework absolutises.
 
 ### CLI reference
 

@@ -1,6 +1,11 @@
 -- SmartIQ_PDP E2E RAW (lower environment) — 11 source columns + framework
 -- metadata. All-string per the mapping contract; the framework writes the
 -- typed values it reads from JDBC into these string columns unchanged.
+-- ORC + EXTERNAL is deliberate: in Hive 3 a MANAGED ORC table is
+-- created transactional (ACID) by DEFAULT, and Spark 3.5 cannot write
+-- Hive ACID tables without the Hive Warehouse Connector. Dropping the
+-- EXTERNAL keyword here would break the pipeline, not just change
+-- ownership semantics.
 CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_raw.smartiq_pdp_e2e (
   `file_name` STRING COMMENT 'src: FileName | business key',
   `last_modified_datetime` STRING COMMENT 'src: LastModifiedDatetime | freshness + watermark (datetime)',
@@ -31,5 +36,5 @@ CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_raw.smartiq_pdp_e2e (
   `source_primary_key` STRING COMMENT 'framework metadata (RawMetadata)'
 )
 PARTITIONED BY (`load_dt` STRING)
-STORED AS PARQUET
+STORED AS ORC
 LOCATION '${LOCATION}/smartiq_pdp_e2e';

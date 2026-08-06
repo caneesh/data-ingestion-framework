@@ -39,11 +39,14 @@ production except the databases themselves.
 1. **Source:** run section 0 of `source_test_data.sql` against the lower
    SQL Server to create `dbo.SmartIQ_PDP_E2E`.
 2. **Hive:** run `raw_ddl_e2e.sql` and `curated_ddl_e2e.sql`, substituting
-   `${LOCATION}`. (Optional — the framework creates the tables itself if
+   `${LOCATION}`. Both are **ORC, EXTERNAL** — keep the `EXTERNAL` keyword:
+   in Hive 3 a *managed* ORC table is created transactional (ACID) by
+   default, and Spark 3.5 cannot write Hive ACID tables without the Hive
+   Warehouse Connector. (Optional — the framework creates the tables itself if
    absent; pre-creating validates that your DDL and the framework agree.)
 3. **Config:** copy `feed-smartiq-pdp-e2e.conf` + `smartiq-pdp-e2e-schema.conf`
-   side by side (the feed `include`s the schema by relative name), set
-   `SQLHOST-LOWER` and export `SMARTIQ_DB_PASSWORD`.
+   side by side (the feed `include`s the schema by relative name), then
+   supply the connection details — see below.
 4. **Dry run first:**
    `--entity smartiq_pdp_e2e --validate-only` — config, contract and
    connectivity, no reads or writes.
@@ -51,6 +54,49 @@ production except the databases themselves.
 The feed has `executor_probe = true`: every run proves **executors** can
 reach SQL Server before extraction begins, which is the half a firewall
 test from the edge node cannot cover.
+
+## Where the MS SQL connection details go
+
+All of them live in the `sqlserver { }` block at the top of
+`feed-smartiq-pdp-e2e.conf`. Each key carries a lower-environment default
+and an optional environment override, so the same file serves both
+environments:
+
+| Setting | Config key | Environment override |
+|---|---|---|
+| Host | `sqlserver.host` | `SMARTIQ_HOST` |
+| Port | `sqlserver.port` | `SMARTIQ_PORT` |
+| Database | `sqlserver.database` | `SMARTIQ_DB` |
+| Schema + table | `sqlserver.table` | `SMARTIQ_TABLE` |
+| Service account | `sqlserver.user` | `SMARTIQ_USER` |
+| Password | — (never in the file) | `SMARTIQ_DB_PASSWORD` |
+
+The `source` block composes them into the JDBC URL, so you never edit the
+URL by hand:
+
+```hocon
+url = "jdbc:sqlserver://"${sqlserver.host}":"${sqlserver.port}";databaseName="${sqlserver.database}
+```
+
+Either edit the defaults in the file, or leave them and export:
+
+```bash
+export SMARTIQ_HOST=lower-sql-01.corp.example.com
+export SMARTIQ_DB=SmartIQ
+export SMARTIQ_TABLE=dbo.SmartIQ_PDP_E2E
+export SMARTIQ_DB_PASSWORD='...'
+```
+
+**Gotcha (verified, not assumed):** on the `--conf-path` route the
+framework resolves substitutions against **environment variables only** —
+`-D` system properties are *not* consulted there. Use `export`, not
+`--conf spark.driver.extraJavaOptions=-Dsmartiq.host=...`. The password is
+never read from the config file at all: it is fetched at run time through
+the `env` secret provider, so it never lands in source control or in a
+logged config dump.
+
+For extra hardening the password can come from CyberArk, Azure Key Vault or
+Conjur instead — swap the `password` provider block; the rest is unchanged.
 
 ## Run command
 

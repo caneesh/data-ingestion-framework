@@ -1,5 +1,10 @@
 -- SmartIQ_PDP E2E CURATED (lower environment) — same 11 columns +
 -- record_hash + framework audit columns. Unpartitioned: latest-per-key.
+-- ORC + EXTERNAL is deliberate: in Hive 3 a MANAGED ORC table is
+-- created transactional (ACID) by DEFAULT, and Spark 3.5 cannot write
+-- Hive ACID tables without the Hive Warehouse Connector. Dropping the
+-- EXTERNAL keyword here would break the pipeline, not just change
+-- ownership semantics.
 CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_curated.smartiq_pdp_e2e (
   `file_name` STRING COMMENT 'src: FileName | business key',
   `last_modified_datetime` STRING COMMENT 'src: LastModifiedDatetime | freshness + watermark (datetime)',
@@ -17,5 +22,5 @@ CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_curated.smartiq_pdp_e2e (
   `last_modified_ts` TIMESTAMP COMMENT 'framework audit: last publishing run',
   `last_modified_op` STRING COMMENT 'framework audit: I/U/D'
 )
-STORED AS PARQUET
+STORED AS ORC
 LOCATION '${LOCATION}/smartiq_pdp_e2e';

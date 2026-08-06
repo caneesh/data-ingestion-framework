@@ -18,6 +18,11 @@
 --  * last_modified_datetime stays STRING per the all-string contract; the
 --    feed declares freshness.compare_as = timestamp so every comparison is
 --    chronological (unparseable values fail CUR_008, never lose silently).
+-- ORC + EXTERNAL is deliberate: in Hive 3 a MANAGED ORC table is
+-- created transactional (ACID) by DEFAULT, and Spark 3.5 cannot write
+-- Hive ACID tables without the Hive Warehouse Connector. Dropping the
+-- EXTERNAL keyword here would break the pipeline, not just change
+-- ownership semantics.
 CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_curated.smartiq_pdp (
   `file_name` STRING COMMENT 'src: FileName | BUSINESS KEY (2026-08 decision)',
   `form_guid` STRING COMMENT 'src: FormGuid | added to curated 2026-08 (consumer: all columns)',
@@ -388,5 +393,5 @@ CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_curated.smartiq_pdp (
   `last_modified_ts` TIMESTAMP COMMENT 'framework audit: last publishing run',
   `last_modified_op` STRING COMMENT 'framework audit: I/U/D'
 )
-STORED AS PARQUET
+STORED AS ORC
 LOCATION '${LOCATION}/smartiq_pdp';

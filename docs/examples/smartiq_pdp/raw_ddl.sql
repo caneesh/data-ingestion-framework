@@ -11,6 +11,11 @@
 --  * load_dt partition kept (matches raw.partitioning in the feed config).
 -- Alternative: skip this DDL entirely and let the framework create the
 -- table on first run, or set raw.metadata_columns = ALTER.
+-- ORC + EXTERNAL is deliberate: in Hive 3 a MANAGED ORC table is
+-- created transactional (ACID) by DEFAULT, and Spark 3.5 cannot write
+-- Hive ACID tables without the Hive Warehouse Connector. Dropping the
+-- EXTERNAL keyword here would break the pipeline, not just change
+-- ownership semantics.
 CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_raw.smartiq_pdp (
   `file_name` STRING COMMENT 'src: FileName',
   `form_guid` STRING COMMENT 'src: FormGuid',
@@ -394,5 +399,5 @@ CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_raw.smartiq_pdp (
   `source_primary_key` STRING COMMENT 'framework metadata (RawMetadata)'
 )
 PARTITIONED BY (`load_dt` STRING)
-STORED AS PARQUET
+STORED AS ORC
 LOCATION '${LOCATION}/smartiq_pdp';

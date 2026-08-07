@@ -55,9 +55,38 @@ submit_ingest() {
     JAR_OPTS=(--jars "$INGEST_JARS")
   fi
 
+  # cluster (default, what Control-M runs) | client (driver = this shell).
+  local DEPLOY_MODE="${INGEST_DEPLOY_MODE:-cluster}"
+  if [[ "$DEPLOY_MODE" != "cluster" && "$DEPLOY_MODE" != "client" ]]; then
+    echo "ERROR: INGEST_DEPLOY_MODE must be 'cluster' or 'client', got '$DEPLOY_MODE'." >&2
+    return 2
+  fi
+
+  # Where the DRIVER finds the feed config. Cluster mode: --files localises
+  # it into the container working directory, so the basename is correct.
+  # Client mode: the driver is this shell and reads the ORIGINAL path, so
+  # "./name" would only work when the cwd happens to hold it — use the
+  # absolute path and let the HOCON include resolve beside it.
+  local CONF_ARG="./$CONF_NAME"
+  if [[ "$DEPLOY_MODE" == "client" ]]; then
+    if [[ ! -f "$CONF_FILE" ]]; then
+      echo "ERROR: client mode needs a readable config on this host: '$CONF_FILE'" >&2
+      return 2
+    fi
+    CONF_ARG="$(cd "$(dirname "$CONF_FILE")" && pwd)/$CONF_NAME"
+  fi
+
   # Forward the named variables into the driver container's environment.
+  # CLIENT MODE ONLY INHERITS: the driver is this shell, so exported values
+  # are already visible to it. Forwarding them there would put secrets on
+  # the command line for no benefit — spark.yarn.appMasterEnv does not
+  # reach a client-mode driver anyway.
   local ENV_CONFS=()
-  if [[ -n "${INGEST_ENV_VARS:-}" ]]; then
+  if [[ -n "${INGEST_ENV_VARS:-}" && "$DEPLOY_MODE" == "client" ]]; then
+    echo "INFO: client mode — the driver inherits this shell's environment;" >&2
+    echo "      INGEST_ENV_VARS is not forwarded (and no secret is placed" >&2
+    echo "      on the spark-submit command line)." >&2
+  elif [[ -n "${INGEST_ENV_VARS:-}" ]]; then
     local NAMES=() NAME
     IFS=',' read -ra NAMES <<< "$INGEST_ENV_VARS"
     for NAME in "${NAMES[@]}"; do
@@ -86,7 +115,7 @@ submit_ingest() {
     --class com.hcsc.generic.ingest.app.IngestMain \
     --name "ingest-${ENTITY}" \
     --master yarn \
-    --deploy-mode cluster \
+    --deploy-mode "$DEPLOY_MODE" \
     --conf spark.sql.caseSensitive=false \
     --conf spark.speculation=false \
     --conf spark.sql.sources.partitionOverwriteMode=dynamic \
@@ -98,6 +127,6 @@ submit_ingest() {
     --files "$FILES" \
     "$JAR_FILE" \
     --entity "$ENTITY" \
-    --conf-path "./$CONF_NAME" \
+    --conf-path "$CONF_ARG" \
     "$@"
 }

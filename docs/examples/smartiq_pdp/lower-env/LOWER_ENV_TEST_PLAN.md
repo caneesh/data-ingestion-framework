@@ -141,10 +141,28 @@ YARN launch context. Fine for a lower-environment service account,
 **not** for production — see the hardening note below.
 
 **B. Client mode — plain `export` works** (`--deploy-mode client` makes
-your shell the driver). Nothing sensitive touches a command line, and the
-test plan already suggests client mode for the first attempt because it
+your shell the driver). Nothing sensitive touches a command line, and it
 separates driver-side from executor-side failures. This is the quickest
-way to get the E2E test moving.
+way to get the E2E test moving:
+
+```bash
+INGEST_DEPLOY_MODE=client \
+INGEST_JARS=/opt/jdbc/mssql-jdbc-12.4.2.jre11.jar \
+INGEST_EXTRA_FILES=smartiq-pdp-e2e-schema.conf \
+  scripts/run_ingest.sh /full/path/feed-smartiq-pdp-e2e.conf smartiq_pdp_e2e INCR
+```
+
+In client mode the wrapper skips the `appMasterEnv` forwarding entirely
+(the driver already has your environment, and forwarding would put the
+password on the command line for nothing) and passes the config by
+**absolute** path, since a client-mode driver reads the original file
+rather than a `--files` copy.
+
+**Run cluster mode at least once before sign-off.** It is what Control-M
+executes, and it exercises things client mode cannot: environment
+forwarding, config shipping, and the driver's own network path to SQL
+Server — which originates from a data node, not the edge node, so
+firewall rules can differ.
 
 **Also verified, not assumed:** substitutions resolve against environment
 variables only — `-D` system properties are *not* consulted on the

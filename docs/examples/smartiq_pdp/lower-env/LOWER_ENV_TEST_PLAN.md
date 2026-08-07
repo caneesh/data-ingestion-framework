@@ -200,6 +200,99 @@ shipped cannot be found. The config is handed over with **`--conf-path`**;
 `-Dconfig.file` also works now but reports missing files less clearly. See
 the troubleshooting entry below.
 
+## Running it with the wrapper script
+
+The wrapper builds the whole `spark-submit` for you, so the `--jars`,
+`--files` and environment-forwarding pieces cannot be forgotten.
+
+**On the edge node, put these four things in one directory:**
+
+| | |
+|---|---|
+| `ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar` | built from `main`, **after 2026-08-06** |
+| `feed-smartiq-pdp-e2e.conf` | the feed |
+| `smartiq-pdp-e2e-schema.conf` | the include — must sit beside the feed |
+| `scripts/` | `ingest_submit_common.sh` + `run_ingest.sh`, keeping their relative layout (`run_ingest.sh` sources its sibling) |
+
+**Set the connection details once per shell:**
+
+```bash
+export SMARTIQ_HOST=lower-sql-01.corp.example.com
+export SMARTIQ_DB=SmartIQ
+export SMARTIQ_TABLE=dbo.SmartIQ_PDP_E2E
+export SMARTIQ_USER=svc_ingest
+read -rs -p "SQL password: " SMARTIQ_DB_PASSWORD; export SMARTIQ_DB_PASSWORD; echo
+```
+
+`read -rs` keeps the password out of your shell history, which a plain
+`export SMARTIQ_DB_PASSWORD=...` does not.
+
+**Then run.** The feed does not declare `ingestion.execution`, so it is
+COUPLED — raw and curated in one process, one job — which is
+`run_ingest.sh`:
+
+```bash
+cd /path/to/that/directory
+
+INGEST_DEPLOY_MODE=client \
+INGEST_JARS=/opt/jdbc/mssql-jdbc-12.4.2.jre11.jar \
+INGEST_EXTRA_FILES="$PWD/smartiq-pdp-e2e-schema.conf" \
+  scripts/run_ingest.sh "$PWD/feed-smartiq-pdp-e2e.conf" smartiq_pdp_e2e INCR \
+  --run-id e2e-1
+```
+
+Argument order is `<config> <entity> <FULL|INCR>`; anything after that
+starting with `--` goes straight to the app, which is how the scenarios
+below pass their `--run-id`. To use a jar that is not in the working
+directory, either put its path in the 4th slot (before the flags) or set
+`INGEST_JAR`.
+
+**Start with a dry run** — it validates config, contract and connectivity
+without reading or writing anything:
+
+```bash
+INGEST_DEPLOY_MODE=client INGEST_JARS=/opt/jdbc/mssql-jdbc-12.4.2.jre11.jar \
+INGEST_EXTRA_FILES="$PWD/smartiq-pdp-e2e-schema.conf" \
+  scripts/run_ingest.sh "$PWD/feed-smartiq-pdp-e2e.conf" smartiq_pdp_e2e INCR \
+  --validate-only
+```
+
+**Wrapper environment variables:**
+
+| Variable | Purpose |
+|---|---|
+| `INGEST_DEPLOY_MODE` | `cluster` (default, what Control-M runs) or `client` |
+| `INGEST_JARS` | vendor JDBC driver(s), comma-separated — required for jdbc feeds |
+| `INGEST_EXTRA_FILES` | files `include`d by the feed config, comma-separated |
+| `INGEST_ENV_VARS` | names forwarded to a **cluster-mode** driver; ignored in client mode |
+| `INGEST_JAR` | app jar path, instead of the positional slot |
+
+For the later cluster-mode confirmation run, the same command plus the
+forwarding list:
+
+```bash
+INGEST_DEPLOY_MODE=cluster \
+INGEST_ENV_VARS="SMARTIQ_HOST,SMARTIQ_DB,SMARTIQ_TABLE,SMARTIQ_USER,SMARTIQ_DB_PASSWORD" \
+INGEST_JARS=/opt/jdbc/mssql-jdbc-12.4.2.jre11.jar \
+INGEST_EXTRA_FILES="$PWD/smartiq-pdp-e2e-schema.conf" \
+  scripts/run_ingest.sh "$PWD/feed-smartiq-pdp-e2e.conf" smartiq_pdp_e2e INCR \
+  --run-id e2e-cluster-1
+```
+
+**Reading the outcome.** Client mode prints the driver log to your
+terminal; cluster mode needs `yarn logs -applicationId <appId>`. Either
+way, check these three lines before trusting a green run:
+
+```
+[Config] --conf-path='...' includes resolve against '<dir>'   # the jar is current
+[Jdbc]   url=jdbc:sqlserver://<host>...  table=<table>        # the RIGHT database
+[Lock]   entity=smartiq_pdp_e2e lease released by run <id>    # clean exit
+```
+
+Exit code 0 means success, including a clean no-op. Non-zero propagates
+the framework's `CFG_` / `JDBC_` / `PIPE_` / `CUR_` code — rerunning the
+same job after a failure is always safe.
+
 Explicit `--run-id` values matter: scenario 7 replays one by id. Use
 `--deploy-mode client` for the first attempt if executor connectivity is
 still unproven — it isolates driver-side from executor-side failures.

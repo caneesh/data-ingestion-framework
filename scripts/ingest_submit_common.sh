@@ -31,6 +31,14 @@
 # A listed-but-unset name is reported rather than silently skipped: a HOCON
 # override that quietly falls back to its default points the run at the
 # wrong database without raising any error at all.
+#
+# JDBC DRIVER: a jdbc feed needs its vendor driver on the driver AND every
+# executor — the framework loads it reflectively in both places and fails
+# fast with JDBC_001 if it is absent. Unless the cluster already ships one
+# cluster-wide, point INGEST_JARS at it (comma-separated for several):
+#
+#   INGEST_JARS=/opt/jdbc/mssql-jdbc-12.4.2.jre11.jar \
+#     scripts/run_ingest.sh /path/feed.conf my_feed INCR
 set -euo pipefail
 
 submit_ingest() {
@@ -39,6 +47,12 @@ submit_ingest() {
   local FILES="$CONF_FILE"
   if [[ -n "${INGEST_EXTRA_FILES:-}" ]]; then
     FILES="$FILES,$INGEST_EXTRA_FILES"
+  fi
+
+  # Vendor JDBC driver(s), distributed to the driver and every executor.
+  local JAR_OPTS=()
+  if [[ -n "${INGEST_JARS:-}" ]]; then
+    JAR_OPTS=(--jars "$INGEST_JARS")
   fi
 
   # Forward the named variables into the driver container's environment.
@@ -80,6 +94,7 @@ submit_ingest() {
     --conf spark.yarn.maxAppAttempts=1 \
     --conf spark.sql.shuffle.partitions=200 \
     ${ENV_CONFS[@]+"${ENV_CONFS[@]}"} \
+    ${JAR_OPTS[@]+"${JAR_OPTS[@]}"} \
     --files "$FILES" \
     "$JAR_FILE" \
     --entity "$ENTITY" \

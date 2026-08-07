@@ -47,7 +47,15 @@ production except the databases themselves.
 3. **Config:** copy `feed-smartiq-pdp-e2e.conf` + `smartiq-pdp-e2e-schema.conf`
    side by side (the feed `include`s the schema by relative name), then
    supply the connection details — see below.
-4. **Dry run first:**
+4. **JDBC driver:** the Microsoft SQL Server driver must be on the
+   classpath of the **driver and every executor** — the framework loads it
+   reflectively in both places. Unless your cluster already ships one
+   cluster-wide, pass it explicitly:
+   `--jars /opt/jdbc/mssql-jdbc-12.4.2.jre11.jar` (match the version to
+   your Java: `jre11` for Java 11). It is deliberately **not** bundled in
+   the app jar — Microsoft's licence is separate from this framework's.
+   A missing driver fails fast with `JDBC_001` before any read starts.
+5. **Dry run first:**
    `--entity smartiq_pdp_e2e --validate-only` — config, contract and
    connectivity, no reads or writes.
 
@@ -123,6 +131,7 @@ one:
 ```bash
 INGEST_ENV_VARS="SMARTIQ_HOST,SMARTIQ_DB,SMARTIQ_TABLE,SMARTIQ_DB_PASSWORD" \
 INGEST_EXTRA_FILES=smartiq-pdp-e2e-schema.conf \
+INGEST_JARS=/opt/jdbc/mssql-jdbc-12.4.2.jre11.jar \
   scripts/run_ingest.sh feed-smartiq-pdp-e2e.conf smartiq_pdp_e2e INCR
 ```
 
@@ -156,6 +165,7 @@ spark-submit --class com.hcsc.generic.ingest.app.IngestMain \
   --conf spark.yarn.appMasterEnv.SMARTIQ_DB="$SMARTIQ_DB" \
   --conf spark.yarn.appMasterEnv.SMARTIQ_TABLE="$SMARTIQ_TABLE" \
   --conf spark.yarn.appMasterEnv.SMARTIQ_DB_PASSWORD="$SMARTIQ_DB_PASSWORD" \
+  --jars /opt/jdbc/mssql-jdbc-12.4.2.jre11.jar \
   --files feed-smartiq-pdp-e2e.conf,smartiq-pdp-e2e-schema.conf \
   ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar \
   --entity smartiq_pdp_e2e --mode INCR --run-id e2e-1 \
@@ -288,6 +298,30 @@ order:
    `[Config] --conf-path='...' resolved='...' includes resolve against
    '<dir>'` before parsing. If that line is absent from the driver log, the
    jar is stale — see 2.
+
+**`JDBC_001 Driver class 'com.microsoft.sqlserver.jdbc.SQLServerDriver' not
+found on classpath`**
+
+The Microsoft JDBC driver was not shipped. It is not bundled in the app jar
+(separate licence), so pass it with `--jars`:
+
+```bash
+--jars /opt/jdbc/mssql-jdbc-12.4.2.jre11.jar
+```
+
+Use the `jre11` build to match Java 11; a `jre8` jar on Java 11 throws
+`UnsupportedClassVersionError` instead. With the wrapper script, set
+`INGEST_JARS` to the same path.
+
+`--jars` distributes to the driver **and** the executors, which is what
+this feed needs: the driver runs the health check and the watermark query,
+and each executor opens its own connection for its partition of the read.
+Placing the jar on only one side produces the same JDBC_001 later, from
+an executor rather than the driver.
+
+Reaching this error means config loading, credential resolution and the
+entity lock all succeeded — it is the last piece of plumbing before the
+first real read.
 
 **`JDBC_002 Environment variable 'SMARTIQ_DB_PASSWORD' is not set`**
 

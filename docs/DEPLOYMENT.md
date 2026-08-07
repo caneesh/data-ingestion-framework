@@ -83,6 +83,21 @@ Rules that follow from this split:
 
 - **Never put a credential in the `.conf`.** Passwords come from a secret
   provider (`env`, CyberArk, Key Vault, Conjur) resolved at run time.
+- **In cluster mode, `export` does not reach the driver.** The driver is a
+  YARN container with its own environment. Both the `env` secret provider
+  and HOCON `${?VAR}` overrides read *that* environment, so every variable
+  must be forwarded with
+  `--conf spark.yarn.appMasterEnv.<NAME>=<value>` (the wrapper script does
+  this from `INGEST_ENV_VARS`), or the job must run
+  `--deploy-mode client`. The two halves fail **asymmetrically**: a missing
+  secret raises `JDBC_002`, but a missing `${?VAR}` override silently falls
+  back to the config's default — no error, wrong target. Verify the
+  driver's `[Jdbc] url=... table=...` line on any run whose connection
+  details come from the environment.
+- A password forwarded via `--conf` is visible in `ps` on the submitting
+  host and in the YARN launch context. Acceptable for a lower-environment
+  service account; for production use CyberArk / Key Vault / Conjur, which
+  the driver fetches at run time under its own identity.
 - **Never point `--conf-path` at an HDFS path or a submit-side absolute
   path in cluster mode.** The driver runs in a container that has neither.
   Ship with `--files` and reference the basename (`./feed.conf`).

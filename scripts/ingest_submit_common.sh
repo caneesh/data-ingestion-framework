@@ -19,6 +19,18 @@
 # directory, which is where --files lands them. (-Dconfig.file is also
 # absolutised by the app as of 2026-08-06, but --conf-path is preferred:
 # it is explicit and reports a missing file as CFG_018.)
+#
+# ENVIRONMENT IN CLUSTER MODE: with --deploy-mode cluster the driver runs
+# in a YARN container, so `export FOO=bar` in THIS shell does NOT reach it.
+# Both the `env` secret provider (JDBC_002) and HOCON `${?FOO}` overrides
+# read the DRIVER's environment. List the variable NAMES to forward:
+#
+#   INGEST_ENV_VARS="SMARTIQ_HOST,SMARTIQ_DB,SMARTIQ_DB_PASSWORD" \
+#     scripts/run_ingest.sh /path/feed.conf my_feed INCR
+#
+# A listed-but-unset name is reported rather than silently skipped: a HOCON
+# override that quietly falls back to its default points the run at the
+# wrong database without raising any error at all.
 set -euo pipefail
 
 submit_ingest() {
@@ -28,6 +40,34 @@ submit_ingest() {
   if [[ -n "${INGEST_EXTRA_FILES:-}" ]]; then
     FILES="$FILES,$INGEST_EXTRA_FILES"
   fi
+
+  # Forward the named variables into the driver container's environment.
+  local ENV_CONFS=()
+  if [[ -n "${INGEST_ENV_VARS:-}" ]]; then
+    local NAMES=() NAME
+    IFS=',' read -ra NAMES <<< "$INGEST_ENV_VARS"
+    for NAME in "${NAMES[@]}"; do
+      NAME="${NAME//[[:space:]]/}"
+      [[ -z "$NAME" ]] && continue
+      if [[ -z "${!NAME:-}" ]]; then
+        echo "WARN: INGEST_ENV_VARS names '$NAME' but it is unset here — NOT forwarded." >&2
+        echo "      The feed will fall back to its built-in default for this value." >&2
+        continue
+      fi
+      case "$NAME" in
+        *PASSWORD*|*SECRET*|*TOKEN*|*CREDENTIAL*|*PASSWD*)
+          # The value becomes part of the spark-submit argv.
+          echo "WARN: forwarding '$NAME' places its VALUE on the spark-submit command" >&2
+          echo "      line — readable via 'ps' on this host and in the YARN launch" >&2
+          echo "      context. Acceptable for a lower-environment test; for production" >&2
+          echo "      use a secret provider (cyberark / azure_keyvault / conjur) or the" >&2
+          echo "      'file' provider with a --files-shipped secret." >&2
+          ;;
+      esac
+      ENV_CONFS+=(--conf "spark.yarn.appMasterEnv.$NAME=${!NAME}")
+    done
+  fi
+
   spark-submit \
     --class com.hcsc.generic.ingest.app.IngestMain \
     --name "ingest-${ENTITY}" \
@@ -39,6 +79,7 @@ submit_ingest() {
     --conf spark.serializer=org.apache.spark.serializer.KryoSerializer \
     --conf spark.yarn.maxAppAttempts=1 \
     --conf spark.sql.shuffle.partitions=200 \
+    ${ENV_CONFS[@]+"${ENV_CONFS[@]}"} \
     --files "$FILES" \
     "$JAR_FILE" \
     --entity "$ENTITY" \

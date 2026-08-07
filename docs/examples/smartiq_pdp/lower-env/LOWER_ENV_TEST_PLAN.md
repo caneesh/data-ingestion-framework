@@ -78,22 +78,71 @@ URL by hand:
 url = "jdbc:sqlserver://"${sqlserver.host}":"${sqlserver.port}";databaseName="${sqlserver.database}
 ```
 
-Either edit the defaults in the file, or leave them and export:
+Either edit the defaults in the file, or leave them and supply the values
+at submit time.
+
+### The cluster-mode environment trap (read this before running)
+
+Both the `${?SMARTIQ_*}` HOCON overrides and the `env` password provider
+read the **driver JVM's** environment. With `--deploy-mode cluster` the
+driver is a YARN container on some cluster node, so `export FOO=...` in
+your shell **never reaches it**. The two halves fail differently:
+
+| What | If not forwarded | How you find out |
+|---|---|---|
+| `SMARTIQ_DB_PASSWORD` | run dies | `JDBC_002 Environment variable 'SMARTIQ_DB_PASSWORD' is not set` |
+| `SMARTIQ_HOST` / `_DB` / `_TABLE` / `_USER` / `_PORT` | **silently falls back to the file's default** | nothing — check the driver log line `[Jdbc] url=... table=...` |
+
+The second row is the dangerous one: there is no error, the run just uses
+whatever the file says. Always confirm the `[Jdbc] url=` line names the
+host and database you intended.
+
+Two supported ways to get the values in:
+
+**A. Cluster mode — forward them explicitly** (`spark.yarn.appMasterEnv.*`
+sets the driver container's environment):
 
 ```bash
 export SMARTIQ_HOST=lower-sql-01.corp.example.com
 export SMARTIQ_DB=SmartIQ
 export SMARTIQ_TABLE=dbo.SmartIQ_PDP_E2E
 export SMARTIQ_DB_PASSWORD='...'
+
+spark-submit ... \
+  --conf spark.yarn.appMasterEnv.SMARTIQ_HOST="$SMARTIQ_HOST" \
+  --conf spark.yarn.appMasterEnv.SMARTIQ_DB="$SMARTIQ_DB" \
+  --conf spark.yarn.appMasterEnv.SMARTIQ_TABLE="$SMARTIQ_TABLE" \
+  --conf spark.yarn.appMasterEnv.SMARTIQ_DB_PASSWORD="$SMARTIQ_DB_PASSWORD" \
+  ...
 ```
 
-**Gotcha (verified, not assumed):** on the `--conf-path` route the
-framework resolves substitutions against **environment variables only** —
-`-D` system properties are *not* consulted there. Use `export`, not
-`--conf spark.driver.extraJavaOptions=-Dsmartiq.host=...`. The password is
-never read from the config file at all: it is fetched at run time through
-the `env` secret provider, so it never lands in source control or in a
-logged config dump.
+`scripts/ingest_submit_common.sh` does this for you — list the names in
+`INGEST_ENV_VARS` and it forwards each set one and warns about each unset
+one:
+
+```bash
+INGEST_ENV_VARS="SMARTIQ_HOST,SMARTIQ_DB,SMARTIQ_TABLE,SMARTIQ_DB_PASSWORD" \
+INGEST_EXTRA_FILES=smartiq-pdp-e2e-schema.conf \
+  scripts/run_ingest.sh feed-smartiq-pdp-e2e.conf smartiq_pdp_e2e INCR
+```
+
+Note the cost: a password passed this way sits in the `spark-submit`
+command line, readable by `ps` on the submitting host and visible in the
+YARN launch context. Fine for a lower-environment service account,
+**not** for production — see the hardening note below.
+
+**B. Client mode — plain `export` works** (`--deploy-mode client` makes
+your shell the driver). Nothing sensitive touches a command line, and the
+test plan already suggests client mode for the first attempt because it
+separates driver-side from executor-side failures. This is the quickest
+way to get the E2E test moving.
+
+**Also verified, not assumed:** substitutions resolve against environment
+variables only — `-D` system properties are *not* consulted on the
+`--conf-path` route, so `--conf spark.driver.extraJavaOptions=-Dsmartiq.host=...`
+does nothing. The password is never read from the config file at all; it
+is fetched at run time through the `env` secret provider, so it never
+lands in source control or in a logged config dump.
 
 For extra hardening the password can come from CyberArk, Azure Key Vault or
 Conjur instead — swap the `password` provider block; the rest is unchanged.
@@ -103,11 +152,19 @@ Conjur instead — swap the `password` provider block; the rest is unchanged.
 ```bash
 spark-submit --class com.hcsc.generic.ingest.app.IngestMain \
   --name ingest-smartiq_pdp_e2e --master yarn --deploy-mode cluster \
+  --conf spark.yarn.appMasterEnv.SMARTIQ_HOST="$SMARTIQ_HOST" \
+  --conf spark.yarn.appMasterEnv.SMARTIQ_DB="$SMARTIQ_DB" \
+  --conf spark.yarn.appMasterEnv.SMARTIQ_TABLE="$SMARTIQ_TABLE" \
+  --conf spark.yarn.appMasterEnv.SMARTIQ_DB_PASSWORD="$SMARTIQ_DB_PASSWORD" \
   --files feed-smartiq-pdp-e2e.conf,smartiq-pdp-e2e-schema.conf \
   ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar \
   --entity smartiq_pdp_e2e --mode INCR --run-id e2e-1 \
   --conf-path ./feed-smartiq-pdp-e2e.conf
 ```
+
+The four `appMasterEnv` lines are **required in cluster mode** — without
+them the password lookup fails with `JDBC_002` and the host/database/table
+silently revert to the file's defaults. See the trap section above.
 
 **Both files must be in `--files`** (the feed `include`s the schema) — this
 is the one part no code fix can cover, because a file that was never
@@ -231,6 +288,29 @@ order:
    `[Config] --conf-path='...' resolved='...' includes resolve against
    '<dir>'` before parsing. If that line is absent from the driver log, the
    jar is stale — see 2.
+
+**`JDBC_002 Environment variable 'SMARTIQ_DB_PASSWORD' is not set`**
+
+The driver container has no such variable. In `--deploy-mode cluster` your
+shell's `export` does not reach the driver — forward it with
+`--conf spark.yarn.appMasterEnv.SMARTIQ_DB_PASSWORD="$SMARTIQ_DB_PASSWORD"`
+(or use `INGEST_ENV_VARS` with the wrapper script, or run client mode).
+See "The cluster-mode environment trap" above.
+
+Reaching this error is progress: config parsing and the schema `include`
+both succeeded, or the run would have died earlier.
+
+**Check the same submit for the SILENT half of this problem.** The
+`SMARTIQ_HOST` / `_DB` / `_TABLE` / `_USER` / `_PORT` overrides have
+defaults, so an unforwarded value produces no error — the run just uses
+the file's default. Confirm the driver log line
+
+```
+[Jdbc] url=jdbc:sqlserver://<host>:1433;databaseName=<db> table=<table> ...
+```
+
+names the host and database you meant. A default of `SQLHOST-LOWER` in the
+URL means nothing was forwarded.
 
 A stack ending in `cleanupStagingDir` with *"Operation category READ is not
 supported in state standby"* is a **secondary** error from the shutdown

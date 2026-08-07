@@ -410,6 +410,35 @@ order:
    '<dir>'` before parsing. If that line is absent from the driver log, the
    jar is stale — see 2.
 
+**`JDBC_001 Connection to jdbc:sqlserver://UNSET-export-SMARTIQ_HOST:1433 ...
+The TCP/IP connection to the host ... has failed`**
+
+The host in that URL is what the run actually used. If it reads
+`UNSET-export-SMARTIQ_HOST` (or any placeholder), the override never took
+effect and the config default was used — the silent half of the
+environment problem.
+
+The variable is named **`SMARTIQ_HOST`**. A frequent slip is exporting the
+*placeholder value* instead of the variable name:
+
+```bash
+export SQLHOST-LOWER=dwauswbasq01...   # WRONG - that is the default VALUE,
+                                       # and bash rejects it anyway:
+                                       # "not a valid identifier" (hyphens
+                                       # are illegal in shell identifiers)
+export SMARTIQ_HOST=dwauswbasq01...    # RIGHT
+```
+
+Bash printing `not a valid identifier` means **nothing was set** — the
+export failed silently as far as the job is concerned. Re-check with
+`echo "$SMARTIQ_HOST"` before resubmitting; empty output means the run will
+fall back to the default again.
+
+If the host is right but the connection still fails, it is genuinely
+network: confirm the port, the firewall between this host and SQL Server,
+and — in cluster mode — that the same is true from the *data nodes*, not
+just the edge node.
+
 **`JDBC_001 Driver class 'com.microsoft.sqlserver.jdbc.SQLServerDriver' not
 found on classpath`**
 
@@ -454,8 +483,8 @@ the file's default. Confirm the driver log line
 [Jdbc] url=jdbc:sqlserver://<host>:1433;databaseName=<db> table=<table> ...
 ```
 
-names the host and database you meant. A default of `SQLHOST-LOWER` in the
-URL means nothing was forwarded.
+names the host and database you meant. A host of
+`UNSET-export-SMARTIQ_HOST` in the URL means nothing was forwarded.
 
 A stack ending in `cleanupStagingDir` with *"Operation category READ is not
 supported in state standby"* is a **secondary** error from the shutdown

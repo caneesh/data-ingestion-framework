@@ -1,3 +1,24 @@
+-- ===========================================================================
+-- SUBSTITUTE ${LOCATION} BEFORE RUNNING THIS FILE.
+--
+-- Hive does NOT always fail on an unresolved ${...}: it can create the
+-- table with the placeholder as a LITERAL directory name, and the run then
+-- dies at the first read with
+--   [PATH_NOT_FOUND] Path does not exist: hdfs://.../${LOCATION}/<table>
+--
+-- Safest — substitute textually, so nothing depends on the client:
+--   sed 's|${LOCATION}|hdfs://NAMESERVICE/path/to/base|g' THIS_FILE > run.sql
+--   beeline -u '<jdbc-url>' -f run.sql
+--
+-- Or let the client do it:
+--   beeline -u '<jdbc-url>' --hivevar LOCATION=hdfs://NAMESERVICE/base -f THIS_FILE
+--
+-- Verify afterwards — the Location row must contain no '$':
+--   DESCRIBE FORMATTED <db>.<table>;
+--
+-- Pre-creating is OPTIONAL. The framework creates these tables itself when
+-- they are absent, which sidesteps this entirely.
+-- ===========================================================================
 -- SmartIQ_PDP CURATED (v2, 2026-08-04) — framework-compatible.
 -- CONSUMER REQUEST: ALL 364 source columns now land in curated (was 357).
 -- The 7 columns the original business tab dropped — FileName, FormGuid,

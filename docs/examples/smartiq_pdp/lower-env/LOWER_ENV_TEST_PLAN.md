@@ -38,8 +38,18 @@ production except the databases themselves.
 
 1. **Source:** run section 0 of `source_test_data.sql` against the lower
    SQL Server to create `dbo.SmartIQ_PDP_E2E`.
-2. **Hive:** run `raw_ddl_e2e.sql` and `curated_ddl_e2e.sql`, substituting
-   `${LOCATION}`. Both are **ORC, EXTERNAL** — keep the `EXTERNAL` keyword:
+2. **Hive:** run `raw_ddl_e2e.sql` and `curated_ddl_e2e.sql`, **substituting
+   `${LOCATION}` first** — Hive may otherwise create the table with the
+   placeholder as a literal directory name, which fails only later at the
+   first read:
+
+   ```bash
+   BASE=hdfs://TSTODPHA/user/$USER/smartiq_e2e
+   for f in raw_ddl_e2e curated_ddl_e2e; do
+     sed "s|\${LOCATION}|$BASE|g" $f.sql > $f.run.sql
+   done
+   # then run the .run.sql files, and check DESCRIBE FORMATTED shows no '$'
+   ``` Both are **ORC, EXTERNAL** — keep the `EXTERNAL` keyword:
    in Hive 3 a *managed* ORC table is created transactional (ACID) by
    default, and Spark 3.5 cannot write Hive ACID tables without the Hive
    Warehouse Connector. (Optional — the framework creates the tables itself if
@@ -409,6 +419,47 @@ order:
    `[Config] --conf-path='...' resolved='...' includes resolve against
    '<dir>'` before parsing. If that line is absent from the driver log, the
    jar is stale — see 2.
+
+**`[PATH_NOT_FOUND] Path does not exist: hdfs://.../${LOCATION}/smartiq_pdp_e2e`**
+
+The `${LOCATION}` placeholder in the DDL was never substituted, so the
+EXTERNAL table was created pointing at a directory *literally named*
+`${LOCATION}`. Hive does not always reject the unresolved variable — it can
+create the table happily, and the failure surfaces only at the first read.
+
+Confirm it:
+
+```sql
+DESCRIBE FORMATTED membership_common_raw.smartiq_pdp_e2e;
+-- the Location row must contain no '$'
+```
+
+Pick one fix:
+
+**Simplest — drop them and let the framework create them.** These are
+EXTERNAL tables over a path that does not exist, so there is no data to
+lose:
+
+```sql
+DROP TABLE membership_common_raw.smartiq_pdp_e2e;
+DROP TABLE membership_common_curated.smartiq_pdp_e2e;
+```
+
+Pre-creating is optional; it only validates that your DDL and the framework
+agree. Dropping avoids the placeholder question entirely.
+
+**Or repoint the existing tables:**
+
+```sql
+ALTER TABLE membership_common_raw.smartiq_pdp_e2e
+  SET LOCATION 'hdfs://TSTODPHA/user/<you>/smartiq_e2e/raw/smartiq_pdp_e2e';
+ALTER TABLE membership_common_curated.smartiq_pdp_e2e
+  SET LOCATION 'hdfs://TSTODPHA/user/<you>/smartiq_e2e/curated/smartiq_pdp_e2e';
+```
+
+**Or recreate from the DDL, substituting properly** — see the header of
+each `.sql` file. Substituting with `sed` before running is safest, since
+it does not depend on the client honouring `--hivevar`.
 
 **`JDBC_001 ... Could not establish a secure connection ... PKIX path
 building failed: unable to find valid certification path to requested

@@ -1,3 +1,24 @@
+-- ===========================================================================
+-- SUBSTITUTE ${LOCATION} BEFORE RUNNING THIS FILE.
+--
+-- Hive does NOT always fail on an unresolved ${...}: it can create the
+-- table with the placeholder as a LITERAL directory name, and the run then
+-- dies at the first read with
+--   [PATH_NOT_FOUND] Path does not exist: hdfs://.../${LOCATION}/<table>
+--
+-- Safest — substitute textually, so nothing depends on the client:
+--   sed 's|${LOCATION}|hdfs://NAMESERVICE/path/to/base|g' THIS_FILE > run.sql
+--   beeline -u '<jdbc-url>' -f run.sql
+--
+-- Or let the client do it:
+--   beeline -u '<jdbc-url>' --hivevar LOCATION=hdfs://NAMESERVICE/base -f THIS_FILE
+--
+-- Verify afterwards — the Location row must contain no '$':
+--   DESCRIBE FORMATTED <db>.<table>;
+--
+-- Pre-creating is OPTIONAL. The framework creates these tables itself when
+-- they are absent, which sidesteps this entirely.
+-- ===========================================================================
 -- SmartIQ_PDP E2E CURATED (lower environment) — same 11 columns +
 -- record_hash + framework audit columns. Unpartitioned: latest-per-key.
 -- ORC + EXTERNAL is deliberate: in Hive 3 a MANAGED ORC table is

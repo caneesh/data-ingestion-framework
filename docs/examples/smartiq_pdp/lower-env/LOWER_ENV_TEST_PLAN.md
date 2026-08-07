@@ -410,6 +410,49 @@ order:
    '<dir>'` before parsing. If that line is absent from the driver log, the
    jar is stale — see 2.
 
+**`JDBC_001 ... Could not establish a secure connection ... PKIX path
+building failed: unable to find valid certification path to requested
+target`**
+
+TCP reached the server and the **TLS handshake** failed — real progress:
+the host, port, credentials and driver are all correct by this point.
+
+The `sqlserver` dialect defaults to `encrypt=true` and
+`trustServerCertificate=false`, so SQL Server's certificate must chain to a
+CA the JVM trusts. This error means it does not — typically an internal
+corporate CA that is absent from the truststore.
+
+**Preferred fix — trust the CA** (no config change, encryption *and*
+validation stay on). On the driver and every executor:
+
+```bash
+keytool -importcert -alias corp-ca -file corp-ca.crt \
+  -keystore "$JAVA_HOME/lib/security/cacerts" -storepass changeit
+```
+
+Obtain `corp-ca.crt` from whoever issued the SQL Server certificate. This
+is usually a platform/infrastructure task, and it is the only option
+appropriate for production.
+
+**Lower-environment escape hatch — skip validation.** In the feed's
+`source` block (both lines are required):
+
+```hocon
+allow_insecure_tls = true
+connection_properties { trustServerCertificate = "true" }
+```
+
+The connection stays encrypted but can no longer detect a
+man-in-the-middle, so the service-account credential is exposed to anyone
+able to intercept it. The framework refuses the downgrade without
+`allow_insecure_tls` and logs `INSECURE TLS override approved` on every
+run. `feed-smartiq-pdp-e2e.conf` carries both lines commented out. Do not
+promote them to production.
+
+Do **not** reach for `encrypt = "false"`: it removes encryption entirely
+rather than just the certificate check, and many servers refuse the
+connection anyway.
+
 **`JDBC_001 Connection to jdbc:sqlserver://UNSET-export-SMARTIQ_HOST:1433 ...
 The TCP/IP connection to the host ... has failed`**
 

@@ -42,6 +42,14 @@ final class BatchControl(spark: SparkSession, feedConf: Config) {
       .filter(col("entity") === entity)
       .withColumn("terminal", when(col("status") === "STARTED", lit(0)).otherwise(lit(1)))
 
+    // A dry run records SUCCESS but writes nothing. AuditService excludes
+    // those rows from every checkpoint query, so curated_done — documented
+    // here as the checkpoint truth — must exclude them too, or the view
+    // reports a batch as curated that was never written. coalesce keeps a
+    // NULL message from evaluating the predicate to NULL and dropping the
+    // row instead.
+    val notDryRun = coalesce(col("message"), lit("")) =!= "dry-run"
+
     // Latest-terminal per stage: max(struct(event_ts, terminal, field))
     // reproduces stageStatus ordering (latest event_ts; terminal beats
     // STARTED on exact ties).
@@ -54,7 +62,7 @@ final class BatchControl(spark: SparkSession, feedConf: Config) {
     // event_ts) — a later re-invocation under a different mode must not
     // swap in its metadata.
     def firstRawSuccess(field: org.apache.spark.sql.Column) =
-      min(when(col("stage") === "raw" && col("status") === "SUCCESS",
+      min(when(col("stage") === "raw" && col("status") === "SUCCESS" && notDryRun,
         struct(col("event_ts").as("ts"), field.as("v")))).getField("v")
 
     ev.groupBy(col("run_id").as("batch_id"))
@@ -65,8 +73,8 @@ final class BatchControl(spark: SparkSession, feedConf: Config) {
         firstRawSuccess(optCol("window_end")).as("extract_window_end"),
         latest("raw", col("status")).as("raw_status"),
         latest("curated", col("status")).as("curated_status"),
-        max(when(col("stage") === "curated" && col("status") === "SUCCESS", 1).otherwise(0))
-          .cast("boolean").as("curated_done"),
+        max(when(col("stage") === "curated" && col("status") === "SUCCESS" && notDryRun, 1)
+          .otherwise(0)).cast("boolean").as("curated_done"),
         max(when(col("stage") === "raw", col("raw_count"))).as("raw_count"),
         max(when(col("stage") === "raw", col("accepted_count"))).as("accepted_count"),
         max(when(col("stage") === "raw", col("rejected_count"))).as("rejected_count"),

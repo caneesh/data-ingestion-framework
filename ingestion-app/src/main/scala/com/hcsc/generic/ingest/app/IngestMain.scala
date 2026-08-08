@@ -161,7 +161,15 @@ object IngestMain {
           results.map { case (t, action, n) => s"$t $action count=$n" }.mkString("; "))
     } catch {
       case e: Throwable =>
-        audit.recordStage(ctx, "retention", StageStatus.Failed, message = String.valueOf(e.getMessage))
+        // Best-effort, same reasoning as the pipeline's stage handler: an
+        // audit write that fails must not replace the failure it records.
+        try audit.recordStage(ctx, "retention", StageStatus.Failed, message = String.valueOf(e.getMessage))
+        catch {
+          case audErr: Throwable =>
+            logger.error("[Retention] Could not record FAILED in the ledger: " +
+              s"${audErr.getMessage} — original failure follows and is rethrown", audErr)
+            e.addSuppressed(audErr)
+        }
         throw e
     } finally {
       held.foreach(l =>

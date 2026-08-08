@@ -19,17 +19,18 @@ WITH ev AS (
 SELECT
   run_id AS batch_id,
   entity,
-  MIN(CASE WHEN stage = 'raw' AND status = 'SUCCESS'
+  MIN(CASE WHEN stage = 'raw' AND status = 'SUCCESS' AND COALESCE(message, '') <> 'dry-run'
         THEN named_struct('ts', event_ts, 'v', run_mode) END).v      AS run_mode,
-  MIN(CASE WHEN stage = 'raw' AND status = 'SUCCESS'
+  MIN(CASE WHEN stage = 'raw' AND status = 'SUCCESS' AND COALESCE(message, '') <> 'dry-run'
         THEN named_struct('ts', event_ts, 'v', window_start) END).v  AS extract_window_start,
-  MIN(CASE WHEN stage = 'raw' AND status = 'SUCCESS'
+  MIN(CASE WHEN stage = 'raw' AND status = 'SUCCESS' AND COALESCE(message, '') <> 'dry-run'
         THEN named_struct('ts', event_ts, 'v', window_end) END).v    AS extract_window_end,
   MAX(CASE WHEN stage = 'raw'
         THEN named_struct('ts', event_ts, 't', terminal, 'v', status) END).v     AS raw_status,
   MAX(CASE WHEN stage = 'curated'
         THEN named_struct('ts', event_ts, 't', terminal, 'v', status) END).v     AS curated_status,
-  MAX(CASE WHEN stage = 'curated' AND status = 'SUCCESS' THEN TRUE ELSE FALSE END) AS curated_done,
+  MAX(CASE WHEN stage = 'curated' AND status = 'SUCCESS'
+           AND COALESCE(message, '') <> 'dry-run' THEN TRUE ELSE FALSE END) AS curated_done,
   MAX(CASE WHEN stage = 'raw' THEN raw_count END)      AS raw_count,
   MAX(CASE WHEN stage = 'raw' THEN accepted_count END) AS accepted_count,
   MAX(CASE WHEN stage = 'raw' THEN rejected_count END) AS rejected_count,

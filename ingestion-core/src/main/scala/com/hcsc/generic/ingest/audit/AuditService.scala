@@ -273,6 +273,16 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
       s"missingRequired=[${record.missing_required_columns}]")
   }
 
+  /** A dry run records SUCCESS while writing nothing, so it must never
+    * checkpoint a batch or prove a raw slice exists. `coalesce` matters:
+    * a bare `=!=` against a NULL message evaluates to NULL, and `filter`
+    * drops non-TRUE rows — a null-message SUCCESS would silently vanish
+    * from every checkpoint query. */
+  private def notDryRun: org.apache.spark.sql.Column = {
+    import org.apache.spark.sql.functions.{coalesce, col, lit}
+    coalesce(col("message"), lit("")) =!= "dry-run"
+  }
+
   /** True when some OTHER run's raw stage succeeded over the same extract
     * window with rejected rows — the signal the HOLD recovery path uses to
     * re-append a held window instead of window-skipping it. Requires the
@@ -326,9 +336,7 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
       .filter(col("run_id") === runId && col("entity") === entity &&
         col("stage") === stage &&
         col("status") === com.hcsc.generic.ingest.runtime.StageStatus.Success &&
-        // A dry-run SUCCESS wrote NOTHING: it must neither checkpoint a
-        // batch as curated-done nor prove a raw slice exists.
-        col("message") =!= "dry-run")
+        notDryRun)
       .limit(1).count() > 0
   }
 
@@ -352,7 +360,7 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
       def optCol(n: String) = if (cols.contains(n)) col(n) else lit("")
       runs.filter(col("stage") === com.hcsc.generic.ingest.runtime.Stages.Raw &&
           col("status") === com.hcsc.generic.ingest.runtime.StageStatus.Success &&
-          col("message") =!= "dry-run")
+          notDryRun)
         .groupBy(col("run_id"))
         // run_mode/window come from the SAME row as the first commit
         // (struct-min keyed on event_ts) — a later re-invocation under a
@@ -377,8 +385,7 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
     import org.apache.spark.sql.functions.col
     batchFrame(entity).fold(Set.empty[String]) { runs =>
       // dry-run rows checkpoint nothing (see hasStageSuccess)
-      runs.filter(col("stage") === stage && col("status") === status &&
-          col("message") =!= "dry-run")
+      runs.filter(col("stage") === stage && col("status") === status && notDryRun)
         .select("run_id").distinct().collect().map(_.getString(0)).toSet
     }
   }
@@ -403,13 +410,26 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
   def lastRawSuccessBatches(entity: String, n: Int): Seq[PendingBatch] =
     rawSuccessBatches(entity).takeRight(n)
 
-  /** RAW-successful batches whose raw SUCCESS date (event_ts, session zone)
-    * falls in [from, to] inclusive. */
-  def rawSuccessBatchesBetween(entity: String, from: java.time.LocalDate, to: java.time.LocalDate): Seq[PendingBatch] =
+  /**
+    * RAW-successful batches whose raw SUCCESS date falls in [from, to]
+    * inclusive, bucketed on the SESSION-zone calendar.
+    *
+    * The session zone is what renders event_ts everywhere an operator reads
+    * it — Hive queries, the batch control view, the run ledger — so
+    * `--replay-from` / `--replay-to` must agree with that calendar.
+    * `Timestamp.toLocalDateTime` would instead render in the JVM default
+    * zone, and a driver JVM on local time with the framework's default UTC
+    * session zone puts every run in the hours around midnight into the
+    * wrong day.
+    */
+  def rawSuccessBatchesBetween(entity: String, from: java.time.LocalDate, to: java.time.LocalDate): Seq[PendingBatch] = {
+    val zone = java.time.ZoneId.of(
+      spark.conf.get("spark.sql.session.timeZone", java.time.ZoneId.systemDefault().getId))
     rawSuccessBatches(entity).filter { b =>
-      val d = b.rawSuccessTs.toLocalDateTime.toLocalDate
+      val d = b.rawSuccessTs.toInstant.atZone(zone).toLocalDate
       !d.isBefore(from) && !d.isAfter(to)
     }
+  }
 
   /** Latest recorded status for a stage of a given run, used by --resume.
     * Terminal statuses win over STARTED when timestamps tie. */

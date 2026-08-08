@@ -439,7 +439,17 @@ final class IngestPipeline(
       Some(result)
     } catch {
       case e: Throwable =>
-        audit.recordStage(ctx, stage, StageStatus.Failed, message = String.valueOf(e.getMessage))
+        // Best-effort: the ledger write can itself fail (metastore or HDFS
+        // unavailable is a LIKELY reason the stage failed in the first
+        // place). Letting it propagate would replace the real cause with a
+        // Hive error and leave the operator debugging the wrong thing.
+        try audit.recordStage(ctx, stage, StageStatus.Failed, message = String.valueOf(e.getMessage))
+        catch {
+          case audErr: Throwable =>
+            logger.error(s"[Pipeline] Could not record stage=$stage FAILED in the ledger: " +
+              s"${audErr.getMessage} — original failure follows and is rethrown", audErr)
+            e.addSuppressed(audErr)
+        }
         throw e
     }
   }

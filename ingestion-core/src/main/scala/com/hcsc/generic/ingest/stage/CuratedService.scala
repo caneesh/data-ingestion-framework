@@ -121,7 +121,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
 
     val prepared0 = transform.castConfigured(transformed, conf)
     val prepared1 = transform.applyTransforms(prepared0, conf)
-    val prepared2 = transform.ensureAudit(prepared1)
+    val prepared2 = stampRunLineage(transform.ensureAudit(prepared1), ctx)
     val prepared3 = transform.normalizeKeys(prepared2, conf)
 
     // Partition-column validation + null policy run on the fully prepared
@@ -577,6 +577,22 @@ final class CuratedService(spark: SparkSession, conf: Config) {
             "(no reject service wired; configure rejects{} and run via the pipeline to quarantine them)")
         count
     }
+
+  /**
+    * Stamps `last_modified_run_id` with the publishing run when — and only
+    * when — the curated schema carries that column.
+    *
+    * Batch lineage: RAW rows carry run_id, curated rows historically did
+    * not, so a suspect curated row could not be traced to the batch that
+    * last wrote it without inferring from timestamps. Opt-in by DDL,
+    * exactly like `is_deleted`: adding the column to a curated table starts
+    * populating it, and every existing table keeps working untouched. The
+    * incoming value is overwritten rather than preserved — unlike
+    * create_timestamp, this records the LAST write, not the first.
+    */
+  private def stampRunLineage(df: DataFrame, ctx: RunContext): DataFrame =
+    df.columns.find(_.equalsIgnoreCase("last_modified_run_id"))
+      .fold(df)(c => df.withColumn(c, lit(ctx.runId)))
 
   /** Stamps soft-delete tombstones: last_modified_op='D' plus
     * is_deleted=true when the frame carries the column. The indicator must
@@ -1172,5 +1188,5 @@ object CuratedService {
 
   /** Columns stamped by ensureAudit; not usable as a freshness column. */
   val FrameworkAuditColumns: Set[String] =
-    Set("create_timestamp", "last_modified_ts", "last_modified_op")
+    Set("create_timestamp", "last_modified_ts", "last_modified_op", "last_modified_run_id")
 }

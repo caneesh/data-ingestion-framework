@@ -104,10 +104,28 @@ class AuditZoneAndDryRunTest extends AnyFunSuite with SharedSparkSession {
     // rows can reach the ledger from an older writer or an external insert.
     // A bare `col("message") =!= "dry-run"` evaluates to NULL for those and
     // filter drops them, silently un-checkpointing a completed batch.
-    spark.sql(
-      s"""INSERT INTO $db.run_audit VALUES
-         |('NULLMSG','azdr_feed','raw','SUCCESS',0,0,0,0,0,0,0,NULL,NULL,
-         | current_timestamp(),'INCR','','')""".stripMargin)
+    // Built from the table's CURRENT schema rather than a positional VALUES
+    // list: the ledger is designed to gain columns over time (run_mode,
+    // window_*, provenance...), and a hard-coded arity would break this test
+    // on every such addition while telling us nothing about NULL handling.
+    val schema = spark.table(s"$db.run_audit").schema
+    val values = schema.map { f =>
+      f.name.toLowerCase match {
+        case "run_id"   => "NULLMSG"
+        case "entity"   => "azdr_feed"
+        case "stage"    => Stages.Raw
+        case "status"   => StageStatus.Success
+        case "message"  => null                       // <- the point of the test
+        case "event_ts" => new java.sql.Timestamp(System.currentTimeMillis())
+        case _ => f.dataType match {
+          case org.apache.spark.sql.types.LongType => 0L
+          case _ => null
+        }
+      }
+    }
+    spark.createDataFrame(
+      java.util.Collections.singletonList(org.apache.spark.sql.Row(values: _*)), schema)
+      .write.mode(org.apache.spark.sql.SaveMode.Append).insertInto(s"$db.run_audit")
     assert(audit.hasStageSuccess("NULLMSG", "azdr_feed", Stages.Raw),
       "a SUCCESS row with a NULL message must still count as a success")
     assert(audit.pendingBatches("azdr_feed").map(_.runId).contains("NULLMSG"),

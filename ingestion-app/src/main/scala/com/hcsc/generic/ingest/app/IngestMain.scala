@@ -156,7 +156,11 @@ object IngestMain {
     try {
       val results = new com.hcsc.generic.ingest.retention.RetentionService(spark, feedConf, logger)
         .run(dryRun = cli.dryRun)
+      // delete_count makes the purge volume queryable and trendable; the
+      // per-table breakdown stays in the message, which cannot be aggregated.
+      val purged = results.map { case (_, _, n) => n }.sum
       audit.recordStage(ctx, "retention", StageStatus.Success,
+        counts = com.hcsc.generic.ingest.audit.StageCounts(deleteCount = purged),
         message = (if (cli.dryRun) "dry-run: " else "") +
           results.map { case (t, action, n) => s"$t $action count=$n" }.mkString("; "))
     } catch {

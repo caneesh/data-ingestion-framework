@@ -50,7 +50,13 @@ final case class RunAuditRecord(
   // ADD COLUMNS without breaking positional insertInto.
   run_mode: String,
   window_start: String,
-  window_end: String
+  window_end: String,
+  // Provenance: WHICH code, WHICH config and WHO produced this batch.
+  // Without these a batch found to be wrong cannot be traced to the build
+  // or configuration that made it.
+  framework_version: String,
+  config_fingerprint: String,
+  principal: String
 )
 
 /** One RAW batch as seen by the decoupled curated driver: identity, the
@@ -110,7 +116,14 @@ final case class HeaderAuditRecord(
   *   reconciliation_table = "ingest_reconciliation"
   * }
   */
-final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
+final class AuditService(
+  spark: SparkSession,
+  auditConf: Option[Config],
+  /** The whole feed config, for the provenance fingerprint. Optional so the
+    * many call sites that construct with just the audit block still compile;
+    * they simply record an empty fingerprint. */
+  feedConf: Option[Config] = None
+) {
   private val logger = Logger.getLogger(getClass.getName)
 
   val enabled: Boolean =
@@ -132,6 +145,18 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
 
   private def now(): Timestamp = new Timestamp(System.currentTimeMillis())
 
+  /**
+    * Stable digest of the AUDIT-visible feed configuration, so two batches
+    * can be compared for "was this produced under the same settings?".
+    *
+    * Computed once per service instance. Values are never included — a
+    * config can carry inline endpoints and identifiers, and this string
+    * lands in a table many people can read — only the rendered structure is
+    * hashed, which is enough to detect that something changed.
+    */
+  private lazy val configFingerprint: String =
+    feedConf.map(AuditService.fingerprint).getOrElse("")
+
   private val fileTableDdl =
     "run_id STRING, entity STRING, file_name STRING, file_path STRING, checksum STRING, " +
       "size_bytes BIGINT, status STRING, reason STRING, event_ts TIMESTAMP"
@@ -140,13 +165,15 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
     "run_id STRING, entity STRING, stage STRING, status STRING, source_count BIGINT, " +
       "raw_count BIGINT, accepted_count BIGINT, rejected_count BIGINT, insert_count BIGINT, " +
       "update_count BIGINT, delete_count BIGINT, control_total STRING, message STRING, " +
-      "event_ts TIMESTAMP, run_mode STRING, window_start STRING, window_end STRING"
+      "event_ts TIMESTAMP, run_mode STRING, window_start STRING, window_end STRING, " +
+      "framework_version STRING, config_fingerprint STRING, principal STRING"
 
   /** Columns added after the original run-audit DDL; pre-existing tables are
     * migrated in place (Hive appends ADD COLUMNS at the end, matching the
     * record's field order). */
   private val runTableAddedColumns = Seq(
-    "run_mode" -> "STRING", "window_start" -> "STRING", "window_end" -> "STRING")
+    "run_mode" -> "STRING", "window_start" -> "STRING", "window_end" -> "STRING",
+    "framework_version" -> "STRING", "config_fingerprint" -> "STRING", "principal" -> "STRING")
 
   /** The migration check runs ONCE per service instance, not on every
     * recordStage — repeated metadata reads and racing ALTERs from concurrent
@@ -237,7 +264,8 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
       counts.sourceCount, counts.rawCount, counts.acceptedCount, counts.rejectedCount,
       counts.insertCount, counts.updateCount, counts.deleteCount,
       counts.controlTotal.orNull, AuditService.sanitizeMessage(message), now(),
-      ctx.mode, extractWindow._1, extractWindow._2
+      ctx.mode, extractWindow._1, extractWindow._2,
+      AuditService.frameworkVersion, configFingerprint, AuditService.principal
     )
     ensureRunTableColumns()
     append(Seq(record).toDF(), runTable, runTableDdl)
@@ -431,6 +459,35 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
     }
   }
 
+  /**
+    * Rows this run's raw stage actually WROTE, from its own ledger entry.
+    *
+    * The decoupled curated job re-reads those rows from the RAW table, so
+    * this is an INDEPENDENT measure of how many rows it should have
+    * accounted for — recorded by a different run, at a different time, from
+    * a different frame. That independence is the whole point: deriving the
+    * expectation from the curated result itself would make the accounting
+    * identity tautological.
+    *
+    * None when the ledger is disabled, the run never succeeded at raw, or
+    * the count was not measured (-1).
+    */
+  def rawRowCount(runId: String, entity: String): Option[Long] = {
+    if (!enabled || !spark.catalog.tableExists(runTable)) return None
+    import org.apache.spark.sql.functions.col
+    spark.table(runTable)
+      .filter(col("run_id") === runId && col("entity") === entity &&
+        col("stage") === com.hcsc.generic.ingest.runtime.Stages.Raw &&
+        col("status") === com.hcsc.generic.ingest.runtime.StageStatus.Success &&
+        notDryRun)
+      .orderBy(col("event_ts").asc)
+      .select("raw_count")
+      .collect()
+      .headOption
+      .map(_.getLong(0))
+      .filter(_ >= 0L)
+  }
+
   /** Latest recorded status for a stage of a given run, used by --resume.
     * Terminal statuses win over STARTED when timestamps tie. */
   def stageStatus(runId: String, entity: String, stage: String): Option[String] = {
@@ -448,7 +505,38 @@ final class AuditService(spark: SparkSession, auditConf: Option[Config]) {
 
 object AuditService {
   def apply(spark: SparkSession, feedConf: Config): AuditService =
-    new AuditService(spark, ConfigUtils.optConfig(feedConf, "audit"))
+    new AuditService(spark, ConfigUtils.optConfig(feedConf, "audit"), Some(feedConf))
+
+  /** Build identity from the jar manifest; "unknown" when running from
+    * classes (tests, IDE) where no manifest is present. */
+  private[ingest] lazy val frameworkVersion: String =
+    Option(classOf[AuditService].getPackage)
+      .flatMap(p => Option(p.getImplementationVersion))
+      .getOrElse("unknown")
+
+  /** The identity the run executed under. Prefers the Hadoop login user so
+    * a Kerberised cluster records the real principal rather than whatever
+    * user.name happens to be set to; falls back when Hadoop is unavailable. */
+  private[ingest] lazy val principal: String =
+    try org.apache.hadoop.security.UserGroupInformation.getCurrentUser.getUserName
+    catch { case _: Throwable => Option(System.getProperty("user.name")).getOrElse("unknown") }
+
+  /**
+    * SHA-256 over the config's rendered STRUCTURE, values excluded.
+    *
+    * Deliberately not a hash of the whole rendered config: feed configs
+    * carry hostnames, database names and identifiers, and this value is
+    * written to a table with a wide readership. Hashing the sorted key
+    * paths detects "the shape of the configuration changed" — which is what
+    * provenance needs — without republishing any of it.
+    */
+  private[ingest] def fingerprint(conf: Config): String = {
+    import scala.collection.JavaConverters._
+    val paths = conf.entrySet().asScala.map(_.getKey).toSeq.sorted.mkString("\n")
+    val digest = java.security.MessageDigest.getInstance("SHA-256")
+      .digest(paths.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+    "v1:" + digest.take(16).map("%02x".format(_)).mkString
+  }
 
   private val CredentialPattern =
     "(?i)(password|passwd|pwd|secret|token|accesskey|access_key|credential)\\s*=\\s*[^;,&\\s]+".r

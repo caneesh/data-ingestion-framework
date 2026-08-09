@@ -32,12 +32,22 @@ CREATE TABLE IF NOT EXISTS ingest_audit.ingest_run_audit (
   event_ts       TIMESTAMP,
   run_mode       STRING,   -- FULL | INCR
   window_start   STRING,   -- serialized extract window (incremental sources)
-  window_end     STRING
+  window_end     STRING,
+  -- Provenance: which build, which configuration and whose identity
+  -- produced this batch. Without them a batch found to be wrong cannot be
+  -- traced back to what made it.
+  framework_version  STRING,   -- jar build identity ("unknown" outside a jar)
+  config_fingerprint STRING,   -- v1:<sha256 over the config's KEY STRUCTURE;
+                               -- values are never hashed or stored
+  principal          STRING    -- Hadoop login user, else user.name
 ) STORED AS ORC;
 -- Pre-existing tables migrate in place (the framework also does this
 -- automatically on first write):
 --   ALTER TABLE ingest_audit.ingest_run_audit
 --     ADD COLUMNS (run_mode STRING, window_start STRING, window_end STRING);
+--   ALTER TABLE ingest_audit.ingest_run_audit
+--     ADD COLUMNS (framework_version STRING, config_fingerprint STRING,
+--                  principal STRING);
 
 CREATE TABLE IF NOT EXISTS ingest_audit.ingest_reconciliation (
   run_id     STRING,

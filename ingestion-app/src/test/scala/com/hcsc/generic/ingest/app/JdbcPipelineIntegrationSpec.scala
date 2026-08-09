@@ -22,6 +22,8 @@ import java.sql.DriverManager
   */
 class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
 
+  private val LEDGER_COLS = "(run_id, entity, stage, status, source_count, raw_count, accepted_count, rejected_count, insert_count, update_count, delete_count, control_total, message, event_ts, run_mode, window_start, window_end)"
+
   private var tempDir: JPath = _
   private var spark: SparkSession = _
   private val logger = Logger.getLogger(getClass.getName)
@@ -490,7 +492,11 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     // the entity — the store (still at 2026-01-07) and ledger now disagree,
     // exactly what tampering/reseeding outside the pipeline looks like.
     spark.sql(
-      "INSERT INTO j_audit.ingest_run_audit VALUES ('ghost-run', 'claims_hold', 'raw', 'SUCCESS', " +
+      // Named column list, not positional: the ledger gains columns over
+      // time (provenance, windows...) and a positional seed breaks on every
+      // addition while testing nothing about this scenario.
+      "INSERT INTO j_audit.ingest_run_audit " + LEDGER_COLS + " VALUES " +
+        "('ghost-run', 'claims_hold', 'raw', 'SUCCESS', " +
         "0, 0, 0, 0, 0, 0, 0, CAST(NULL AS STRING), '', TIMESTAMP '2030-01-01 00:00:00', 'FULL', " +
         "'2027-01-01 00:00:00.0', '2027-02-01 00:00:00.0')")
     h2("INSERT INTO claims VALUES ('C008', 150, '2026-01-08 09:00:00')")

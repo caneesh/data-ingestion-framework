@@ -22,6 +22,8 @@ import java.nio.file.{Files, Path => JPath}
   */
 class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
 
+  private val LEDGER_COLS = "(run_id, entity, stage, status, source_count, raw_count, accepted_count, rejected_count, insert_count, update_count, delete_count, control_total, message, event_ts, run_mode, window_start, window_end)"
+
   private var tempDir: JPath = _
   private var spark: SparkSession = _
   private val logger = Logger.getLogger(getClass.getName)
@@ -465,7 +467,8 @@ class PipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
     // A FAILED raw stage means the RAW slice may be partial: publishing it
     // as curated (and stamping SUCCESS) would poison later --resume.
     spark.sql(
-      "INSERT INTO p_audit.ingest_run_audit VALUES " +
+      // Named column list, not positional — see LEDGER_COLS.
+      "INSERT INTO p_audit.ingest_run_audit " + LEDGER_COLS + " VALUES " +
         "('run-rawfailed-1', 'member', 'raw', 'FAILED', -1, -1, -1, -1, -1, -1, -1, " +
         "null, 'boom', current_timestamp(), 'FULL', '', '')")
     val e = intercept[IllegalArgumentException] {

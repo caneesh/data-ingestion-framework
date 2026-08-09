@@ -181,7 +181,14 @@ final class IngestPipeline(
         (r, counts)
       }.flatten
 
-      reconcile(None, result)
+      // Only a single-run replay can be attributed to one ledger entry; a
+      // --resume-ingest-dt replay spans many run_ids, so no single raw_count
+      // describes its slice and the identity is deliberately not claimed.
+      val replayExpectation = cli.runId.flatMap(rid => audit.rawRowCount(rid, ctx.entity))
+      if (cli.runId.isDefined && replayExpectation.isEmpty)
+        logger.warn(s"[Pipeline] No ledger raw_count for run_id=${cli.runId.get}: the curated " +
+          "accounting identity cannot be checked for this replay")
+      reconcile(None, result, replayExpectation)
       logger.info(s"==== Curated replay success entity=${ctx.entity} runId=${ctx.runId} " +
         "(watermark intentionally untouched) ====")
     } finally {
@@ -950,8 +957,19 @@ final class IngestPipeline(
         String.valueOf(value)
       }
 
-  /** Cross-stage consistency checks persisted to the reconciliation table. */
-  private def reconcile(raw: Option[RawOutcome], curated: Option[CuratedResult]): Unit = {
+  /**
+    * Cross-stage consistency checks persisted to the reconciliation table.
+    *
+    * `replayInputCount` carries the accounting expectation for a DECOUPLED
+    * curated replay, where `raw` is None because the raw stage ran in a
+    * different job: it is the row count that run recorded writing to RAW,
+    * which is exactly the slice this replay re-reads.
+    */
+  private def reconcile(
+    raw: Option[RawOutcome],
+    curated: Option[CuratedResult],
+    replayInputCount: Option[Long] = None
+  ): Unit = {
     val checks = scala.collection.mutable.ArrayBuffer.empty[(String, String, String, Boolean)]
 
     raw.foreach { o =>
@@ -1000,12 +1018,20 @@ final class IngestPipeline(
     // an insert/update). Rows silently vanishing between RAW and CURATED
     // fail this.
     curated.foreach { r =>
+      val accounted = r.insertCount + r.updateCount + r.deleteCount + r.ignoredCount +
+        r.nullKeyCount + r.dedupedCount + r.passthroughCount
       val rawAccepted = raw.map(_.counts.acceptedCount).getOrElse(-1L)
       if (!ctx.dryRun && rawAccepted >= 0) {
-        val accounted = r.insertCount + r.updateCount + r.deleteCount + r.ignoredCount +
-          r.nullKeyCount + r.dedupedCount + r.passthroughCount
         checks += (("curated_accounts_for_accepted_rows",
           rawAccepted.toString, accounted.toString, accounted == rawAccepted))
+      }
+      // DECOUPLED replay: raw ran in a different job, so the expectation
+      // comes from that run's own ledger entry. Without this the identity —
+      // the framework's strongest data-loss detector — never ran in the
+      // execution mode Control-M actually uses.
+      if (!ctx.dryRun) replayInputCount.foreach { expected =>
+        checks += (("curated_accounts_for_replayed_rows",
+          expected.toString, accounted.toString, accounted == expected))
       }
     }
 

@@ -5,6 +5,116 @@ entity and tables, the same machinery**. A green run here means the
 mechanisms the full feed depends on are working against the real SQL
 Server, the real Hive metastore and the real cluster.
 
+## Pre-flight checklist (start here)
+
+Everything below is covered in detail later; this is the ordered list of
+what to change before a run, and the two steps worth not skipping are 2
+(nothing works until it is done) and 4 (it can write into another team's
+table).
+
+**1. Refresh the artifacts on the edge node.** All of these changed:
+
+| Artifact | Why it must be re-copied |
+|---|---|
+| `ingestion-app-...-jar-with-dependencies.jar` | config loading, audit ledger, and the CREATE DATABASE guard are all framework code |
+| `smartiq-pdp-e2e-schema.conf` | `nullable = false` removed from `file_name`; otherwise one null key fails the whole run |
+| `feed-smartiq-pdp-e2e.conf` | control tables moved to `membership_common_raw`, table names now explicit, TLS block added |
+
+Confirm the jar is current: the driver logs
+`[Config] --conf-path='...' includes resolve against '<dir>'` before
+parsing. No such line means the jar is stale.
+
+**2. Clear any half-created Hive tables.** A previous run that mixed
+hand-written DDL and framework-created tables at one path leaves files
+whose schema does not match the table, which surfaces later as
+`converted table has N columns, but source Hive table has M columns`.
+`DROP TABLE` on an EXTERNAL table does **not** remove the files:
+
+```sql
+DESCRIBE FORMATTED membership_common_raw.smartiq_pdp_e2e;      -- note Location
+DESCRIBE FORMATTED membership_common_curated.smartiq_pdp_e2e;  -- note Location
+```
+```bash
+hdfs dfs -rm -r -skipTrash <raw Location>
+hdfs dfs -rm -r -skipTrash <curated Location>
+```
+```sql
+DROP TABLE IF EXISTS membership_common_raw.smartiq_pdp_e2e;
+DROP TABLE IF EXISTS membership_common_curated.smartiq_pdp_e2e;
+```
+
+Safe here because this is lower-environment test data. For an EXTERNAL
+table those files are the only copy — never run this against data you need.
+
+**3. Create the tables ONE way and keep to it.** Either run the DDLs with
+`${LOCATION}` substituted, or let the framework create them — not both at
+the same path, which is what causes step 2:
+
+```bash
+BASE=hdfs://TSTODPHA/user/$USER/smartiq_e2e
+for f in raw_ddl_e2e curated_ddl_e2e; do
+  sed "s|\${LOCATION}|$BASE|g" $f.sql > $f.run.sql
+done
+# then check DESCRIBE FORMATTED shows a Location containing no '$'
+```
+
+**4. Check for control-table name collisions.** The control tables live in
+`membership_common_raw`, which is **shared with other pipelines**, and the
+framework creates eight of them on first write:
+
+```sql
+SHOW TABLES IN membership_common_raw LIKE 'ingest_*';
+```
+
+Expected: `ingest_run_audit`, `ingest_file_audit`, `ingest_reconciliation`,
+`ingest_header_audit`, `ingest_rejects`, `ingest_file_registry`,
+`ingest_watermarks`, `ingest_run_locks`. **If any already exist from
+another pipeline, rename yours in the feed config before running** —
+otherwise this feed appends to their table. Only the `audit.*`,
+`rejects.*`, `watermark_store.*` and `concurrency.*` keys decide the names.
+
+No database-creation privilege is needed: the framework issues
+`CREATE DATABASE` only when the database is genuinely absent.
+
+**5. Decide the TLS route.** Either import the SQL Server CA into the JVM
+truststore on the driver and every executor (the only production-
+appropriate option), or uncomment the two lower-environment lines in the
+feed's `source` block. See the PKIX entry under Troubleshooting.
+
+**6. Set the environment and run.** Variable NAMES matter — `SMARTIQ_HOST`,
+not the placeholder value:
+
+```bash
+export SMARTIQ_HOST=<sql host>
+export SMARTIQ_DB=<database>
+export SMARTIQ_TABLE=dbo.SmartIQ_PDP_E2E
+export SMARTIQ_USER=<service account>
+read -rs -p "SQL password: " SMARTIQ_DB_PASSWORD; export SMARTIQ_DB_PASSWORD; echo
+echo "$SMARTIQ_HOST"      # must echo a value; empty means it did not take
+
+INGEST_DEPLOY_MODE=client \
+INGEST_JARS=/opt/jdbc/mssql-jdbc-<ver>.jre11.jar \
+INGEST_EXTRA_FILES="$PWD/smartiq-pdp-e2e-schema.conf" \
+  scripts/run_ingest.sh "$PWD/feed-smartiq-pdp-e2e.conf" smartiq_pdp_e2e INCR \
+  --validate-only
+```
+
+`--validate-only` checks config, contract and connectivity while writing
+nothing. When it passes, replace it with `--run-id e2e-1` and work through
+the scenarios.
+
+**7. Read three lines before trusting a green run:**
+
+```
+[Config] --conf-path='...' includes resolve against '<dir>'   # jar is current
+[Jdbc]   url=jdbc:sqlserver://<host>... table=<table>          # the RIGHT database
+[Lock]   entity=smartiq_pdp_e2e lease released by run <id>     # clean exit
+```
+
+The middle one matters most: an unforwarded `SMARTIQ_HOST` / `_DB` /
+`_TABLE` fails **silently** by falling back to the config default, unlike
+the password, which fails loudly with `JDBC_002`.
+
 ## Why these 11 columns
 
 Not the first eleven — each one is carrying a specific mechanism:
@@ -35,6 +145,9 @@ this feed gets its own of each automatically. Tables are
 production except the databases themselves.
 
 ## Setup
+
+The pre-flight checklist above is the short form of this section plus the
+run command; this is the detail behind each step.
 
 1. **Source:** run section 0 of `source_test_data.sql` against the lower
    SQL Server to create `dbo.SmartIQ_PDP_E2E`.

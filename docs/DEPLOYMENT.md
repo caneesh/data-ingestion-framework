@@ -109,6 +109,49 @@ Rules that follow from this split:
 
 ---
 
+## 4b. Control tables in a shared database
+
+The framework keeps eight control tables — run ledger, file audit,
+reconciliation, header audit, rejects, file registry, watermarks and run
+locks. It creates each one on first write with `CREATE TABLE IF NOT
+EXISTS`; nothing needs pre-creating.
+
+**Where they go is entirely config.** There is no hard-coded `ingest_audit`:
+
+| Table | Key | Default name |
+|---|---|---|
+| run ledger | `audit.database` + `run_table` | `ingest_run_audit` |
+| file audit | `audit.database` + `file_table` | `ingest_file_audit` |
+| reconciliation | `audit.database` + `reconciliation_table` | `ingest_reconciliation` |
+| header audit | `audit.database` + `header_table` | `ingest_header_audit` |
+| rejects | `rejects.database` + `table` | `ingest_rejects` |
+| file registry | `rejects.database` + `registry_table` | `ingest_file_registry` |
+| watermarks | `source.incremental.watermark_store.database` + `table` | `ingest_watermarks` |
+| run locks | `concurrency.database` (else `audit.database`) + `table` | `ingest_run_locks` |
+
+`watermark_store.database` is **required** for the hive store — it does not
+inherit `audit.database`, and its absence raises `JDBC_003`.
+
+### Sites that cannot create databases
+
+Point every key above at a database the job already has write access to —
+commonly the raw database. The framework issues `CREATE DATABASE` **only
+when the database is genuinely absent**: `IF NOT EXISTS` is not enough on
+its own, because an authorizer (Ranger, SQL-standard auth) evaluates the
+CREATE privilege before reaching it, and would reject a statement that had
+nothing to do. So no database-creation privilege is needed for an existing
+target.
+
+### Sharing a database with other pipelines
+
+The default names are `ingest_`-prefixed but not otherwise namespaced.
+When the database also holds other teams' tables, **state every table name
+explicitly in the feed config** rather than relying on defaults — what the
+framework will create should be visible, not implied — and rename any that
+would collide. `docs/examples/smartiq_pdp/` shows the full shape.
+
+---
+
 ## 5. spark-submit examples
 
 The reference invocation is `scripts/run_health_sherpa.sh`:

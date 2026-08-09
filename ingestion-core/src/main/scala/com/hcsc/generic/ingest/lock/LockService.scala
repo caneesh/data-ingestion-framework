@@ -187,7 +187,12 @@ final class LockService(
   }
 
   private def ensureTable(): Unit = {
-    spark.sql(s"CREATE DATABASE IF NOT EXISTS $database")
+    // Conditional for the same reason as HiveTables.ensure: an authorizer
+    // checks CREATE DATABASE privilege even when IF NOT EXISTS would be a
+    // no-op, which breaks sites whose control tables live in an existing
+    // shared database they cannot create in.
+    if (!spark.catalog.databaseExists(database))
+      spark.sql(s"CREATE DATABASE IF NOT EXISTS $database")
     spark.sql(
       s"""CREATE TABLE IF NOT EXISTS $fullTable (
          |  entity STRING, holder_run_id STRING, action STRING,

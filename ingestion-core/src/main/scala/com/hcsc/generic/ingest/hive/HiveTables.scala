@@ -32,7 +32,14 @@ object HiveTables {
     // forks, restarted sessions) has its own metastore and must re-ensure.
     val key = s"${spark.sparkContext.applicationId}:$fullTable"
     if (ensured.contains(key)) return
-    spark.sql(s"CREATE DATABASE IF NOT EXISTS $database")
+    // Only issue CREATE DATABASE when the database is genuinely absent.
+    // "IF NOT EXISTS" stops Hive complaining, but an authorizer (Ranger,
+    // SQL-standard auth) checks the CREATE privilege before it ever gets
+    // that far — so a site that places control tables in an EXISTING shared
+    // database it cannot create in would fail on a statement that had
+    // nothing to do.
+    if (!spark.catalog.databaseExists(database))
+      spark.sql(s"CREATE DATABASE IF NOT EXISTS $database")
     spark.sql(s"CREATE TABLE IF NOT EXISTS $fullTable ($columnsDdl) USING ORC")
     ensured.add(key)
   }

@@ -76,7 +76,18 @@ feeds.claims {
 
   audit {
     enabled = true                     # required when reconciliation FAILs (CFG_007)
-    database = "ingest_audit"
+    database = "ingest_audit"          # ANY database the job can write to; the
+                                       # name is not special. Point it at an
+                                       # existing shared database when the site
+                                       # cannot create one — the framework
+                                       # issues CREATE DATABASE only when the
+                                       # database is genuinely absent. Table
+                                       # names are configurable too
+                                       # (run_table, file_table,
+                                       # reconciliation_table, header_table);
+                                       # state them explicitly when the
+                                       # database is shared. See DEPLOYMENT.md
+                                       # "Control tables in a shared database".
     reconciliation {
       on_mismatch = "FAIL"             # WARN | FAIL | FAIL_ON equations
       tolerance { raw_equals_accepted = { percent = 0.0 } }

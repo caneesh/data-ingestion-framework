@@ -340,18 +340,23 @@ SELECT file_name, last_modified_datetime, ai_size_contract_count, last_modified_
   FROM membership_common_curated.smartiq_pdp_e2e WHERE file_name = 'F002.pdf';
 -- expect 2026-03-03 12:00:00 , content unchanged , op still 'I'
 
+-- NOTE: the control tables live in membership_common_raw because that is
+-- where this feed's audit / rejects / watermark_store blocks point. There
+-- is no fixed 'ingest_audit' database — change those keys and these
+-- queries change with them.
+
 -- 4: quarantine with PII masked
-SELECT error_code, raw_record FROM ingest_audit.ingest_rejects
+SELECT error_code, raw_record FROM membership_common_raw.ingest_rejects
  WHERE entity = 'smartiq_pdp_e2e';
 -- expect CUR_001 ; no plaintext e-mail address in raw_record
 
 -- per-run outcome, counts and status
 SELECT run_id, stage, status, raw_count, insert_count, update_count, event_ts
-  FROM ingest_audit.ingest_run_audit
+  FROM membership_common_raw.ingest_run_audit
  WHERE entity = 'smartiq_pdp_e2e' ORDER BY event_ts;
 
 -- watermark advanced only after curated succeeded
-SELECT * FROM ingest_audit.ingest_watermarks WHERE entity = 'smartiq_pdp_e2e';
+SELECT * FROM membership_common_raw.ingest_watermarks WHERE entity = 'smartiq_pdp_e2e';
 ```
 
 ### 6. Watermark holds on failure

@@ -1,3 +1,18 @@
+-- ===========================================================================
+-- The database name below is a PLACEHOLDER. Control tables live wherever
+-- the feed config points them:
+--   audit.database                            (run/file/reconciliation/header)
+--   rejects.database                          (rejects, file registry)
+--   source.incremental.watermark_store.database  (watermarks)
+--   concurrency.database, else audit.database (run locks)
+-- Substitute your database before running, e.g.
+--   sed 's/ingest_audit\./membership_common_raw./g' THIS_FILE > run.sql
+--
+-- Running this file is OPTIONAL. The framework creates every table on
+-- first write, and issues CREATE DATABASE only when the database is
+-- genuinely absent — so it needs no database-creation privilege against an
+-- existing one.
+-- ===========================================================================
 -- Batch control VIEW: one row per batch (batch_id = run_id) projected from
 -- the append-only ingest_run_audit ledger. Read-only by design — the
 -- ledger is the single source of truth; there is no physical batch table.

@@ -420,6 +420,43 @@ order:
    '<dir>'` before parsing. If that line is absent from the driver log, the
    jar is stale — see 2.
 
+**`SchemaContractViolationException: [nullability_violation] Column
+'file_name' is declared non-nullable but contains 1 null value(s)`**
+(at `validateContractBeforeRaw`, before the RAW write)
+
+The contract declared `nullable = false` on the business key. That rule is
+enforced **before RAW** and fails the ENTIRE RUN — one defective row stops
+the whole load, and nothing reaches RAW or curated.
+
+That contradicted scenario 4, which expects the null-key row to land in RAW
+and be quarantined at the curated merge as `CUR_001` while the run
+succeeds. The shipped contracts had `nullable = false`; they no longer do.
+If you are running an older copy of `smartiq-pdp-e2e-schema.conf`, remove
+`nullable = false` from the `file_name` entry.
+
+The two policies, so the choice is explicit:
+
+| | `nullable = false` | (default now) |
+|---|---|---|
+| One null key | **whole run fails**, nothing lands | row lands in RAW, quarantined at curated (`CUR_001`), run succeeds |
+| RAW content | nothing | faithful to the source |
+| Alarm on a systemic problem | immediate | `rejects.max_reject_percent` |
+
+The default matches this framework's "raw is history, curated is truth"
+principle: RAW records what the source actually sent, and curated refuses
+to publish a row it cannot key. Null keys never reach curated either way —
+`CUR_001` is independent of contract nullability and keys off `merge.keys`.
+
+Choose `nullable = false` when a null business key means the extract itself
+is broken and continuing would be worse than stopping. That is a business
+call, not a framework default.
+
+A third option exists and is deliberately NOT the default here:
+`rejects.use_contract_nullability = true` keeps `nullable = false` but
+diverts violating rows to the reject table BEFORE the RAW write instead of
+failing. It quarantines earlier with a more precise reason, at the cost of
+RAW no longer being a faithful copy — the row never lands at all.
+
 **`converted table has 16 columns, but source Hive table has 15 columns`**
 (or any other N-vs-M count)
 

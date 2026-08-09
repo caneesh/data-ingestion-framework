@@ -19,7 +19,7 @@ pass; column mapping stays name-based; no credential/PII logging.
 
 ### P0 — Baseline (this document)
 Done: compliance re-verification (`REQUIREMENTS_COMPLIANCE_STATUS.md`),
-execution-flow documentation (`DEVELOPER_GUIDE.md`), performance review
+execution-flow documentation (`../development/DEVELOPER_GUIDE.md`), performance review
 (`PERFORMANCE_REVIEW.md`). No runtime change.
 
 ### P1 — Typed ingestion-pattern model — **DELTA: NEW (P1 severity)**

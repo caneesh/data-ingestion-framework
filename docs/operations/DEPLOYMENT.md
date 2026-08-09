@@ -1,7 +1,7 @@
 # Deployment Guide
 
 How to build, package, and deploy the Data Ingestion Framework. Companion
-docs: [ARCHITECTURE.md](ARCHITECTURE.md), [OPERATIONS_RUNBOOK.md](OPERATIONS_RUNBOOK.md).
+docs: [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md), [OPERATIONS_RUNBOOK.md](OPERATIONS_RUNBOOK.md).
 
 ---
 
@@ -316,7 +316,7 @@ attribute) map to JDBC_002.
 
 **Azure Key Vault / Databricks scopes** are not built in but plug in by
 registering a custom `SecretProvider` (no extra SDK unless your custom
-provider needs one). See [ARCHITECTURE.md](ARCHITECTURE.md#extension-points)
+provider needs one). See [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md#extension-points)
 for the registration contract.
 
 ---

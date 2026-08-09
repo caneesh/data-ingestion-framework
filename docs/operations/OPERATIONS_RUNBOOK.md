@@ -4,7 +4,7 @@ Production support runbook for the Data Ingestion Framework. Every behavior
 below is grounded in the current code — file references are given so an
 on-call engineer can verify before acting.
 
-Companion docs: [ARCHITECTURE.md](ARCHITECTURE.md) (how the pieces fit),
+Companion docs: [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md) (how the pieces fit),
 [DEPLOYMENT.md](DEPLOYMENT.md) (how it is deployed).
 
 > **Golden rule:** the safest first move for almost any header/mapping issue is
@@ -363,7 +363,7 @@ Operational facts:
 
 ## Decoupled Raw / Curated operation
 
-See docs/DECOUPLING_DESIGN.md for the full design. Quick reference:
+See ../architecture/DECOUPLING_DESIGN.md for the full design. Quick reference:
 
 - Raw job: `--stage raw` + feed `watermark { advance_after = RAW }`
   (required in decoupled operation — without it the window re-reads forever).

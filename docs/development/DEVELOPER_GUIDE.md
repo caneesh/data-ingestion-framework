@@ -481,7 +481,7 @@ quarantine with a recorded reason, not in RAW.
   `watermark { advance_after = RAW }`, plus
   `scripts/run_curated_pending.sh`). CFG_016 validates the combination
   and a DECOUPLED feed refuses `--stage all` so a scheduler cannot
-  double-process batches. See docs/DECOUPLING_DESIGN.md and the
+  double-process batches. See ../architecture/DECOUPLING_DESIGN.md and the
   runbook's Control-M section.
 - **Batch status:** query the `ingest_batch_control` view
   (`ddl/ingest_batch_control_view.sql`) — one row per batch;
@@ -498,7 +498,7 @@ Every failure carries a coded, greppable prefix:
 | `REC_*` / `CFG_*` | Reconciliation and feed-config compatibility |
 
 The full catalog, plus watermark and quarantine recovery procedures, lives
-in [OPERATIONS_RUNBOOK.md](OPERATIONS_RUNBOOK.md).
+in [../operations/OPERATIONS_RUNBOOK.md](../operations/OPERATIONS_RUNBOOK.md).
 
 ---
 
@@ -527,8 +527,8 @@ draft files out of git if you chose the `inline` secret provider.
 
 | Document | Contents |
 |----------|----------|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Module map, data flow, extension points, enforced invariants |
-| [DEPLOYMENT.md](DEPLOYMENT.md) | Assembly, spark-submit, JDBC drivers, secret providers |
-| [OPERATIONS_RUNBOOK.md](OPERATIONS_RUNBOOK.md) | Error catalog, watermark/quarantine recovery, restart/resume |
+| [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md) | Module map, data flow, extension points, enforced invariants |
+| [../operations/DEPLOYMENT.md](../operations/DEPLOYMENT.md) | Assembly, spark-submit, JDBC drivers, secret providers |
+| [../operations/OPERATIONS_RUNBOOK.md](../operations/OPERATIONS_RUNBOOK.md) | Error catalog, watermark/quarantine recovery, restart/resume |
 | [CONFIG_GENERATOR.md](CONFIG_GENERATOR.md) / [RUNNING_CONFIG_GENERATOR.md](RUNNING_CONFIG_GENERATOR.md) | Feed-config wizard |
-| [SQL_SERVER_AUTH_AUDIT.md](SQL_SERVER_AUTH_AUDIT.md) | Credential resolution chain, security posture |
+| [../operations/SQL_SERVER_AUTH_AUDIT.md](../operations/SQL_SERVER_AUTH_AUDIT.md) | Credential resolution chain, security posture |

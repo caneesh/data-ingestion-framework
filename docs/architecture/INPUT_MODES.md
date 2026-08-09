@@ -11,7 +11,7 @@ merge algorithms.
 |---|---|
 | Config / business-key / partition validation | CuratedService (CUR_00x) |
 | Incoming dedup + latest-record selection | freshness column + directional tie-breakers, `row_number`, target wins exact ties |
-| Affected partitions / merge / partition overwrite / full overwrite | CuratedService publish modes (docs/CURATED_PARTITIONING.md) |
+| Affected partitions / merge / partition overwrite / full overwrite | CuratedService publish modes (CURATED_PARTITIONING.md) |
 | Schema alignment, audit metrics, failure recovery | align/guards, run ledger, staged publish |
 
 ## Per-source position tracking

@@ -86,7 +86,7 @@ feeds.claims {
                                        # (run_table, file_table,
                                        # reconciliation_table, header_table);
                                        # state them explicitly when the
-                                       # database is shared. See DEPLOYMENT.md
+                                       # database is shared. See ../operations/DEPLOYMENT.md
                                        # "Control tables in a shared database".
     reconciliation {
       on_mismatch = "FAIL"             # WARN | FAIL | FAIL_ON equations
@@ -161,7 +161,7 @@ curated {
 
 DECOUPLED requires `watermark { advance_after = RAW }` for incremental
 sources and the run ledger (`audit.database`) — the ledger is the curated
-job's batch checkpoint. See docs/DECOUPLING_DESIGN.md and the runbook's
+job's batch checkpoint. See DECOUPLING_DESIGN.md and the runbook's
 Control-M section; wrapper scripts live in `scripts/`.
 
 CDC-events example and a file-feed example live in `application.conf`'s

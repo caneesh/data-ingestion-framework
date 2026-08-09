@@ -2,7 +2,7 @@
 
 Structural overview of the Data Ingestion Framework: modules, data flow,
 extension points, and the invariants the code enforces. Companion docs:
-[DEPLOYMENT.md](DEPLOYMENT.md), [OPERATIONS_RUNBOOK.md](OPERATIONS_RUNBOOK.md).
+[../operations/DEPLOYMENT.md](../operations/DEPLOYMENT.md), [../operations/OPERATIONS_RUNBOOK.md](../operations/OPERATIONS_RUNBOOK.md).
 
 ---
 

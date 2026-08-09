@@ -1,7 +1,7 @@
 # Remediation Implementation Plan
 
 **Date:** 2026-07-28
-**Input:** `docs/REQUIREMENTS_GAP_ANALYSIS.md` (verified revision) — findings
+**Input:** `REQUIREMENTS_GAP_ANALYSIS.md` (verified revision) — findings
 C1–C12, S1–S16, backlog items 1–21.
 
 > **Implementation status (2026-07-28):** Phase 0 and all of Phase 1
@@ -81,7 +81,7 @@ Nothing in Phase 1 is sound without these two conventions. Both are small.
   `caseSensitive` setting. Make it overridable via
   `app.spark.session_time_zone` for feeds that genuinely need local time,
   defaulting to UTC.
-- Document the convention in `docs/ARCHITECTURE.md`: all framework-stamped
+- Document the convention in `../architecture/ARCHITECTURE.md`: all framework-stamped
   timestamps (`load_timestamp`, `create_timestamp`, `last_modified_ts`,
   `ingest_dt` derivations) are UTC; the source freshness column is compared
   as an instant (no conversion needed for `datetimeoffset`; plain

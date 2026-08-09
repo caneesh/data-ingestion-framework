@@ -19,7 +19,7 @@ import org.apache.spark.sql.streaming.StreamingQuery
   *   crash replays the micro-batch with the SAME batchId;
   * - the curated merge is content-idempotent, so replays converge
   *   (at-least-once delivery, convergent target; exactly-once is NOT
-  *   claimed on this format — see docs/INPUT_MODES.md);
+  *   claimed on this format — see docs/architecture/INPUT_MODES.md);
   * - empty micro-batches are successful no-ops;
   * - FULL_OVERWRITE is refused by CuratedMicroBatch for micro-batches;
   * - deterministic ordering comes from the configured freshness column

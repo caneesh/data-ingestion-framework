@@ -221,7 +221,7 @@ This contradicts the framework's own documented contract in three places:
 the comment at `IngestPipeline.scala:180` ("after everything above
 succeeded"), `WatermarkAdvancing.scala:8-11` ("ONLY after the full run —
 RAW write, CURATED publish, file completion — has succeeded"), and
-`docs/OPERATIONS_RUNBOOK.md:85,254`. It is a defect, not a supported
+`../operations/OPERATIONS_RUNBOOK.md:85,254`. It is a defect, not a supported
 topology. No test covers the interaction (the only `--stage raw` test is a
 file feed asserting raw/audit state only, `PipelineIntegrationSpec.scala:383-402`).
 
@@ -395,7 +395,7 @@ updated mid-extraction are unprotected.
 No retention, TTL, purge, or archive code for raw, reject, audit, registry,
 or watermark data. The only deletion logic is a 24-hour cleanup of
 crash-leftover curated **staging** tables (`PublishService.scala:107-125`).
-`docs/OPERATIONS_RUNBOOK.md` documents retention as a manual operator task.
+`../operations/OPERATIONS_RUNBOOK.md` documents retention as a manual operator task.
 
 ### S9. Curated partitioning/bucketing is absent (§6.6) — [CONFIRMED]
 

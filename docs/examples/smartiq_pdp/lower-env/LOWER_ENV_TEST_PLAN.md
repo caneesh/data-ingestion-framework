@@ -420,6 +420,54 @@ order:
    '<dir>'` before parsing. If that line is absent from the driver log, the
    jar is stale — see 2.
 
+**`converted table has 16 columns, but source Hive table has 15 columns`**
+(or any other N-vs-M count)
+
+Spark compares the schema it infers from the DATA FILES against the
+metastore's schema for the table and refuses to read when they disagree.
+Stale files from a differently-shaped table are sitting at the table's
+LOCATION.
+
+**The usual cause: `DROP TABLE` on an EXTERNAL table does NOT delete the
+data.** Dropping and recreating these tables removes only the metastore
+entry; the files remain, and the next table created over that path inherits
+them. Recreating with a different column list — or letting the framework
+create the table where a DDL-created one used to be, or the reverse — leaves
+files and schema out of step.
+
+The framework does not cause this: when the target table exists it aligns
+the incoming frame to the target's schema
+(`CuratedService.scala`, `transform.align(incoming, target.schema, ...)`),
+so it writes exactly the columns the table declares.
+
+Clean recovery — note the LOCATION *before* dropping, then remove the files:
+
+```sql
+DESCRIBE FORMATTED membership_common_curated.smartiq_pdp_e2e;   -- note Location
+DESCRIBE FORMATTED membership_common_raw.smartiq_pdp_e2e;
+```
+
+```bash
+hdfs dfs -rm -r -skipTrash <curated Location>
+hdfs dfs -rm -r -skipTrash <raw Location>
+```
+
+```sql
+DROP TABLE IF EXISTS membership_common_curated.smartiq_pdp_e2e;
+DROP TABLE IF EXISTS membership_common_raw.smartiq_pdp_e2e;
+```
+
+Then re-create from the DDLs **with `${LOCATION}` substituted**, or let the
+framework create them. Do not mix the two across runs at the same path.
+
+To see the schema the framework itself would choose, let it create the
+tables on a clean path and then `DESCRIBE FORMATTED` them — that output is
+authoritative, and any hand-written DDL should match it column for column.
+
+Because these are EXTERNAL tables over a lower-environment path, deleting
+the files is safe here. Never run the `hdfs dfs -rm -r` step against a path
+holding data you need — for an EXTERNAL table it is the only copy.
+
 **`[PATH_NOT_FOUND] Path does not exist: hdfs://.../${LOCATION}/smartiq_pdp_e2e`**
 
 The `${LOCATION}` placeholder in the DDL was never substituted, so the
@@ -438,7 +486,10 @@ Pick one fix:
 
 **Simplest — drop them and let the framework create them.** These are
 EXTERNAL tables over a path that does not exist, so there is no data to
-lose:
+lose. Note that `DROP TABLE` on an EXTERNAL table removes only the
+metastore entry — if the path DOES hold files, delete them too, or the next
+table created over it inherits a schema that may not match (see the
+column-count entry below):
 
 ```sql
 DROP TABLE membership_common_raw.smartiq_pdp_e2e;

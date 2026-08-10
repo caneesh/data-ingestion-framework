@@ -110,6 +110,29 @@ if [[ -z "${SMARTIQ_DB_PASSWORD:-}" ]]; then
   export SMARTIQ_DB_PASSWORD
 fi
 
+# ---- raw flag ---------------------------------------------------------------
+# Stamped on every RAW row as file_type, so a full load and an incremental are
+# distinguishable in the data itself rather than only by joining the ledger.
+# Derived from the mode so the two cannot drift apart.
+#
+# It is NOT a partition key on purpose: RAW retention drops partitions on a
+# single-key ingest_dt layout only, so a second key would disable purging
+# altogether, and a two-value column prunes almost nothing.
+#
+# CONSISTENCY MATTERS: --resume-ingest-dt replays a RAW partition filtered by
+# `file_type = <raw flag>`, so a replay must use the SAME mode as the run that
+# wrote the rows, or it selects nothing. Deriving the flag from the mode is
+# what keeps that true without anyone having to remember it.
+RAW_FLAG_ARGS=()
+if [[ " $* " == *" --raw-flag "* ]]; then
+  note "--raw-flag given explicitly; not deriving one from the mode"
+else
+  if [[ "$MODE" == "FULL" ]]; then RAW_FLAG="${SMARTIQ_RAW_FLAG_FULL:-F}"
+  else                            RAW_FLAG="${SMARTIQ_RAW_FLAG_INCR:-I}"; fi
+  RAW_FLAG_ARGS=(--raw-flag "$RAW_FLAG")
+  note "raw flag         file_type='$RAW_FLAG' (from mode $MODE)"
+fi
+
 # ---- submit -----------------------------------------------------------------
 export INGEST_DEPLOY_MODE="${SMARTIQ_DEPLOY_MODE:-client}"
 export INGEST_JARS="$SMARTIQ_JDBC_DRIVER"
@@ -120,4 +143,5 @@ export INGEST_JAR="$SMARTIQ_JAR"
 export INGEST_ENV_VARS="SMARTIQ_HOST,SMARTIQ_PORT,SMARTIQ_DB,SMARTIQ_TABLE,SMARTIQ_USER,SMARTIQ_DB_PASSWORD"
 
 echo "Submitting ($INGEST_DEPLOY_MODE mode)" >&2
-exec "$SCRIPT_DIR/run_ingest.sh" "$CONF" "$ENTITY" "$MODE" "$@"
+exec "$SCRIPT_DIR/run_ingest.sh" "$CONF" "$ENTITY" "$MODE" \
+  ${RAW_FLAG_ARGS[@]+"${RAW_FLAG_ARGS[@]}"} "$@"

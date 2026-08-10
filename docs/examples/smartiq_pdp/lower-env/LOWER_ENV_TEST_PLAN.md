@@ -115,6 +115,24 @@ scripts/run_smartiq.sh e2e INCR --run-id e2e-1      # the real thing
 scripts/run_smartiq.sh prod INCR --run-id pdp-initial-1   # 364-column feed
 ```
 
+The launcher also stamps the load type on every RAW row: `file_type = 'I'`
+for an `INCR` run, `'F'` for `FULL`, derived from the mode so the two cannot
+drift. Query it directly rather than joining the ledger:
+
+```sql
+SELECT file_type, COUNT(*) FROM membership_common_raw.smartiq_pdp_e2e
+ GROUP BY file_type;
+```
+
+Pass `--raw-flag` explicitly to override one run; set
+`SMARTIQ_RAW_FLAG_FULL` / `SMARTIQ_RAW_FLAG_INCR` to change the labels.
+
+**Rows written before this** carry `file_type = ''`. That matters in one
+place: `--resume-ingest-dt` replays a RAW partition filtered by
+`file_type = <raw flag>`, so a replay of an older partition finds nothing
+unless it runs with `--raw-flag ''`. Replay by `--run-id` instead, or
+re-load the partition.
+
 It refuses to submit and names the cause when the schema file is not beside
 the feed, the JDBC driver is missing, a connection variable is empty or
 still a placeholder, or the jar is absent — each of which would otherwise

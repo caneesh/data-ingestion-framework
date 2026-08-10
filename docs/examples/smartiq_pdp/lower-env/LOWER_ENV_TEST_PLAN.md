@@ -76,10 +76,25 @@ otherwise this feed appends to their table. Only the `audit.*`,
 No database-creation privilege is needed: the framework issues
 `CREATE DATABASE` only when the database is genuinely absent.
 
-**5. Decide the TLS route.** Either import the SQL Server CA into the JVM
-truststore on the driver and every executor (the only production-
-appropriate option), or uncomment the two lower-environment lines in the
-feed's `source` block. See the PKIX entry under Troubleshooting.
+**5. TLS — decided, and carrying an open action.** Both shipped feeds now
+set `allow_insecure_tls = true` with
+`connection_properties { trustServerCertificate = "true" }`, so no TLS step
+is needed to run. Encryption stays on; certificate **validation** is
+skipped, which means the connection cannot detect a man-in-the-middle and
+the service-account credential is exposed to anyone able to intercept it.
+Every run logs `INSECURE TLS override approved`.
+
+This is a stopgap pending the CA import, and it is **carried in both the
+lower-environment and production feeds** — so it will reach production
+unless it is removed. The exit is a platform request:
+
+```bash
+keytool -importcert -alias corp-ca -file corp-ca.crt \
+  -keystore "$JAVA_HOME/lib/security/cacerts" -storepass changeit
+```
+
+Once the CA is in the truststore on the driver and every executor, delete
+both lines from each feed. See the PKIX entry under Troubleshooting.
 
 **6. Set the environment and run.** Variable NAMES matter — `SMARTIQ_HOST`,
 not the placeholder value:

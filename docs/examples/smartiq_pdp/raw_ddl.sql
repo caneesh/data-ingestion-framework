@@ -29,7 +29,9 @@
 --    duplicates of the form_guid/form data columns anyway.
 --  * framework metadata columns appended (raw.record_hash = true and
 --    raw.lineage_extended = true per the feed config).
---  * load_dt partition kept (matches raw.partitioning in the feed config).
+--  * ingest_dt partition kept (matches raw.partitioning in the feed config).
+--    The NAME matters: RAW retention drops partitions on ingest_dt and
+--    --resume-ingest-dt replays one, both by that exact name.
 -- Alternative: skip this DDL entirely and let the framework create the
 -- table on first run, or set raw.metadata_columns = ALTER.
 -- ORC + EXTERNAL is deliberate: in Hive 3 a MANAGED ORC table is
@@ -419,6 +421,6 @@ CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_raw.smartiq_pdp (
   `source_operation` STRING COMMENT 'framework metadata (RawMetadata)',
   `source_primary_key` STRING COMMENT 'framework metadata (RawMetadata)'
 )
-PARTITIONED BY (`load_dt` STRING)
+PARTITIONED BY (`ingest_dt` STRING)
 STORED AS ORC
 LOCATION '${LOCATION}/smartiq_pdp';

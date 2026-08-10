@@ -56,6 +56,6 @@ CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_raw.smartiq_pdp_e2e (
   `source_operation` STRING COMMENT 'framework metadata (RawMetadata)',
   `source_primary_key` STRING COMMENT 'framework metadata (RawMetadata)'
 )
-PARTITIONED BY (`load_dt` STRING)
+PARTITIONED BY (`ingest_dt` STRING)
 STORED AS ORC
 LOCATION '${LOCATION}/smartiq_pdp_e2e';

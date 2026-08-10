@@ -144,6 +144,20 @@ final class RetentionService(spark: SparkSession, feedConf: Config, logger: Logg
             "supports single-key ingest_dt partitions only — nothing dropped")
           return Seq((table, "skipped (multi-key partitioning unsupported)", 0L))
         }
+        // A single-key partition under ANY OTHER NAME is the quiet failure:
+        // SHOW PARTITIONS succeeds, there is no '/' to trip the multi-key
+        // guard, and every partition then fails the name match — leaving
+        // retention to report "0 dropped" run after run, indistinguishable
+        // from a table that simply has nothing expired yet. Skip loudly, like
+        // the two cases above.
+        val partitionKeys = partitions.flatMap(_.split("=", 2).headOption).distinct
+        if (partitionKeys.nonEmpty && !partitionKeys.exists(_.equalsIgnoreCase("ingest_dt"))) {
+          logger.warn(s"[Retention] $table is partitioned by " +
+            s"${partitionKeys.mkString(", ")}, not ingest_dt; RAW retention drops partitions " +
+            "by that exact name — nothing dropped. Rename the partition column to ingest_dt " +
+            "(raw.partitioning.keys and the table DDL) to enable RAW retention.")
+          return Seq((table, s"skipped (partitioned by ${partitionKeys.mkString(",")}, not ingest_dt)", 0L))
+        }
         val expired = partitions.flatMap { p =>
           // "ingest_dt=2026-01-01"
           p.split("=", 2) match {

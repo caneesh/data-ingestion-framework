@@ -33,7 +33,7 @@
 --    TARGET the no-change skip and same-hash version advance never operate);
 --    src_form_guid/curated_load_ts REMOVED (the framework never populates
 --    foreign audit columns — they would stay NULL forever).
---  * PARTITIONED BY load_dt REMOVED: CUR_006 rejects full-replace publishes
+--  * PARTITIONED BY ingest_dt REMOVED: CUR_006 rejects full-replace publishes
 --    into partitioned Hive-format tables, and a latest-per-key table would
 --    move rows between partitions on every update.
 --  * last_modified_datetime stays STRING per the all-string contract; the

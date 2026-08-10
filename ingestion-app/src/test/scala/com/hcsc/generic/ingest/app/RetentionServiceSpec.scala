@@ -135,6 +135,31 @@ class RetentionServiceSpec extends AnyFunSuite with BeforeAndAfterAll {
       "no partition may be dropped from an unsupported layout")
   }
 
+  test("a raw table partitioned under another name is skipped loudly, never silently") {
+    // The quietest failure of the three: SHOW PARTITIONS succeeds because the
+    // table IS partitioned, and there is no '/' to trip the multi-key guard,
+    // so every partition simply fails the ingest_dt name match. Reported as
+    // "0 dropped", that is indistinguishable from a table with nothing yet
+    // expired — and RAW would never be purged, run after run, silently.
+    spark.sql(
+      """CREATE TABLE r_raw.member_ld (id STRING)
+        |PARTITIONED BY (load_dt STRING) STORED AS ORC""".stripMargin)
+    spark.sql("INSERT INTO r_raw.member_ld PARTITION (load_dt='2020-01-01') VALUES ('old')")
+
+    val conf = ConfigFactory.parseString(
+      """
+        |raw { database = r_raw, table = member_ld }
+        |retention { raw = "365d" }
+        |""".stripMargin)
+    val results = new RetentionService(spark, conf, logger).run(dryRun = false)
+
+    assert(results.exists { case (t, action, n) =>
+      t == "r_raw.member_ld" && action.contains("not ingest_dt") && n == 0L },
+      s"a differently-named partition column must be reported as skipped, got $results")
+    assert(spark.sql("SHOW PARTITIONS r_raw.member_ld").count() == 1,
+      "nothing may be dropped from a layout retention cannot interpret")
+  }
+
   test("a retention run without a retention block fails with guidance") {
     val e = intercept[IllegalArgumentException] {
       new RetentionService(spark, ConfigFactory.parseString("{}"), logger).run(dryRun = false)

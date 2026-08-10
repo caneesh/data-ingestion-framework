@@ -96,8 +96,35 @@ keytool -importcert -alias corp-ca -file corp-ca.crt \
 Once the CA is in the truststore on the driver and every executor, delete
 both lines from each feed. See the PKIX entry under Troubleshooting.
 
-**6. Set the environment and run.** Variable NAMES matter — `SMARTIQ_HOST`,
-not the placeholder value:
+**6. Run it.** `scripts/run_smartiq.sh` assembles the whole invocation from
+one settings file, so the variable names, paths and flags cannot be got
+wrong per-run. Set it up once:
+
+```bash
+cp scripts/smartiq.env.example scripts/smartiq.env
+chmod 600 scripts/smartiq.env
+# edit: host, database, user, conf directory, jar path, JDBC driver path
+```
+
+Then each run is one line — the password is prompted, never echoed:
+
+```bash
+scripts/run_smartiq.sh e2e INCR --validate-only     # no writes
+scripts/run_smartiq.sh e2e INCR --dry-run           # reads, reconciles, writes nothing
+scripts/run_smartiq.sh e2e INCR --run-id e2e-1      # the real thing
+scripts/run_smartiq.sh prod INCR --run-id pdp-initial-1   # 364-column feed
+```
+
+It refuses to submit and names the cause when the schema file is not beside
+the feed, the JDBC driver is missing, a connection variable is empty or
+still a placeholder, or the jar is absent — each of which would otherwise
+surface minutes later as an error describing a symptom rather than its
+cause. `e2e` and `prod` carry their own feed, contract, entity **and source
+table**, so a production run cannot read the test table through a stale
+exported variable.
+
+<details>
+<summary>Equivalent manual invocation</summary>
 
 ```bash
 export SMARTIQ_HOST=<sql host>
@@ -113,6 +140,7 @@ INGEST_EXTRA_FILES="$PWD/smartiq-pdp-e2e-schema.conf" \
   scripts/run_ingest.sh "$PWD/feed-smartiq-pdp-e2e.conf" smartiq_pdp_e2e INCR \
   --validate-only
 ```
+</details>
 
 `--validate-only` checks config, contract and connectivity while writing
 nothing. When it passes, replace it with `--run-id e2e-1` and work through

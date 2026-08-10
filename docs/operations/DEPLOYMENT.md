@@ -154,6 +154,30 @@ would collide. `docs/examples/smartiq_pdp/` shows the full shape.
 
 ## 5. spark-submit examples
 
+### Ready-made launchers
+
+`scripts/` holds the submit wrappers. Each takes the feed config, entity and
+mode, and forwards any further flags to the application:
+
+| Script | Runs |
+|---|---|
+| `run_ingest.sh` | COUPLED — raw then curated in one job (the usual case) |
+| `run_raw.sh` | DECOUPLED job 1 of 2 — raw only |
+| `run_curated_pending.sh` | DECOUPLED job 2 of 2 — drain pending curated batches |
+| `run_smartiq.sh` | the SmartIQ feeds, with site settings in one file and preflight checks |
+
+They share `ingest_submit_common.sh`, configured by environment:
+`INGEST_DEPLOY_MODE` (`cluster` default, or `client`), `INGEST_JARS` (vendor
+JDBC driver — required for jdbc feeds), `INGEST_EXTRA_FILES` (files the
+config `include`s), `INGEST_ENV_VARS` (names forwarded to a cluster-mode
+driver), `INGEST_JAR` (jar path).
+
+A feed-specific launcher like `run_smartiq.sh` is worth writing per pipeline:
+it keeps site values in one gitignored settings file, prompts for the
+credential rather than storing it, and refuses to submit when a prerequisite
+is missing — naming the cause instead of letting it surface minutes later as
+a symptom.
+
 The reference invocation is `scripts/run_health_sherpa.sh`:
 
 ```bash

@@ -6,3 +6,6 @@ target/
 *.iml
 .DS_Store
 spark-warehouse
+
+# site settings, not framework config
+scripts/smartiq.env

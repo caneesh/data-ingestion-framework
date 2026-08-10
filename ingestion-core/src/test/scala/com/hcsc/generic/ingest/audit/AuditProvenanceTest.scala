@@ -28,13 +28,7 @@ class AuditProvenanceTest extends AnyFunSuite with SharedSparkSession {
   private def ctx(runId: String) = RunContext(runId, "prov_feed", "INCR", "I")
 
   locally {
-    val warehouse = new java.io.File(
-      new java.net.URI(spark.conf.get("spark.sql.warehouse.dir")).getPath, s"$db.db")
-    def purge(f: java.io.File): Unit = {
-      if (f.isDirectory) f.listFiles().foreach(purge)
-      f.delete()
-    }
-    if (warehouse.exists()) purge(warehouse)
+    purgeWarehouseDb(db)
     spark.sql(s"DROP TABLE IF EXISTS $db.run_audit")
 
     audit.recordStage(ctx("P1"), Stages.Raw, StageStatus.Success,

@@ -80,7 +80,17 @@ object SchemaVersions {
         val existing = spark.sql(s"SHOW TBLPROPERTIES $fullTable").collect()
           .map(r => r.getString(0) -> r.getString(1)).toMap
         desired.forall { case (k, v) => existing.get(k).contains(v) }
-      } catch { case _: Exception => false }
+      } catch {
+        // Deliberately swallowed: this read is only a fast path around the
+        // ALTER below. Failing it means "assume not recorded", so the ALTER
+        // still runs and reports its own failure — nothing is lost, at worst
+        // one redundant metastore write. Logged at debug so a metastore
+        // problem is still traceable without warning on every such read.
+        case e: Exception =>
+          logger.debug(s"[SchemaVersions] Could not read TBLPROPERTIES of $fullTable " +
+            s"(${e.getMessage}); proceeding to set them")
+          false
+      }
     if (unchanged) return
     val props = desired.map { case (k, v) => s"'$k'='${escape(v)}'" }.mkString(", ")
     try {

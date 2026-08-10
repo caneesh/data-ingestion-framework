@@ -29,18 +29,7 @@ class CuratedRunLineageTest extends AnyFunSuite with SharedSparkSession {
   private def ctx(runId: String) = RunContext(runId, "lineage_feed", "INCR", "I")
 
   locally {
-    // DROP TABLE clears the metastore entry but leaves the warehouse
-    // directory, which OUTLIVES the JVM — the next run then fails with
-    // LOCATION_ALREADY_EXISTS. Same trap as a dropped EXTERNAL table in
-    // production: the metadata goes, the files stay. (Precedent:
-    // AuditPendingQueriesTest.)
-    val warehouse = new java.io.File(
-      new java.net.URI(spark.conf.get("spark.sql.warehouse.dir")).getPath, "lineage_db.db")
-    def purge(f: java.io.File): Unit = {
-      if (f.isDirectory) f.listFiles().foreach(purge)
-      f.delete()
-    }
-    if (warehouse.exists()) purge(warehouse)
+    purgeWarehouseDb("lineage_db")
     spark.sql("CREATE DATABASE IF NOT EXISTS lineage_db")
     Seq("with_lineage", "without_lineage").foreach(t =>
       spark.sql(s"DROP TABLE IF EXISTS lineage_db.$t"))

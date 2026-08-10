@@ -35,16 +35,7 @@ class AuditPendingQueriesTest extends AnyFunSuite with SharedSparkSession {
   //     curated SUCCESS then curated SKIPPED       -> done (EXISTS beats latest)
   //  G: curated SUCCESS then curated FAILED retry  -> done (monotone checkpoint)
   locally {
-    // The shared non-Hive session forgets tables between JVMs but their
-    // WAREHOUSE LOCATIONS persist — purge the leftover physical dir so
-    // CREATE TABLE cannot hit LOCATION_ALREADY_EXISTS on the next run.
-    val warehouse = new java.io.File(
-      new java.net.URI(spark.conf.get("spark.sql.warehouse.dir")).getPath, "apq_audit.db")
-    def purge(f: java.io.File): Unit = {
-      if (f.isDirectory) f.listFiles().foreach(purge)
-      f.delete()
-    }
-    if (warehouse.exists()) purge(warehouse)
+    purgeWarehouseDb("apq_audit")
     spark.sql("DROP TABLE IF EXISTS apq_audit.run_audit")
 
     raw("A", StageStatus.Started); raw("A", StageStatus.Success); curated("A", StageStatus.Success)

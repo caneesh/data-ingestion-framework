@@ -41,18 +41,61 @@
 #     scripts/run_ingest.sh /path/feed.conf my_feed INCR
 set -euo pipefail
 
+# Joins a comma-separated list, DROPPING empty elements and checking each
+# path exists. A stray comma ("a.conf," or "a.conf,,b.conf") otherwise
+# reaches spark-submit as an empty element, and YARN fails deep in
+# prepareLocalResources with "Can not create a Path from an empty string" —
+# an error that names neither the option nor the file responsible.
+# Echoes the cleaned list; returns non-zero (with a message) if a path is
+# missing.
+_ingest_clean_list() {
+  local what="$1"; local raw="$2"; local out=(); local rc=0
+  local IFS=','; local part
+  for part in $raw; do
+    part="${part#"${part%%[![:space:]]*}"}"   # ltrim
+    part="${part%"${part##*[![:space:]]}"}"   # rtrim
+    [[ -z "$part" ]] && continue              # stray comma: drop it
+    if [[ ! -f "$part" ]]; then
+      echo "ERROR: $what lists a file that does not exist: '$part'" >&2
+      rc=1
+    fi
+    out+=("$part")
+  done
+  (IFS=','; echo "${out[*]}")
+  return $rc
+}
+
 submit_ingest() {
   local CONF_FILE="$1"; local ENTITY="$2"; local JAR_FILE="$3"; shift 3
   local CONF_NAME; CONF_NAME="$(basename "$CONF_FILE")"
-  local FILES="$CONF_FILE"
-  if [[ -n "${INGEST_EXTRA_FILES:-}" ]]; then
-    FILES="$FILES,$INGEST_EXTRA_FILES"
+
+  # Fail here, with the cause named, rather than minutes later inside YARN.
+  local FILES
+  FILES="$(_ingest_clean_list "--files (feed config + INGEST_EXTRA_FILES)" \
+            "$CONF_FILE,${INGEST_EXTRA_FILES:-}")" || return 2
+
+  if [[ ! -f "$JAR_FILE" ]]; then
+    echo "ERROR: application jar not found: '$JAR_FILE'" >&2
+    echo "       Set INGEST_JAR to the assembly jar, or pass it as the 4th argument." >&2
+    return 2
   fi
+  # INGEST_JAR (application) and INGEST_JARS (vendor drivers) differ by one
+  # letter and are easy to cross. A driver jar has no Main-Class, so the run
+  # would fail late and obscurely; say so now.
+  case "$(basename "$JAR_FILE")" in
+    mssql-jdbc*|ojdbc*|postgresql-*|mysql-connector*|*jdbc*.jar)
+      echo "ERROR: INGEST_JAR looks like a JDBC DRIVER: $(basename "$JAR_FILE")" >&2
+      echo "       INGEST_JAR  = the application assembly jar (ingestion-app-...-jar-with-dependencies.jar)" >&2
+      echo "       INGEST_JARS = the vendor JDBC driver(s)  <- you probably meant this" >&2
+      return 2 ;;
+  esac
 
   # Vendor JDBC driver(s), distributed to the driver and every executor.
   local JAR_OPTS=()
   if [[ -n "${INGEST_JARS:-}" ]]; then
-    JAR_OPTS=(--jars "$INGEST_JARS")
+    local CLEAN_JARS
+    CLEAN_JARS="$(_ingest_clean_list "INGEST_JARS" "$INGEST_JARS")" || return 2
+    [[ -n "$CLEAN_JARS" ]] && JAR_OPTS=(--jars "$CLEAN_JARS")
   fi
 
   # cluster (default, what Control-M runs) | client (driver = this shell).

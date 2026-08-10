@@ -167,10 +167,25 @@ mode, and forwards any further flags to the application:
 | `run_smartiq.sh` | the SmartIQ feeds, with site settings in one file and preflight checks |
 
 They share `ingest_submit_common.sh`, configured by environment:
-`INGEST_DEPLOY_MODE` (`cluster` default, or `client`), `INGEST_JARS` (vendor
-JDBC driver — required for jdbc feeds), `INGEST_EXTRA_FILES` (files the
-config `include`s), `INGEST_ENV_VARS` (names forwarded to a cluster-mode
-driver), `INGEST_JAR` (jar path).
+
+| Variable | Meaning |
+|---|---|
+| `INGEST_DEPLOY_MODE` | `cluster` (default) or `client` |
+| `INGEST_JAR` | **the application** assembly jar |
+| `INGEST_JARS` | **the vendor JDBC driver(s)**, comma-separated |
+| `INGEST_EXTRA_FILES` | files the feed config `include`s, comma-separated |
+| `INGEST_ENV_VARS` | variable NAMES forwarded to a cluster-mode driver |
+
+`INGEST_JAR` and `INGEST_JARS` differ by one letter and mean different
+things; the wrapper rejects an `INGEST_JAR` that looks like a JDBC driver
+rather than letting the run fail later with no main class.
+
+The wrapper validates before submitting: every path in `--files` and
+`--jars` must exist, and empty elements from a stray comma
+(`"a.conf,"`, `"a.conf,,b.conf"`) are dropped. Left in, they reach YARN as
+an empty path and fail inside `prepareLocalResources` with *"Can not create
+a Path from an empty string"* — an error naming neither the option nor the
+file.
 
 A feed-specific launcher like `run_smartiq.sh` is worth writing per pipeline:
 it keeps site values in one gitignored settings file, prompts for the

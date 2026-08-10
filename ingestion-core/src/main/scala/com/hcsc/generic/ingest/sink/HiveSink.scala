@@ -30,7 +30,28 @@ object HiveSink extends Sink {
       val targetCols = spark.table(fullTable).columns
       val actual = withPartitions.columns.map(_.toLowerCase).toSet
       val missing = targetCols.filterNot(c => actual.contains(c.toLowerCase))
-      require(missing.isEmpty, s"DataFrame is missing target columns: ${missing.mkString(",")}")
+      if (missing.nonEmpty) {
+        // A missing PARTITION column has one overwhelmingly likely cause: the
+        // table's partition column and raw.partitioning.keys/derive disagree,
+        // usually because the DDL and the feed config were updated out of
+        // step. Naming the configured keys turns "add the column somehow"
+        // into a one-line diff.
+        val targetPartitions =
+          try spark.catalog.listColumns(fullTable).collect()
+            .filter(_.isPartition).map(_.name.toLowerCase).toSet
+          catch { case scala.util.control.NonFatal(_) => Set.empty[String] }
+        val missingPartitions = missing.filter(c => targetPartitions.contains(c.toLowerCase))
+        val hint =
+          if (missingPartitions.isEmpty) ""
+          else s". ${missingPartitions.mkString(",")} " +
+            (if (missingPartitions.length == 1) "is a PARTITION column of" else "are PARTITION columns of") +
+            s" $fullTable, but raw.partitioning produces " +
+            (if (partitionSpec.keys.isEmpty) "no partition columns"
+             else s"[${partitionSpec.keys.mkString(",")}]") +
+            " — the table DDL and the feed config disagree. Align " +
+            "raw.partitioning.keys/derive with the table, or recreate the table to match"
+        require(false, s"DataFrame is missing target columns: ${missing.mkString(",")}$hint")
+      }
 
       val targetSet = targetCols.map(_.toLowerCase).toSet
       val extra = withPartitions.columns.filterNot(c => targetSet.contains(c.toLowerCase))

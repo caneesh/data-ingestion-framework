@@ -165,6 +165,7 @@ mode, and forwards any further flags to the application:
 | `run_raw.sh` | DECOUPLED job 1 of 2 — raw only |
 | `run_curated_pending.sh` | DECOUPLED job 2 of 2 — drain pending curated batches |
 | `run_smartiq.sh` | the SmartIQ feeds, with site settings in one file and preflight checks |
+| `sync_artifacts.sh` | copies jar + feed/schema configs from the checkout to the run directory, reporting what was stale |
 
 They share `ingest_submit_common.sh`, configured by environment:
 

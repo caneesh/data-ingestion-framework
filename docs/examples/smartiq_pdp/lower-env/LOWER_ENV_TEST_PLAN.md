@@ -12,7 +12,22 @@ what to change before a run, and the two steps worth not skipping are 2
 (nothing works until it is done) and 4 (it can write into another team's
 table).
 
-**1. Refresh the artifacts on the edge node.** All of these changed:
+**1. Refresh the artifacts on the edge node.**
+
+```bash
+git pull
+scripts/sync_artifacts.sh --check    # what is stale?
+scripts/sync_artifacts.sh            # copy it into SMARTIQ_CONF_DIR
+```
+
+`--check` reports and exits non-zero on drift; without it the files are
+copied and each is listed as `same`, `STALE→copied` or `NEW→copied`. The jar
+is never rebuilt — an absent or stale one is reported, because which commit
+you deploy is a decision, not a side effect. `run_smartiq.sh` runs the same
+check before every submit and warns (without blocking) when the run
+directory differs from the repo.
+
+These are the artifacts it keeps in step:
 
 | Artifact | Why it must be re-copied |
 |---|---|

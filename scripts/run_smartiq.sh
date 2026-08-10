@@ -99,6 +99,18 @@ fi
 
 [[ $FAILED -eq 0 ]] || die "preflight failed; nothing was submitted"
 
+# Staleness is the failure this preflight cannot see by inspecting one file:
+# a config that parses perfectly can still be an older revision than the
+# table it writes to. Warn (never block — the operator may be running a
+# deliberately pinned copy) and only when the repo is actually to hand.
+if [[ -x "$SCRIPT_DIR/sync_artifacts.sh" ]] && [[ -d "$SCRIPT_DIR/../.git" ]]; then
+  if ! "$SCRIPT_DIR/sync_artifacts.sh" --check --to "$SMARTIQ_CONF_DIR" >/dev/null 2>&1; then
+    note "WARN: $SMARTIQ_CONF_DIR differs from the repo — run"
+    note "      scripts/sync_artifacts.sh --check   to see what, or"
+    note "      scripts/sync_artifacts.sh           to refresh"
+  fi
+fi
+
 # ---- credential -------------------------------------------------------------
 # Prompted, never echoed, never written to a file or a command line.
 if [[ -z "${SMARTIQ_DB_PASSWORD:-}" ]]; then

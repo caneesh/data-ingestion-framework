@@ -56,7 +56,14 @@ _ingest_clean_list() {
     part="${part%"${part##*[![:space:]]}"}"   # rtrim
     [[ -z "$part" ]] && continue              # stray comma: drop it
     if [[ ! -f "$part" ]]; then
-      echo "ERROR: $what lists a file that does not exist: '$part'" >&2
+      # Show the RESOLVED path: a bare filename silently resolves against the
+      # current directory, and "feed.conf does not exist" gives no hint that
+      # the cwd is the problem rather than the file.
+      local resolved="$part"
+      [[ "$part" != /* ]] && resolved="$PWD/$part"
+      echo "ERROR: $what lists a file that does not exist:" >&2
+      echo "         given:    $part" >&2
+      [[ "$resolved" != "$part" ]] && echo "         resolved: $resolved" >&2
       rc=1
     fi
     out+=("$part")

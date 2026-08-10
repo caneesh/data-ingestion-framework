@@ -15,20 +15,9 @@ import java.util.Properties
   * observes updateCount == 1 and wins; there is no settle window and no
   * race to shrink.
   *
-  * Control table (auto-created when missing):
-  * {{{
-  *   ingestion_lock(
-  *     entity_name       VARCHAR(200) PRIMARY KEY,
-  *     holder_run_id     VARCHAR(200) NULL,
-  *     lease_acquired_ts TIMESTAMP,
-  *     lease_expires_ts  TIMESTAMP,
-  *     lease_version     BIGINT
-  *   )
-  * }}}
-  * The auto-create DDL is ANSI and works on H2. On SQL Server, pre-create
-  * the table with DATETIME2 columns instead — SQL Server's TIMESTAMP type
-  * is a rowversion, not a datetime. The DML (parameterized UPDATEs and
-  * CURRENT_TIMESTAMP) is portable across both.
+  * The control table is auto-created when missing. On SQL Server, pre-create
+  * it with DATETIME2 columns instead: SQL Server's TIMESTAMP is a rowversion,
+  * not a datetime, so the ANSI auto-create DDL produces the wrong type there.
   *
   * Clock model: lease expiry COMPARISONS happen on the database's single
   * CURRENT_TIMESTAMP clock, so all competing runs are judged by one clock.

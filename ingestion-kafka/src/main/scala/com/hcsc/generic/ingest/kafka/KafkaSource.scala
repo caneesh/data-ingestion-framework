@@ -26,19 +26,7 @@ import org.apache.spark.sql.functions._
   * curated + audit succeed; a failed run never moves offsets and the
   * replay re-reads the same window idempotently.
   *
-  * source {
-  *   type = kafka
-  *   bootstrap.servers = "..."
-  *   topic = "..."
-  *   value.format = string | json          # value.schema required for json
-  *   retain_kafka_metadata = true          # false drops kafka_* after read
-  *   offsets {
-  *     track = true
-  *     database = "ingest_audit"
-  *     table = "ingest_kafka_offsets"
-  *     default_start = earliest | latest   # partitions never consumed
-  *   }
-  * }
+  * Configuration reference: docs/architecture/CONFIGURATION_MODEL.md.
   */
 object KafkaSource extends Source with WatermarkAdvancing {
   private val logger = Logger.getLogger(getClass.getName)

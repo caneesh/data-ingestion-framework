@@ -9,14 +9,8 @@ import org.apache.spark.sql.functions.{col, row_number}
 import java.time.LocalDate
 
 /**
-  * Config-driven retention/purge for the append-only stores (spec §17):
-  *
-  * retention {
-  *   raw = "400d"               # drop ingest_dt partitions older than this
-  *   rejects = "90d"            # reject_ts cutoff for the reject table
-  *   audit = "730d"             # event_ts cutoff for the audit tables
-  *   watermarks_keep_last = 50  # versions retained per entity
-  * }
+  * Config-driven retention/purge for the append-only stores (spec §17).
+  * Configuration reference: docs/architecture/CONFIGURATION_MODEL.md.
   *
   * Semantics:
   * - RAW: partition drops only (ALTER TABLE DROP PARTITION on ingest_dt) —

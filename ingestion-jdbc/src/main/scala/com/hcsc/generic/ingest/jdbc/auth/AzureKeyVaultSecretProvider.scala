@@ -5,38 +5,21 @@ import com.typesafe.config.Config
 import org.apache.log4j.Logger
 
 /**
-  * Azure Key Vault secret provider. Retrieves a secret value from an Azure Key
-  * Vault instance. Reference form in HOCON:
+  * Azure Key Vault secret provider. Configuration reference:
+  * docs/architecture/CONFIGURATION_MODEL.md.
   *
-  *   password = {
-  *     provider    = "azure_keyvault"
-  *     vault_url   = "https://myvault.vault.azure.net"
-  *     secret_name = "sqlserver-pwd"
-  *     secret_version = "..."   # optional; omit for the current version
-  *   }
+  * Authentication goes through `DefaultAzureCredentialBuilder`, so no secret
+  * material lives in this framework's config: the deployment chooses the
+  * mechanism (managed identity, environment service principal, CLI login) by
+  * how the runtime is provisioned.
   *
-  * Authentication uses `DefaultAzureCredentialBuilder`, which walks a chain of
-  * credential sources without any secret material in this framework's config:
-  * managed identity (AKS/VM/App Service), environment service principal
-  * (AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_TENANT_ID), and finally the
-  * Azure CLI login for local development. Deployments choose the mechanism by
-  * how the runtime environment is provisioned.
+  * The Azure SDK artifacts are `<optional>` in the pom — compile-time
+  * available, not forced on consumers — so a deployment using this provider
+  * must bundle them. Their absence is caught and reported as JDBC_002 rather
+  * than surfacing as NoClassDefFoundError.
   *
-  * Optional dependency: `azure-security-keyvault-secrets` and `azure-identity`
-  * are declared `<optional>true</optional>` in ingestion-jdbc's pom, so they are
-  * compile-time available but NOT forced onto consumers. A deployment that uses
-  * this provider must bundle both artifacts (e.g. via the assembly / spark
-  * `--packages`). When the SDK is absent at runtime, retrieval fails fast with a
-  * JDBC_002 error explaining what to bundle rather than a raw
-  * NoClassDefFoundError.
-  *
-  * Retrieved secrets are cached per JVM keyed by
-  * (vault_url, secret_name, secret_version) so repeated resolutions within a run
-  * (e.g. driver plus multiple executor tasks in the same JVM) do not repeatedly
-  * hit the vault. The cache is TTL-bounded (`cache_ttl_ms`, default 300000;
-  * 0 disables caching) so long-lived JVMs pick up rotated secrets — the same
-  * caching contract as the CyberArk and Conjur providers. `clearCache()`
-  * resets the cache for tests.
+  * Secrets are cached per JVM, TTL-bounded so long-lived JVMs pick up
+  * rotations; same contract as the CyberArk and Conjur providers.
   */
 object AzureKeyVaultSecretProvider extends SecretProvider {
   private val logger = Logger.getLogger(getClass.getName)

@@ -107,14 +107,7 @@ final case class HeaderAuditRecord(
   * every call is a logged no-op, so feeds keep working without audit
   * infrastructure.
   *
-  * Config:
-  * audit {
-  *   enabled = true
-  *   database = "ingest_audit"
-  *   file_table = "ingest_file_audit"
-  *   run_table = "ingest_run_audit"
-  *   reconciliation_table = "ingest_reconciliation"
-  * }
+  * Configuration reference: docs/architecture/CONFIGURATION_MODEL.md.
   */
 final class AuditService(
   spark: SparkSession,
@@ -301,11 +294,9 @@ final class AuditService(
       s"missingRequired=[${record.missing_required_columns}]")
   }
 
-  /** A dry run records SUCCESS while writing nothing, so it must never
-    * checkpoint a batch or prove a raw slice exists. `coalesce` matters:
-    * a bare `=!=` against a NULL message evaluates to NULL, and `filter`
-    * drops non-TRUE rows — a null-message SUCCESS would silently vanish
-    * from every checkpoint query. */
+  /** A dry run records SUCCESS while writing nothing, so it never
+    * checkpoints a batch. coalesce is required: `=!=` against a NULL message
+    * yields NULL, which filter drops — silently losing real successes. */
   private def notDryRun: org.apache.spark.sql.Column = {
     import org.apache.spark.sql.functions.{coalesce, col, lit}
     coalesce(col("message"), lit("")) =!= "dry-run"

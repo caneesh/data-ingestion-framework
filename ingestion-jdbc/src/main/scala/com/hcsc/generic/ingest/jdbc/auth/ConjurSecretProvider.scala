@@ -5,25 +5,15 @@ import com.typesafe.config.{Config, ConfigValueType}
 import org.apache.log4j.Logger
 
 /**
-  * CyberArk Conjur secret provider. Reference form:
+  * CyberArk Conjur secret provider. Configuration reference:
+  * docs/architecture/CONFIGURATION_MODEL.md.
   *
-  *   password = {
-  *     provider = "conjur"
-  *     url      = "https://conjur.example.com"
-  *     account  = "myorg"
-  *     host_id  = "data/ingestion/spark"          # 'host/' prefix optional
-  *     api_key  = { provider = "env", key = "CONJUR_API_KEY" }
-  *     variable = "applications/ingestion/database/password"
-  *   }
+  * `api_key` is itself a secret reference resolved through the registry, so
+  * the bootstrap credential need not be inline either. Plain-http urls are
+  * rejected unless `allow_insecure_http = true`.
   *
-  * `api_key` is itself a secret reference resolved through the registry
-  * (env/file/sysprop/...); a bare string is accepted for dev use with the
-  * standard inline warning. Plain-http urls are rejected unless
-  * `allow_insecure_http = true` (isolated dev only). Optional fields:
-  * `connect_timeout_ms` (5000),
-  * `read_timeout_ms` (10000), `max_attempts` (3), `cache_ttl_ms` (300000;
-  * 0 disables the resolved-secret cache — the short-lived auth token is
-  * cached separately inside ConjurClient).
+  * Two caches with different lifetimes: the resolved secret (`cache_ttl_ms`)
+  * and the short-lived auth token, held separately inside ConjurClient.
   */
 object ConjurSecretProvider extends SecretProvider {
   private val logger = Logger.getLogger(getClass.getName)

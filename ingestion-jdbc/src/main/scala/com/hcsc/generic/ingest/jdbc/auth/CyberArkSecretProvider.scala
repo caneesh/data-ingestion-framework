@@ -8,44 +8,17 @@ import java.net.{HttpURLConnection, URL, URLEncoder}
 import scala.collection.JavaConverters._
 
 /**
-  * CyberArk Central Credential Provider (CCP) secret provider. Retrieves an
-  * account from the AIM web service and exposes any response attribute —
-  * `Content` (the password, default) or `UserName` — so ONE vault object
-  * serves both credentials:
+  * CyberArk CCP secret provider. Exposes any response attribute (`Content`,
+  * the default, or `UserName`), so one vault object can serve both
+  * credentials. Configuration reference: docs/architecture/CONFIGURATION_MODEL.md.
   *
-  *   auth {
-  *     user = {
-  *       provider = "cyberark"
-  *       url      = "https://ccp.example.com"
-  *       app_id   = "APP_DataIngestion"
-  *       safe     = "AAM_DB_Safe"
-  *       object   = "sqlserver-svc-account"
-  *       attribute = "UserName"
-  *     }
-  *     password = {
-  *       provider = "cyberark"
-  *       url      = "https://ccp.example.com"
-  *       app_id   = "APP_DataIngestion"
-  *       safe     = "AAM_DB_Safe"
-  *       object   = "sqlserver-svc-account"
-  *       # attribute = "Content" is the default
-  *     }
-  *   }
+  * Plain-http urls are rejected unless `allow_insecure_http = true`: CCP
+  * responses carry the retrieved credential and must not transit
+  * unencrypted. TLS verification is never disabled here; client-certificate
+  * auth comes from the standard JVM TLS configuration.
   *
-  * Optional fields: `folder` (CCP Folder), `params { ... }` (extra query
-  * parameters such as Query/QueryFormat), `connect_timeout_ms` (default
-  * 5000), `read_timeout_ms` (default 10000), `cache_ttl_ms` (default 300000;
-  * 0 disables caching). Plain-http urls are rejected unless
-  * `allow_insecure_http = true` (isolated dev only) — CCP responses carry
-  * the retrieved credential and must not transit unencrypted.
-  *
-  * Responses are cached per request URL for the TTL, so resolving user and
-  * password from the same object costs a single CCP call per run.
-  *
-  * Client-certificate authentication to CCP uses the standard JVM TLS
-  * configuration (`-Djavax.net.ssl.keyStore=...` via
-  * `spark.driver.extraJavaOptions`); the JDK HTTP stack picks it up
-  * automatically. TLS verification is never disabled by this provider.
+  * Responses are cached per request URL, so resolving user and password from
+  * the same object costs one CCP call per run.
   */
 object CyberArkSecretProvider extends SecretProvider {
   private val logger = Logger.getLogger(getClass.getName)

@@ -24,18 +24,7 @@ final class RejectThresholdExceededException(message: String) extends RuntimeExc
   * Splits records into accepted/rejected using configurable rules, persists
   * rejected rows with full lineage, and enforces reject thresholds.
   *
-  * rejects {
-  *   enabled = true
-  *   database = "ingest_audit"
-  *   table = "ingest_rejects"
-  *   use_contract_nullability = true   # derive rules from schema contract
-  *   rules = [
-  *     { name = "missing_subscriber", condition = "subscriber_id IS NULL OR trim(subscriber_id) = ''",
-  *       error_code = "R001", category = "MISSING_KEY", message = "subscriber_id is required" }
-  *   ]
-  *   max_reject_count = 1000
-  *   max_reject_percent = 5.0
-  * }
+  * Configuration reference: docs/architecture/CONFIGURATION_MODEL.md.
   */
 final class RejectService(
   spark: SparkSession,

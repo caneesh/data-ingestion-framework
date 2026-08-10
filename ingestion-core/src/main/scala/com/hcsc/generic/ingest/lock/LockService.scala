@@ -31,16 +31,8 @@ final class PipelineLockException(message: String) extends RuntimeException(mess
   *
   * A crashed run's lease expires after lease_minutes (default 4h); an
   * operator can release earlier via forceRelease (or by appending a RELEASE
-  * row manually).
-  *
-  * concurrency {
-  *   lock = REQUIRED | OFF        # default REQUIRED
-  *   provider = HIVE              # this class; JDBC selects JdbcRunLock
-  *   database = "ingest_audit"    # defaults to audit.database
-  *   table = "ingest_run_locks"
-  *   lease_minutes = 240
-  *   settle_ms = 2000
-  * }
+  * row manually). Configuration reference:
+  * docs/architecture/CONFIGURATION_MODEL.md.
   */
 final class LockService(
   spark: SparkSession,

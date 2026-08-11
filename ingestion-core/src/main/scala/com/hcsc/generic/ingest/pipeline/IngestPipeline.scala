@@ -427,7 +427,12 @@ final class IngestPipeline(
     /** Rows the DEDUPLICATED_APPEND delivery mode skipped because the same
       * source-version identity already exists in RAW — the measured overlap
       * reread. 0 under AT_LEAST_ONCE_APPEND. */
-    overlapSkipped: Long = 0L)
+    overlapSkipped: Long = 0L,
+    /** The RAW write was skipped because rows already existed under THIS
+      * run id. The rows in RAW are a previous attempt's, so they need not
+      * match what this run read — which is what makes the resulting
+      * raw_equals_accepted mismatch confusing without explanation. */
+    runIdSkipped: Boolean = false)
 
   /** Runs a stage unless --resume finds it already SUCCESS; records audit
     * STARTED/SUCCESS/FAILED around the body. Returns None when skipped. */
@@ -605,7 +610,7 @@ final class IngestPipeline(
     val split = rejectService.split(withMeta, ctx)
     val accepted = track(split.accepted.persist(StorageLevel.MEMORY_AND_DISK))
 
-    val (windowSkipped, overlapSkipped) =
+    val (windowSkipped, overlapSkipped, runIdSkipped) =
       writeRawIdempotently(accepted, rawConf, rawFullTable, rawDatabase, rawTable, window, rejectService)
 
     val acceptedCount = if (split.acceptedCount >= 0) split.acceptedCount else sourceCount
@@ -652,7 +657,7 @@ final class IngestPipeline(
       rejectedCount = split.rejectedCount,
       controlTotal = controlTotal(accepted)
     )
-    RawOutcome(accepted, counts, window, duplicateVersions, overlapSkipped)
+    RawOutcome(accepted, counts, window, duplicateVersions, overlapSkipped, runIdSkipped)
   }
 
   /** Multi-file batch safety: staged files were validated per-file at
@@ -729,10 +734,10 @@ final class IngestPipeline(
     rawTable: String,
     window: Option[(String, Option[String])],
     rejectService: RejectService
-  ): (Option[(String, String)], Long) = {
+  ): (Option[(String, String)], Long, Boolean) = {
     if (ctx.dryRun) {
       logger.info("[Pipeline] DRY-RUN: skipping RAW write")
-      return (None, 0L)
+      return (None, 0L, false)
     }
     val runIdLoaded = spark.catalog.tableExists(rawFullTable) &&
       spark.table(rawFullTable).columns.contains("run_id") &&
@@ -851,7 +856,7 @@ final class IngestPipeline(
         spark.catalog.tableExists(rawFullTable))
       recordHashVersionProperty(rawFullTable,
         com.hcsc.generic.ingest.transform.RecordHash.recipeVersion(recordHashOptions(rawConf)))
-    (windowLoaded, overlapSkipped)
+    (windowLoaded, overlapSkipped, runIdLoaded)
   }
 
   private def recordHashOptions(rawConf: Config): com.hcsc.generic.ingest.transform.RecordHashOptions = {
@@ -1046,10 +1051,21 @@ final class IngestPipeline(
         .flatMap(a => ConfigUtils.optString(a, "reconciliation.on_mismatch"))
         .getOrElse("FAIL").toUpperCase
       val summary = failed.map(f => s"${f._1}: expected=${f._2} actual=${f._3}").mkString("; ")
+      // A run-id skip makes raw_equals_accepted fail BY CONSTRUCTION: the
+      // rows counted belong to an earlier attempt under the same run id,
+      // not to what this run just read. The warning explaining the skip is
+      // hundreds of log lines above the failure, so restate it here.
+      val skipHint =
+        if (raw.exists(_.runIdSkipped) && failed.exists(_._1 == "raw_equals_accepted"))
+          s". NOTE: the RAW write was SKIPPED because rows already exist under run id " +
+            s"'${ctx.runId}' (idempotent replay), so the count reflects an earlier attempt, " +
+            "not this read. Re-run with a NEW --run-id, or use --force-reprocess to append " +
+            "anyway (duplicating what that attempt already wrote)"
+        else ""
       if (onMismatch == "FAIL")
-        throw new IllegalStateException(s"Reconciliation failed: $summary")
+        throw new IllegalStateException(s"Reconciliation failed: $summary$skipHint")
       else
-        logger.warn(s"[Pipeline] Reconciliation mismatches: $summary")
+        logger.warn(s"[Pipeline] Reconciliation mismatches: $summary$skipHint")
     }
   }
 }

@@ -13,6 +13,68 @@ Companion docs: [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.m
 
 ---
 
+## PIPE_001: is the lock real, or did the holder crash?
+
+A held lease and an abandoned one look identical if you only read
+`lease_until` — both sit in the future. The distinguishing signal is the
+**heartbeat**: a live run re-CLAIMs every `lease_minutes / 3`, so its last
+row keeps moving; a crashed run's rows stop.
+
+The error states the verdict directly:
+
+```
+PIPE_001 entity 'smartiq_pdp' is locked by run 'pdp-1'
+(lease until 2026-08-11 15:18:53; last heartbeat 2m ago (renews every ~80m)
+ — the holder appears ALIVE; wait for it)
+```
+
+Confirm it yourself — the trail is in the lock table:
+
+```sql
+SELECT holder_run_id, action, lease_until, event_ts
+  FROM membership_common_raw.ingest_run_locks
+ WHERE entity = '<entity>' ORDER BY event_ts DESC LIMIT 10;
+```
+
+Repeated CLAIM rows one interval apart mean a healthy run. If the newest is
+older than two intervals, the holder died.
+
+**Only then**, release it:
+
+```sql
+INSERT INTO membership_common_raw.ingest_run_locks
+VALUES ('<entity>', '<holder_run_id>', 'RELEASE', CAST(NULL AS TIMESTAMP), current_timestamp());
+```
+
+### Size the lease for detection, not for run length
+
+The default `lease_minutes = 240` predates the heartbeat and is the wrong
+shape now: with an active heartbeat the lease need only outlive a transient
+renewal hiccup, because a healthy run extends it indefinitely. What the
+lease actually controls is **how long a crashed run blocks the entity**.
+
+```hocon
+concurrency { lease_minutes = 30 }   # heartbeat every 10m
+```
+
+A crashed run then self-clears in 30 minutes instead of 4 hours, and the
+alive/dead verdict is decisive within ~20 minutes instead of ~160. Long
+runs are unaffected — the heartbeat keeps renewing.
+
+Do not shorten it so far that a normal metastore stall misses a renewal:
+the heartbeat abandons ownership on the FIRST failure and the run aborts.
+10–30 minutes is a reasonable band.
+
+### Avoid creating stale locks
+
+Losing the terminal kills the driver before it can release. Detach anything
+long-running:
+
+```bash
+nohup scripts/run_smartiq.sh prod INCR --run-id pdp-initial-1 > pdp-initial-1.log 2>&1 &
+```
+
+
 ## 1. Error catalog with operator actions
 
 ### 1.1 HDR_001 – HDR_018 (schema / header validation)

@@ -134,11 +134,37 @@ final class LockService(
       release(entity, c.holder)
     }
 
-  private def contention(entity: String, held: Claim): String =
+  /**
+    * Contention message carrying the evidence needed to tell a LIVE holder
+    * from a crashed one.
+    *
+    * The heartbeat re-CLAIMs every leaseMillis/3, so the age of the holder's
+    * last row is the signal: younger than one interval means it is beating;
+    * older than two means it almost certainly died without releasing.
+    * Without this the operator sees only a future lease_until, which looks
+    * identical in both cases and invites force-releasing a healthy run.
+    */
+  private def contention(entity: String, held: Claim): String = {
+    val beatMs = math.max(leaseMillis / 3, 1L)
+    val ageMs = math.max(System.currentTimeMillis() - held.eventTs.getTime, 0L)
+    val ageMin = ageMs / 60000L
+    val beatMin = beatMs / 60000L
+    val verdict =
+      if (ageMs <= beatMs)
+        s"last heartbeat ${ageMin}m ago (renews every ~${beatMin}m) — the holder appears ALIVE; wait for it"
+      else if (ageMs <= 2 * beatMs)
+        s"last heartbeat ${ageMin}m ago (renews every ~${beatMin}m) — one interval missed; " +
+          "re-check in a few minutes before concluding it died"
+      else
+        s"last heartbeat ${ageMin}m ago but it renews every ~${beatMin}m — the holder has almost " +
+          "certainly CRASHED without releasing"
     s"PIPE_001 entity '$entity' is locked by run '${held.holder}' " +
-      s"(lease until ${held.leaseUntil.map(_.toString).getOrElse("?")}). Two concurrent runs of one " +
-      "entity would extract overlapping windows and overwrite each other's curated writes. Wait for " +
-      "the holder to finish, let the lease expire, or force-release the lock if the holder crashed."
+      s"(lease until ${held.leaseUntil.map(_.toString).getOrElse("?")}; $verdict). Two concurrent " +
+      "runs of one entity would extract overlapping windows and overwrite each other's curated " +
+      "writes. Wait for the holder to finish, let the lease expire, or — only once the heartbeat " +
+      s"confirms it is dead — force-release by appending a RELEASE row for holder " +
+      s"'${held.holder}' to the lock table."
+  }
 
   /** Latest row per holder decides its state; a holder is active when that
     * row is a CLAIM whose lease has not expired. */

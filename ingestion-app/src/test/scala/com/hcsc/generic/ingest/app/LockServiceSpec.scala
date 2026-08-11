@@ -126,6 +126,37 @@ class LockServiceSpec extends AnyFunSuite with BeforeAndAfterAll {
     shortLease.release("stolen_feed", "thief-run")
   }
 
+  test("contention message reports heartbeat evidence, not just a lease time") {
+    // The operational question this answers: is the holder ALIVE or did it
+    // crash without releasing? A future lease_until looks identical in both
+    // cases, which is how a healthy run gets force-released. The heartbeat
+    // re-CLAIMs every lease/3, so the age of the holder's last row decides.
+    val lock = service(leaseMillis = 60000L)   // heartbeat interval ~20s
+    lock.acquire("beat_fresh", "holder-1")
+
+    val fresh = intercept[PipelineLockException](lock.acquire("beat_fresh", "holder-2"))
+    val fm = String.valueOf(fresh.getMessage)
+    assert(fm.contains("heartbeat"), s"must report the heartbeat: $fm")
+    assert(fm.contains("ALIVE"),
+      s"a just-claimed lock must be reported as alive so nobody force-releases it: $fm")
+
+    // A holder whose last row is far older than the renewal interval is
+    // dead. Two different leases are in play deliberately: the STORED one
+    // (long, so the claim is still active and the message is reached) and
+    // the READER's (short, so lease/3 makes the row's age look many
+    // intervals old — the same shape as a 4h lease whose 80m heartbeat
+    // stopped hours ago, without sleeping for hours).
+    service(leaseMillis = 600000L).acquire("beat_stale", "holder-3")
+    Thread.sleep(400L)
+    val staleReader = service(leaseMillis = 300L)   // heartbeat interval 100ms
+    val stale = intercept[PipelineLockException](staleReader.acquire("beat_stale", "holder-4"))
+    val sm = String.valueOf(stale.getMessage)
+    assert(sm.contains("CRASHED"),
+      s"a holder silent for many renewal intervals must be reported as crashed: $sm")
+    assert(sm.contains("RELEASE"),
+      s"must say HOW to force-release, not merely that one can: $sm")
+  }
+
   test("forceRelease evicts the active holder") {
     val lock = service()
     lock.acquire("stuck_feed", "wedged-run")

@@ -56,6 +56,7 @@ document above wins; where either disagrees with the code, the code wins.
 | [REMEDIATION_PLAN.md](reports/REMEDIATION_PLAN.md) | the plan that closed those gaps |
 | [SQL_SERVER_RAW_CURATED_IMPLEMENTATION_PLAN.md](reports/SQL_SERVER_RAW_CURATED_IMPLEMENTATION_PLAN.md) | implementation sequence |
 | [SQL_SERVER_RAW_CURATED_ACCEPTANCE_REPORT.md](reports/SQL_SERVER_RAW_CURATED_ACCEPTANCE_REPORT.md) | acceptance traceability |
+| [INGESTION_PATTERN_GAP_ANALYSIS.md](reports/INGESTION_PATTERN_GAP_ANALYSIS.md) | which extraction/curated strategies exist, are partial, or are missing (SCD2) |
 | [PERFORMANCE_REVIEW.md](reports/PERFORMANCE_REVIEW.md) | static performance analysis; phase 1 items are implemented, later phases are not |
 | [PRODUCT_ROADMAP.md](reports/PRODUCT_ROADMAP.md) | positioning and planned direction |
 

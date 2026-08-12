@@ -6,6 +6,7 @@ import org.apache.log4j.Logger
 import org.apache.spark.sql.{SaveMode, SparkSession}
 
 import java.sql.Timestamp
+import com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol
 
 /** Per-stage counters captured for the run audit. Use -1 for "not measured". */
 final case class StageCounts(
@@ -376,7 +377,7 @@ final class AuditService(
     import org.apache.spark.sql.functions._
     batchFrame(entity).fold(Seq.empty[PendingBatch]) { runs =>
       val cols = runs.columns.map(_.toLowerCase).toSet
-      def optCol(n: String) = if (cols.contains(n)) col(n) else lit("")
+      def optCol(n: String) = if (cols.contains(n)) quotedCol(n) else lit("")
       runs.filter(col("stage") === com.hcsc.generic.ingest.runtime.Stages.Raw &&
           col("status") === com.hcsc.generic.ingest.runtime.StageStatus.Success &&
           notDryRun)

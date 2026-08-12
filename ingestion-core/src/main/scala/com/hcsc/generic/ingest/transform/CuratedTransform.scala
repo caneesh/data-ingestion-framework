@@ -8,6 +8,7 @@ import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.StructType
 import scala.collection.JavaConverters._
+import com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol
 
 final class CuratedTransform(spark: SparkSession) {
   private val logger = org.apache.log4j.Logger.getLogger(getClass.getName)
@@ -18,7 +19,7 @@ final class CuratedTransform(spark: SparkSession) {
     // (quadratic driver time). Each cast reads only its own column, so
     // collapsing is semantics-preserving.
     val casts = ConfigUtils.stringMap(conf, "column_types").toSeq.flatMap { case (name, dataType) =>
-      ColumnMapping.findColumn(df, name).map(actual => actual -> col(actual).cast(dataType))
+      ColumnMapping.findColumn(df, name).map(actual => actual -> quotedCol(actual).cast(dataType))
     }
     if (casts.isEmpty) df else df.withColumns(casts.toMap)
   }
@@ -93,7 +94,7 @@ final class CuratedTransform(spark: SparkSession) {
   def splitNullKeys(df: DataFrame, keys: Seq[String], drop: Boolean, blanks: Boolean): (DataFrame, DataFrame) = {
     if (!drop || keys.isEmpty) return (df, df.filter(lit(false)))
     val invalid = keys.map { key =>
-      val c = col(key)
+      val c = quotedCol(key)
       if (blanks) c.isNull || trim(c.cast("string")) === "" else c.isNull
     }.reduce(_ || _)
     (df.filter(!invalid), df.filter(invalid))
@@ -148,7 +149,7 @@ final class CuratedTransform(spark: SparkSession) {
     // re-reads (see RawMetadata), so determinism holds within a run / over
     // a persisted RAW slice, not across independent source re-extractions.
     val tieBreak = df.columns.find(_.equalsIgnoreCase("row_idx"))
-      .map(c => col(c).desc_nulls_last).toSeq
+      .map(c => quotedCol(c).desc_nulls_last).toSeq
     val w = Window.partitionBy(keys.map(col): _*)
       .orderBy(existingOrder ++ tieBreak: _*)
     df.withColumn("_rn", row_number().over(w))
@@ -164,7 +165,7 @@ final class CuratedTransform(spark: SparkSession) {
   def detectCastLoss(df: DataFrame, casts: Seq[(String, org.apache.spark.sql.types.DataType)]): Seq[(String, Long)] = {
     if (casts.isEmpty) return Seq.empty
     val aggs = casts.map { case (c, t) =>
-      sum(when(col(c).isNotNull && col(c).cast(t).isNull, 1).otherwise(0)).alias(c)
+      sum(when(quotedCol(c).isNotNull && quotedCol(c).cast(t).isNull, 1).otherwise(0)).alias(c)
     }
     val row = df.agg(aggs.head, aggs.tail: _*).first()
     casts.indices.flatMap { i =>
@@ -205,7 +206,7 @@ final class CuratedTransform(spark: SparkSession) {
 
     completed.select(schema.fields.map { field =>
       val actual = ColumnMapping.findColumn(completed, field.name).get
-      col(actual).cast(field.dataType).as(field.name)
+      quotedCol(actual).cast(field.dataType).as(field.name)
     }: _*)
   }
 }

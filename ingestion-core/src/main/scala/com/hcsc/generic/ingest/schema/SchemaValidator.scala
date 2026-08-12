@@ -4,6 +4,7 @@ import org.apache.log4j.Logger
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.DataType
+import com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol
 
 sealed trait ViolationKind {
   def label: String
@@ -255,7 +256,7 @@ object SchemaValidator {
     if (nonNullable.nonEmpty) {
       val counts = df.select(
         nonNullable.map { case (contractName, actual) =>
-          sum(when(col(actual).isNull, 1).otherwise(0)).alias(contractName)
+          sum(when(quotedCol(actual).isNull, 1).otherwise(0)).alias(contractName)
         }: _*
       ).first()
 

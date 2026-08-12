@@ -68,4 +68,19 @@ class DottedColumnNameTest extends AnyFunSuite with SharedSparkSession {
     assert(rows.forall(r => Option(r.getString(1)).exists(_.nonEmpty)),
       "the source key must be built from the dotted column, not fail on it")
   }
+
+  test("null-key split references a dotted key without parsing the dot") {
+    // CuratedTransform.splitNullKeys builds a predicate per business key.
+    val (valid, dropped) = new CuratedTransform(spark).splitNullKeys(
+      frame, Seq(Dotted), drop = true, blanks = true)
+    assert(valid.count() == 2, "no row has a null value in that column")
+    assert(dropped.count() == 0)
+  }
+
+  // NOTE: dedup/freshness ORDERING is deliberately not covered here. Those
+  // strings come from operator config ("col desc nulls_last"), which uses
+  // canonical snake_case names, and OrderSpec splits them on whitespace to
+  // read the direction tokens. A raw source name never reaches that parser,
+  // so a test forcing one there would assert a scenario the system cannot
+  // produce.
 }

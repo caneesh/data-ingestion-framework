@@ -2,6 +2,7 @@ package com.hcsc.generic.ingest.transform
 
 import org.apache.spark.sql.Column
 import org.apache.spark.sql.functions.col
+import com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol
 
 /**
   * One ordering term of a dedup / tie-breaker specification. The extended
@@ -20,7 +21,7 @@ final case class OrderSpec(
   compareAs: Option[String] = None
 ) {
   def toColumn(actualColumn: String): Column =
-    applyDirection(compareAs.fold(col(actualColumn))(t => col(actualColumn).cast(t)))
+    applyDirection(compareAs.fold(quotedCol(actualColumn))(t => quotedCol(actualColumn).cast(t)))
 
   /** Direction + null ordering applied to an arbitrary comparison
     * expression (used when the caller supplies the logical-type cast). */

@@ -7,6 +7,7 @@ import com.typesafe.config.Config
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{Column, DataFrame, SaveMode, SparkSession}
 import org.apache.spark.sql.functions._
+import com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol
 
 final case class RejectRule(
   name: String,
@@ -64,12 +65,12 @@ final class RejectService(
 
   private def payloadJson(df: DataFrame, businessCols: Seq[String]): Column = payloadMode match {
     case "HASHED" =>
-      to_json(struct(businessCols.map(c => sha2(col(c).cast("string"), 256).as(c)): _*))
+      to_json(struct(businessCols.map(c => sha2(quotedCol(c).cast("string"), 256).as(c)): _*))
     case "MASKED" =>
       val sensitive = contract.map(_.sensitiveColumns.map(_.toLowerCase).toSet).getOrElse(Set.empty)
       to_json(struct(businessCols.map { c =>
-        if (sensitive.contains(c.toLowerCase)) sha2(col(c).cast("string"), 256).as(c)
-        else col(c)
+        if (sensitive.contains(c.toLowerCase)) sha2(quotedCol(c).cast("string"), 256).as(c)
+        else quotedCol(c)
       }: _*))
     case "KEYS_ONLY" =>
       val keep = rejectConf.map(c => ConfigUtils.stringList(c, "payload_columns")).getOrElse(Seq.empty)

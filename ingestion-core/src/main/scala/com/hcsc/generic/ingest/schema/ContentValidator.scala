@@ -3,6 +3,7 @@ package com.hcsc.generic.ingest.schema
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{Column, DataFrame}
 import org.apache.spark.sql.functions._
+import com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol
 
 /**
   * Column-level content validation to detect swapped or incorrectly mapped
@@ -50,14 +51,14 @@ object ContentValidator {
     val aggregations =
       count(lit(1)).alias("__total") +:
         (ruledColumns.map { case (contractCol, actual) =>
-          sum(when(failsRules(col(actual), contractCol.validation.get), 1).otherwise(0))
+          sum(when(failsRules(quotedCol(actual), contractCol.validation.get), 1).otherwise(0))
             .alias(s"fail_${contractCol.name}")
         } ++
           ruledColumns.map { case (contractCol, actual) =>
-            sum(when(col(actual).isNull, 1).otherwise(0)).alias(s"null_${contractCol.name}")
+            sum(when(quotedCol(actual).isNull, 1).otherwise(0)).alias(s"null_${contractCol.name}")
           } ++
           allNullChecked.map { case (contractCol, actual) =>
-            sum(when(col(actual).isNotNull, 1).otherwise(0)).alias(s"nonnull_${contractCol.name}")
+            sum(when(quotedCol(actual).isNotNull, 1).otherwise(0)).alias(s"nonnull_${contractCol.name}")
           })
 
     val row = scope.agg(aggregations.head, aggregations.tail: _*).first()

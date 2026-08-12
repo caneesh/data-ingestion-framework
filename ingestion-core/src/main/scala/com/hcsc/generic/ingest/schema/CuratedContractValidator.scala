@@ -3,6 +3,7 @@ package com.hcsc.generic.ingest.schema
 import org.apache.log4j.Logger
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.functions._
+import com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol
 
 /**
   * Second validation gate, run immediately before CURATED publication.
@@ -55,7 +56,7 @@ object CuratedContractValidator {
       if (checked.nonEmpty) {
         val aggs = count(lit(1)).alias("__total") +:
           checked.map { case (name, actual) =>
-            sum(when(col(actual).isNotNull, 1).otherwise(0)).alias(name)
+            sum(when(quotedCol(actual).isNotNull, 1).otherwise(0)).alias(name)
           }
         val row = df.agg(aggs.head, aggs.tail: _*).first()
         val total = row.getLong(0)

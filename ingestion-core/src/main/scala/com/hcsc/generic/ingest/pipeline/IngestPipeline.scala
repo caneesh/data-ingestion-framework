@@ -19,6 +19,7 @@ import org.apache.spark.storage.StorageLevel
 
 import java.util.UUID
 import scala.collection.JavaConverters._
+import com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol
 
 /**
   * End-to-end run orchestrator: validate -> raw -> curated (publish) with
@@ -834,6 +835,9 @@ final class IngestPipeline(
           val condition = idempotencyKeyCols.map { k =>
             val iCol = accepted.columns.find(_.equalsIgnoreCase(k)).get
             val eCol = existingCols.find(_.equalsIgnoreCase(k)).get
+            // NOT quotedCol: these are ALIAS-qualified references, where the
+            // dot is a real separator ("i" and "e" are subquery aliases).
+            // Quoting would ask for one column literally named "i.claim_id".
             col(s"i.$iCol") <=> col(s"e.$eCol")
           }.reduce(_ && _)
           val fresh = incoming.join(existing, condition, "left_anti")

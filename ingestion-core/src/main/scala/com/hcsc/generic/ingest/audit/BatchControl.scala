@@ -4,6 +4,7 @@ import com.hcsc.generic.ingest.config.ConfigUtils
 import com.typesafe.config.Config
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.functions._
+import com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol
 
 /**
   * Read-only batch control surface: ONE row per batch (batch_id = run_id)
@@ -36,7 +37,7 @@ final class BatchControl(spark: SparkSession, feedConf: Config) {
       "PIPE_006 the batch control view requires the run ledger (audit.database)"))
     require(spark.catalog.tableExists(table), s"PIPE_006 ledger table $table does not exist yet")
     val cols = spark.table(table).columns.map(_.toLowerCase).toSet
-    def optCol(n: String) = if (cols.contains(n)) col(n) else lit("")
+    def optCol(n: String) = if (cols.contains(n)) quotedCol(n) else lit("")
 
     val ev = spark.table(table)
       .filter(col("entity") === entity)

@@ -7,6 +7,7 @@ import org.apache.spark.sql.{SaveMode, SparkSession}
 import org.apache.spark.sql.functions.{col, row_number}
 
 import java.time.LocalDate
+import com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol
 
 /**
   * Config-driven retention/purge for the append-only stores (spec §17).
@@ -176,11 +177,11 @@ final class RetentionService(spark: SparkSession, feedConf: Config, logger: Logg
     val cutoffTs = java.sql.Timestamp.from(cutoffDate(days).atStartOfDay(sessionZone).toInstant)
     val cutoffLit = org.apache.spark.sql.functions.lit(cutoffTs)
     val expired = spark.table(table)
-      .filter(col(tsColumn).isNotNull && col(tsColumn) < cutoffLit).count()
+      .filter(quotedCol(tsColumn).isNotNull && quotedCol(tsColumn) < cutoffLit).count()
     if (expired == 0L) return (table, s"rows older than $days d purged", 0L)
     // NULL-timestamped rows (legacy) are retained, never silently purged.
     if (!dryRun) rewriteKeeping(table,
-      spark.table(table).filter(col(tsColumn).isNull || col(tsColumn) >= cutoffLit))
+      spark.table(table).filter(quotedCol(tsColumn).isNull || quotedCol(tsColumn) >= cutoffLit))
     (table, s"rows older than $days d purged", expired)
   }
 

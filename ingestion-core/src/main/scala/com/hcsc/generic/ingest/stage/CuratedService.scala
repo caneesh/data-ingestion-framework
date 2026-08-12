@@ -11,6 +11,7 @@ import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions.{coalesce, col, lit, lower, row_number, trim, when}
+import com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol
 
 
 final case class CuratedResult(
@@ -51,8 +52,8 @@ final case class FreshnessSpec(
   def compareExpr(actualColumn: String): org.apache.spark.sql.Column = {
     import org.apache.spark.sql.functions.{col, to_timestamp}
     compareFormat match {
-      case Some(fmt) => to_timestamp(col(actualColumn), fmt)
-      case None => compareAs.fold(col(actualColumn))(t => col(actualColumn).cast(t))
+      case Some(fmt) => to_timestamp(quotedCol(actualColumn), fmt)
+      case None => compareAs.fold(quotedCol(actualColumn))(t => quotedCol(actualColumn).cast(t))
     }
   }
   def hasLogicalType: Boolean = compareAs.isDefined || compareFormat.isDefined
@@ -321,7 +322,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
                 // keyless rows are pure accumulation with zero information.
                 p.columns.find(_.equalsIgnoreCase(
                   com.hcsc.generic.ingest.transform.RecordHash.Column)).foreach { h =>
-                  val dupes = p.groupBy(col(h)).count().filter(col("count") > 1).count()
+                  val dupes = p.groupBy(quotedCol(h)).count().filter(col("count") > 1).count()
                   if (dupes > 0)
                     logger.warn(s"[CuratedService] $dupes duplicate record_hash value(s) " +
                       "among the keyless passthrough rows — identical content accumulating")
@@ -607,10 +608,10 @@ final class CuratedService(spark: SparkSession, conf: Config) {
               s"frame for $fullTable; soft deletes require the indicator in the curated schema"))
         val isDelete = softDeletePredicate(df, deletes).get
         val withOp = df.columns.find(_.equalsIgnoreCase("last_modified_op"))
-          .fold(df)(op => df.withColumn(op, when(isDelete, lit("D")).otherwise(col(op))))
+          .fold(df)(op => df.withColumn(op, when(isDelete, lit("D")).otherwise(quotedCol(op))))
         df.columns.find(_.equalsIgnoreCase("is_deleted"))
           .fold(withOp)(flag => withOp.withColumn(flag,
-            when(isDelete, lit(true)).otherwise(col(flag).cast("boolean"))))
+            when(isDelete, lit(true)).otherwise(quotedCol(flag).cast("boolean"))))
       case _ => df
     }
 
@@ -679,7 +680,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     if (f.hasLogicalType) {
       val incomingActual = incoming.columns.find(_.equalsIgnoreCase(f.column)).get
       val broken = incoming.filter(
-        col(incomingActual).isNotNull && f.compareExpr(incomingActual).isNull).limit(1).count()
+        quotedCol(incomingActual).isNotNull && f.compareExpr(incomingActual).isNull).limit(1).count()
       require(broken == 0,
         s"CUR_008 CURATED_FRESHNESS_TYPE_INVALID: incoming '$incomingActual' values are not " +
           s"parseable as ${f.compareFormat.map(fmt => s"format '$fmt'").getOrElse(f.compareAs.get)} — " +
@@ -696,7 +697,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     deletes match {
       case Some(DeleteSpec.Soft(indicator, values)) =>
         df.columns.find(_.equalsIgnoreCase(indicator))
-          .map(actual => lower(trim(col(actual).cast("string"))).isin(values: _*))
+          .map(actual => lower(trim(quotedCol(actual).cast("string"))).isin(values: _*))
       case _ => None
     }
 
@@ -704,7 +705,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
     deletes match {
       case Some(_: DeleteSpec.Soft) =>
         df.columns.find(_.equalsIgnoreCase("last_modified_op"))
-          .map(op => df.filter(col(op) === "D").count()).getOrElse(0L)
+          .map(op => df.filter(quotedCol(op) === "D").count()).getOrElse(0L)
       case _ => 0L
     }
 
@@ -756,11 +757,12 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           .distinct().alias("k")
         val t = target.alias("t")
         val condition = keys.map { k =>
+          // NOT quotedCol — alias-qualified, see IngestPipeline's join.
           col(s"t.${target.columns.find(_.equalsIgnoreCase(k)).get}") <=> col(s"k.$k")
         }.reduce(_ && _)
         val absent = t.join(incomingKeys, condition, "left_anti").persist()
         val newlyDeleted = target.columns.find(_.equalsIgnoreCase("is_deleted")) match {
-          case Some(flag) => absent.filter(!coalesce(col(flag).cast("boolean"), lit(false))).count()
+          case Some(flag) => absent.filter(!coalesce(quotedCol(flag).cast("boolean"), lit(false))).count()
           case None       => absent.count()
         }
         val retained = absent.count()
@@ -813,11 +815,11 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       actual(incoming, "last_modified_op")) match {
       case (Some(incCreate), Some(tgtCreate), Some(incOp)) =>
         val original = target
-          .select((keys.map(col) :+ col(tgtCreate).cast("timestamp").as("_orig_create_ts")): _*)
+          .select((keys.map(col) :+ quotedCol(tgtCreate).cast("timestamp").as("_orig_create_ts")): _*)
           .dropDuplicates(keys)
         incoming.join(original, keys, "left")
-          .withColumn(incCreate, coalesce(col("_orig_create_ts"), col(incCreate)))
-          .withColumn(incOp, when(col("_orig_create_ts").isNotNull, lit("U")).otherwise(col(incOp)))
+          .withColumn(incCreate, coalesce(col("_orig_create_ts"), quotedCol(incCreate)))
+          .withColumn(incOp, when(col("_orig_create_ts").isNotNull, lit("U")).otherwise(quotedCol(incOp)))
           .drop("_orig_create_ts")
       case _ => incoming
     }
@@ -908,7 +910,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
           org.apache.spark.sql.functions.broadcast
         else identity
 
-      val joinCond = keyCols.map(k => col(k) <=> col(s"__ik_$k")).reduce(_ && _)
+      val joinCond = keyCols.map(k => quotedCol(k) <=> quotedCol(s"__ik_$k")).reduce(_ && _)
 
       // ---- partition scoping (PARTITION_OVERWRITE) ------------------------
       // The merge runs against the SLICE of the target the batch can touch:
@@ -952,7 +954,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
                   .map { case (c, i) => s"$c=${r.get(i)}" }.mkString("[", ",", "]")).mkString(" ") +
                 (if (tuples.length > 20) " ..." else ""))
               val predicate = tuples.map(r =>
-                partCols.zipWithIndex.map { case (c, i) => col(c) <=> lit(r.get(i)) }.reduce(_ && _)
+                partCols.zipWithIndex.map { case (c, i) => quotedCol(c) <=> lit(r.get(i)) }.reduce(_ && _)
               ).reduce(_ || _)
               target.filter(predicate)
             } else {
@@ -960,7 +962,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
                 s"max_affected_partitions=${partitionSpec.maxAffectedPartitions}; filtering the " +
                 "target via a distributed semi-join instead of a literal predicate")
               val ap = affectedParts.toDF(partCols.map(c => s"__ap_$c"): _*)
-              val apCond = partCols.map(c => col(c) <=> col(s"__ap_$c")).reduce(_ && _)
+              val apCond = partCols.map(c => quotedCol(c) <=> quotedCol(s"__ap_$c")).reduce(_ && _)
               target.join(org.apache.spark.sql.functions.broadcast(ap), apCond, "left_semi")
             }
           val persistedSlice = slice.persist()
@@ -976,7 +978,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       val contestedKeys = contested.select(keyCols.map(col): _*).distinct()
         .toDF(keyCols.map(k => s"__ck_$k"): _*).persist()
       persistedContested = Some(contestedKeys)
-      val ckCond = keyCols.map(k => col(k) <=> col(s"__ck_$k")).reduce(_ && _)
+      val ckCond = keyCols.map(k => quotedCol(k) <=> quotedCol(s"__ck_$k")).reduce(_ && _)
       val contestedKeyCount = contestedKeys.count()
       val insertCount = totalIncoming - contestedKeyCount
 
@@ -1003,7 +1005,7 @@ final class CuratedService(spark: SparkSession, conf: Config) {
               val kh = keyCols :+ h
               val tgtKeyHash = contested.select(kh.map(col): _*).distinct()
                 .toDF(kh.map(k => s"__th_$k"): _*)
-              val sameContent = kh.map(k => col(k) <=> col(s"__th_$k")).reduce(_ && _)
+              val sameContent = kh.map(k => quotedCol(k) <=> quotedCol(s"__th_$k")).reduce(_ && _)
               // Tombstones are EXEMPT from the no-change filter: the delete
               // indicator is not a business column, so a tombstone hashes
               // identically to the live target row it deletes — filtering it
@@ -1033,13 +1035,13 @@ final class CuratedService(spark: SparkSession, conf: Config) {
               val iVer = sameHash
                 .select((keyCols.map(col) ++ versionCols.map(col)): _*)
                 .toDF((keyCols.map(k => s"__vk_$k") ++ versionCols.map(v => s"__vv_$v")): _*)
-              val vkCond = keyCols.map(k => col(k) <=> col(s"__vk_$k")).reduce(_ && _)
+              val vkCond = keyCols.map(k => quotedCol(k) <=> quotedCol(s"__vk_$k")).reduce(_ && _)
               val advanced = contested.join(hintKeys(iVer), vkCond, "inner")
                 // strictly newer source version, under the LOGICAL type
                 .filter(f.compareExpr(s"__vv_$fActual") > f.compareExpr(fActual))
                 .select(contested.columns.map(c =>
-                  if (versionCols.exists(_.equalsIgnoreCase(c))) col(s"__vv_$c").as(c)
-                  else col(c)): _*)
+                  if (versionCols.exists(_.equalsIgnoreCase(c))) quotedCol(s"__vv_$c").as(c)
+                  else quotedCol(c)): _*)
 
               (tombstones.fold(changed)(t => changed.unionByName(t)), Some(advanced))
             case None => (alignedIncoming, None)
@@ -1057,12 +1059,12 @@ final class CuratedService(spark: SparkSession, conf: Config) {
             .map(com.hcsc.generic.ingest.transform.OrderSpec.parse)
             .flatMap(s => union.columns.find(_.equalsIgnoreCase(s.column)).map(s.toColumn))
           val orderCols = (freshnessCol ++ tieBreakCols) :+
-            col(src).desc // 'T' > 'I': exact ties keep the target
+            quotedCol(src).desc // 'T' > 'I': exact ties keep the target
           val w = Window.partitionBy(keyCols.map(col): _*).orderBy(orderCols: _*)
           val winners = union.withColumn("_rn", row_number().over(w))
             .filter(col("_rn") === 1).drop("_rn").persist()
           winnersPersisted = Some(winners)
-          val winnersI = winners.filter(col(src) === "I")
+          val winnersI = winners.filter(quotedCol(src) === "I")
           val incomingWinners = winnersI.count()
           val updates = incomingWinners - insertCount
           val ignored = totalIncoming - incomingWinners
@@ -1125,9 +1127,9 @@ final class CuratedService(spark: SparkSession, conf: Config) {
       case NullPartitionPolicy.Hive => df
       case NullPartitionPolicy.Default(value) =>
         df.withColumns(actuals.map(c =>
-          c -> coalesce(col(c), lit(value).cast(df.schema(c).dataType))).toMap)
+          c -> coalesce(quotedCol(c), lit(value).cast(df.schema(c).dataType))).toMap)
       case NullPartitionPolicy.Reject =>
-        val anyNull = actuals.map(col(_).isNull).reduce(_ || _)
+        val anyNull = actuals.map(quotedCol(_).isNull).reduce(_ || _)
         if (df.filter(anyNull).limit(1).count() > 0)
           throw new IllegalStateException(
             s"CUR_006 incoming data carries NULL value(s) in partition column(s) " +

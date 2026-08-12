@@ -1,12 +1,29 @@
 package com.hcsc.generic.ingest.schema
 
-import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.{Column, DataFrame}
 
 /**
   * Common utilities for case-insensitive column mapping used across the
   * schema validation, file source, and curated transform layers.
   */
 object ColumnMapping {
+
+  /**
+    * Column reference for a name that may contain characters Spark's parser
+    * treats as syntax.
+    *
+    * `col("a.b")` does NOT mean the column literally named "a.b" — the dot
+    * is parsed as nested-field access, so it resolves to field `b` of column
+    * `a` and fails with UNRESOLVED_COLUMN when no such struct exists. Source
+    * systems produce such names freely ("AIAccInfo.IsGroupMunicipality/
+    * County/School District/StateofTexas"), and they survive into the frame
+    * whenever a column is not renamed to its canonical form.
+    *
+    * Backtick-quoting makes the whole string one identifier. Embedded
+    * backticks are doubled, the standard escape.
+    */
+  def quotedCol(name: String): Column =
+    org.apache.spark.sql.functions.col(s"`${name.replace("`", "``")}`")
 
   /** Finds a column name in the DataFrame case-insensitively. */
   def findColumn(df: DataFrame, name: String): Option[String] =

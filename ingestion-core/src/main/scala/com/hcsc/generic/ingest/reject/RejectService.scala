@@ -79,11 +79,11 @@ final class RejectService(
       // key tagged PII/PHI must not land verbatim just because it is a key.
       val sensitiveKeys = contract.map(_.sensitiveColumns.map(_.toLowerCase).toSet).getOrElse(Set.empty)
       to_json(struct(present.map { c =>
-        if (sensitiveKeys.contains(c.toLowerCase)) sha2(col(c).cast("string"), 256).as(c)
-        else col(c)
+        if (sensitiveKeys.contains(c.toLowerCase)) sha2(com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol(c).cast("string"), 256).as(c)
+        else com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol(c)
       }: _*))
     case _ =>
-      to_json(struct(businessCols.map(col): _*))
+      to_json(struct(businessCols.map(com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol): _*))
   }
 
   /** rejects.on_reject_watermark = ADVANCE | HOLD. Rows diverted to the

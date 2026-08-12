@@ -57,7 +57,7 @@ object RecordHash {
     }
     val cols = candidates.distinct.sortBy(_.toLowerCase)
     def canonical(name: String): org.apache.spark.sql.Column = {
-      val base = col(name).cast("string")
+      val base = com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol(name).cast("string")
       val trimmed = if (options.trimValues) trim(base) else base
       if (options.uppercaseValues) upper(trimmed) else trimmed
     }

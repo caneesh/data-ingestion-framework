@@ -117,12 +117,12 @@ object RawMetadata {
     def actual(name: String): Option[String] = df.columns.find(_.equalsIgnoreCase(name))
 
     val modified = ext.sourceModifiedColumn.flatMap(actual)
-      .map(c => col(c).cast("string"))
+      .map(c => com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol(c).cast("string"))
       .getOrElse(lit(null).cast("string"))
 
     val operation = ext.softDeleteIndicator.flatMap { case (indicator, values) =>
       actual(indicator).map { c =>
-        when(lower(trim(col(c).cast("string")))
+        when(lower(trim(com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol(c).cast("string")))
           .isin(values.map(_.trim.toLowerCase): _*), "D").otherwise(ext.nonDeleteOperation)
       }
     }.getOrElse(lit(ext.nonDeleteOperation))
@@ -136,7 +136,7 @@ object RawMetadata {
     // serialize through Spark's locale-independent JSON formatting.
     val presentKeys = ext.primaryKeyColumns.flatMap(actual)
     val keyStruct = if (presentKeys.isEmpty) lit(null)
-      else to_json(struct(presentKeys.map(col): _*),
+      else to_json(struct(presentKeys.map(com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol): _*),
         Map("ignoreNullFields" -> "false").asJava)
     val primaryKey =
       if (presentKeys.isEmpty) lit(null).cast("string")

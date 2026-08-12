@@ -87,7 +87,7 @@ object HiveSink extends Sink {
             throw new IllegalArgumentException(s"raw.metadata_columns '$other' must be FAIL, ALTER or WARN")
         }
 
-      withPartitions.select(finalTargetCols.map(col): _*)
+      withPartitions.select(finalTargetCols.map(com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol): _*)
         .write
         .mode(SaveMode.Append)
         .insertInto(fullTable)

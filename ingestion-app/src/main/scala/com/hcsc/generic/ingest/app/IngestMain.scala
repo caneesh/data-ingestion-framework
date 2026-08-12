@@ -63,6 +63,20 @@ object IngestMain {
     } catch {
       case error: Throwable =>
         logger.error(s"Ingest failed entity=${cli.entity}", error)
+        // Single hook covering every terminal failure: stage failures,
+        // reconciliation mismatches and lock contention all reach here by
+        // rethrowing. Best-effort by construction — the run has already
+        // failed, and an unreachable webhook must not change how it failed
+        // or mask the original exception.
+        try {
+          com.hcsc.generic.ingest.notify.NotificationService(feedConf, logger)
+            .notifyFailure(cli.entity, cli.runId.getOrElse("<unassigned>"),
+              cli.stage, String.valueOf(error.getMessage))
+        } catch {
+          case notifyError: Throwable =>
+            logger.warn(s"[Notify] failure notification could not be sent: " +
+              s"${notifyError.getMessage}")
+        }
         throw error
     } finally {
       spark.stop()

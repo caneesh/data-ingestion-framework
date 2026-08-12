@@ -94,8 +94,11 @@ feeds.claims {
     }
   }
 
-  notifications {                      # reserved: design-level section, not yet wired
-    on_failure = ["ops-alerts"]
+  notifications {                      # absent = silent (existing feeds unchanged)
+    enabled = true
+    on      = ["FAILURE"]              # FAILURE (default) | SUCCESS
+    webhook { url = "https://hooks.example.com/ingest", timeout_ms = 5000 }
+    command = "/opt/ingest/notify.sh"  # receives outcome/entity/run/stage/message as ARGV
   }
 }
 ```

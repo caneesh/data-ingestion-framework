@@ -13,6 +13,36 @@ Companion docs: [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.m
 
 ---
 
+## Failure alerting
+
+The framework detects failures precisely and, until a `notifications` block
+exists, tells nobody — a failed Control-M job is visible only to whoever
+queries the ledger. Configure one sink and every terminal failure (stage
+failure, reconciliation mismatch, lock contention) reaches it:
+
+```hocon
+notifications {
+  on      = ["FAILURE"]
+  webhook { url = "https://hooks.example.com/ingest" }
+  # command = "/opt/ingest/notify.sh"   # argv: outcome entity run_id stage message
+}
+```
+
+Guarantees worth knowing:
+
+- **Delivery never changes a run's outcome.** Every sink is best-effort; an
+  unreachable webhook, an HTTP 500, a malformed URL or a hanging command is
+  logged and swallowed. A pipeline must not fail because alerting failed,
+  nor hide a data failure behind a delivery failure.
+- **Messages are redacted** through the same sanitizer as the audit ledger:
+  driver exceptions embed JDBC URLs, which can carry credentials, and a
+  webhook reaches a wider audience than a log file.
+- **SUCCESS is opt-in.** Alerting on every successful run of every feed is
+  how alerting gets muted wholesale.
+- The command sink receives the event as **arguments, never a shell
+  string**, so metacharacters in source exception text cannot execute.
+
+
 ## PIPE_001: is the lock real, or did the holder crash?
 
 A held lease and an abandoned one look identical if you only read

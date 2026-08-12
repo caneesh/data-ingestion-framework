@@ -1,0 +1,84 @@
+name: build
+
+# The 787-test suite previously ran only when someone remembered to run it
+# locally. Every push and pull request now builds and tests the full
+# reactor, so a regression is caught at the commit that caused it rather
+# than at the next manual run.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  reactor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Java 11 is pinned in the root pom (maven.compiler.source/target).
+      # Building on a different major would not reproduce the cluster.
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build and test
+        run: mvn --batch-mode --no-transfer-progress clean install
+
+      # Spark suites write surefire/scalatest reports; keep them on failure
+      # so a CI-only failure can be diagnosed without reproducing locally.
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            **/target/surefire-reports/**
+            **/target/scalatest-reports/**
+          retention-days: 14
+
+  # Guards that cost seconds and catch the two mistakes this project has
+  # actually made: a shell script that does not parse, and documentation
+  # links that point at files moved during the docs reorganisation.
+  static-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell scripts parse
+        run: |
+          fail=0
+          for f in scripts/*.sh; do
+            bash -n "$f" || { echo "::error file=$f::bash syntax error"; fail=1; }
+          done
+          exit $fail
+
+      - name: Documentation links resolve
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+          files = [f for f in subprocess.run(['git','ls-files'],capture_output=True,text=True)
+                   .stdout.split() if f.endswith(('.md','.scala','.sh','.conf','.html'))]
+          broken = []
+          for path in files:
+              here = os.path.dirname(path)
+              try: s = open(path).read()
+              except Exception: continue
+              for m in re.finditer(r'\]\(([^)\s#]+\.md)(#[^)]*)?\)', s):
+                  t = m.group(1)
+                  if t.startswith(('http','mailto')): continue
+                  if not os.path.exists(os.path.normpath(os.path.join(here, t))):
+                      broken.append(f"{path} -> {t}")
+              for m in re.finditer(r'(?<![\w/])(docs/[\w/]*[A-Z_]{3,}\.md)', s):
+                  if not os.path.exists(m.group(1)):
+                      broken.append(f"{path} -> {m.group(1)}")
+          for b in broken:
+              print(f"::error::broken documentation link: {b}")
+          sys.exit(1 if broken else 0)
+          PY

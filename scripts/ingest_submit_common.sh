@@ -161,6 +161,13 @@ submit_ingest() {
     done
   fi
 
+  # Driver memory. A wide feed builds a large ANALYZER plan on the driver
+  # before any row is read; the 364-column feed exhausted the default heap.
+  # Unset = cluster default (unchanged behaviour); set it for wide feeds.
+  local MEM_OPTS=()
+  [[ -n "${INGEST_DRIVER_MEMORY:-}" ]] && MEM_OPTS+=(--driver-memory "$INGEST_DRIVER_MEMORY")
+  [[ -n "${INGEST_EXECUTOR_MEMORY:-}" ]] && MEM_OPTS+=(--executor-memory "$INGEST_EXECUTOR_MEMORY")
+
   spark-submit \
     --class com.hcsc.generic.ingest.app.IngestMain \
     --name "ingest-${ENTITY}" \
@@ -174,6 +181,7 @@ submit_ingest() {
     --conf spark.sql.shuffle.partitions=200 \
     ${ENV_CONFS[@]+"${ENV_CONFS[@]}"} \
     ${JAR_OPTS[@]+"${JAR_OPTS[@]}"} \
+    ${MEM_OPTS[@]+"${MEM_OPTS[@]}"} \
     --files "$FILES" \
     "$JAR_FILE" \
     --entity "$ENTITY" \

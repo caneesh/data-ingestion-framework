@@ -53,8 +53,19 @@ object ColumnMapping {
     * Renames columns from their source names to canonical names.
     */
   def applyRenames(df: DataFrame, renames: Seq[(String, String)]): DataFrame =
-    renames.foldLeft(df) { case (acc, (from, to)) =>
-      acc.withColumnRenamed(from, to)
+    if (renames.isEmpty) df
+    else {
+      // ONE projection, not one per column. withColumnRenamed in a fold adds
+      // a Spark Project per rename, and every Project carries the full
+      // attribute list — so an N-column feed builds an N-deep plan holding
+      // N*N attribute references. At 364 columns that was ~130,000, which
+      // exhausted the DRIVER heap during analysis before a single row was
+      // read. Column order and case-insensitive matching are preserved, so
+      // the result is identical; only the plan shape changes.
+      val target = renames.map { case (from, to) => from.toLowerCase -> to }.toMap
+      df.select(df.columns.map { actual =>
+        target.get(actual.toLowerCase).fold(quotedCol(actual))(quotedCol(actual).as(_))
+      }: _*)
     }
 
   /**

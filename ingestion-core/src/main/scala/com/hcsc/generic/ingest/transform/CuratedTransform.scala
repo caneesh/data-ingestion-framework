@@ -186,9 +186,15 @@ final class CuratedTransform(spark: SparkSession) {
     */
   def align(df: DataFrame, schema: StructType, contract: Option[SchemaContract]): DataFrame = {
     val columnLookup = ColumnMapping.buildLookup(df.columns)
-    val completed = schema.fields.foldLeft(df) { (acc, field) =>
+
+    // Missing columns are supplied INSIDE the final projection rather than
+    // added one withColumn at a time: the fold added a Spark Project per
+    // missing column, and a wide target multiplies plan size the same way
+    // the rename fold did. One Project, same values, same order.
+    df.select(schema.fields.map { field =>
       columnLookup.get(field.name.toLowerCase) match {
-        case Some(_) => acc
+        case Some(actual) =>
+          quotedCol(actual).cast(field.dataType).as(field.name)
         case None =>
           contract.flatMap(_.column(field.name)) match {
             case Some(cc) if cc.required && cc.category.equalsIgnoreCase("business") =>
@@ -196,17 +202,10 @@ final class CuratedTransform(spark: SparkSession) {
                 s"HDR_001 Required column '${field.name}' is missing from the incoming data; " +
                   "refusing to auto-create it as null during schema alignment"
               )
-            case Some(cc) =>
-              acc.withColumn(field.name, lit(cc.default.orNull).cast(field.dataType))
-            case None =>
-              acc.withColumn(field.name, lit(null).cast(field.dataType))
+            case Some(cc) => lit(cc.default.orNull).cast(field.dataType).as(field.name)
+            case None     => lit(null).cast(field.dataType).as(field.name)
           }
       }
-    }
-
-    completed.select(schema.fields.map { field =>
-      val actual = ColumnMapping.findColumn(completed, field.name).get
-      quotedCol(actual).cast(field.dataType).as(field.name)
     }: _*)
   }
 }

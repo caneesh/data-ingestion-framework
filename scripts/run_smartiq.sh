@@ -122,6 +122,20 @@ if [[ -z "${SMARTIQ_DB_PASSWORD:-}" ]]; then
   export SMARTIQ_DB_PASSWORD
 fi
 
+# ---- driver heap ------------------------------------------------------------
+# The 364-column feed builds a large ANALYZER plan on the driver before any
+# row is read. In cluster mode the driver is a YARN container at the queue
+# default, which is routinely too small — the symptom is an
+# OutOfMemoryError in driver threads (heartbeater, BlockManagerMaster) with
+# no reference to the pipeline at all, so it reads like a cluster fault
+# rather than a sizing one.
+if [[ "$TARGET" == "prod" && -z "${INGEST_DRIVER_MEMORY:-}" ]]; then
+  note "WARN: INGEST_DRIVER_MEMORY is not set for the 364-column feed."
+  note "      The driver builds a large plan before reading any row; the"
+  note "      default heap has not been enough. Add to $ENV_FILE:"
+  note "        INGEST_DRIVER_MEMORY=4g"
+fi
+
 # ---- raw flag ---------------------------------------------------------------
 # Stamped on every RAW row as file_type, so a full load and an incremental are
 # distinguishable in the data itself rather than only by joining the ledger.

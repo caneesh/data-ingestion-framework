@@ -13,6 +13,44 @@ Companion docs: [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.m
 
 ---
 
+## Driver OutOfMemoryError on a wide feed
+
+Symptom: `java.lang.OutOfMemoryError: Java heap space` in DRIVER threads
+(`driver-heartbeater`, `BlockManagerMaster`, netty RPC) with no reference to
+the pipeline at all — it reads like a cluster fault rather than a sizing
+one. It happens during ANALYSIS, before a single row is read.
+
+The framework builds one projection per stage regardless of width (a
+per-column fold was removed for exactly this reason), but a 364-column feed
+still produces a large analyzer plan, and in **cluster mode the driver is a
+YARN container at the queue default** — routinely smaller than an edge-node
+shell. A feed that succeeds in client mode can therefore fail in cluster
+mode with no other change.
+
+```bash
+# scripts/smartiq.env
+INGEST_DRIVER_MEMORY=4g
+```
+
+Confirm it applied: the submit line contains `--driver-memory 4g`, and the
+Spark UI Environment tab shows `spark.driver.memory`.
+
+`run_smartiq.sh` warns when the 364-column feed runs without it.
+
+### Settings added to the template after your file was created
+
+`scripts/smartiq.env` is deliberately never overwritten — it holds site
+values — so a key ADDED to `smartiq.env.example` later is invisible. That
+is how `INGEST_DRIVER_MEMORY` went missing. `sync_artifacts.sh` now reports
+the difference:
+
+```
+  settings in the template but NOT in smartiq.env:
+    INGEST_DRIVER_MEMORY
+  (this file is never overwritten — add anything you need by hand)
+```
+
+
 ## Failure alerting
 
 The framework detects failures precisely and, until a `notifications` block

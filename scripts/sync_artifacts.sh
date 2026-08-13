@@ -88,6 +88,22 @@ for SRC in "${SOURCES[@]}"; do
   fi
 done
 
+# Settings drift: smartiq.env is intentionally never overwritten (it holds
+# site values), so a key ADDED to the template after the file was created
+# is invisible — which is exactly how a needed setting goes missing.
+if [[ -f "$ENV_FILE" && -f "$SCRIPT_DIR/smartiq.env.example" ]]; then
+  MISSING_KEYS=""
+  while IFS= read -r key; do
+    grep -qE "^[[:space:]]*${key}=" "$ENV_FILE" || MISSING_KEYS="$MISSING_KEYS $key"
+  done < <(grep -oE '^[A-Z_]+=' "$SCRIPT_DIR/smartiq.env.example" | tr -d '=')
+  if [[ -n "$MISSING_KEYS" ]]; then
+    echo
+    echo "  settings in the template but NOT in $(basename "$ENV_FILE"):"
+    for k in $MISSING_KEYS; do echo "    $k"; done
+    echo "  (this file is never overwritten — add anything you need by hand)"
+  fi
+fi
+
 echo
 if [[ $MISSING -eq 1 ]]; then
   echo "One or more sources are missing. If it is the assembly jar, build it:" >&2

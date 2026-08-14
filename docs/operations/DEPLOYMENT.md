@@ -251,6 +251,46 @@ spark-submit --class com.hcsc.generic.ingest.app.IngestMain --master yarn \
   --conf-path ./application.conf
 ```
 
+
+### Deploying to a server that is not a git checkout
+
+The runtime server commonly receives an EXPORTED copy rather than a clone,
+which leaves no way to answer the two questions that cost a debugging round
+each: *which commit is this*, and *has anything been edited since export*.
+
+Build a stamped bundle on a machine that does have the repo:
+
+```bash
+scripts/build_bundle.sh --with-jar          # -> smartiq_bundle_<commit>.zip
+```
+
+It carries the feed configs, contracts, DDLs, every launcher script, the
+settings template, optionally the assembly jar, plus:
+
+| File | Answers |
+|---|---|
+| `SOURCE_COMMIT` | which commit, and whether the tree was dirty |
+| `MANIFEST.sha256` | whether any file changed after export |
+
+On the server, with no git installed:
+
+```bash
+unzip -o smartiq_bundle_<commit>.zip -d /path/to/bundle
+cd /path/to/bundle
+sha256sum -c MANIFEST.sha256                    # prove the transfer is intact
+scripts/sync_artifacts.sh --from . --to "$SMARTIQ_CONF_DIR"
+```
+
+`sync_artifacts.sh` detects a bundle automatically when it is not inside a
+checkout, so `--from` can be omitted once `SMARTIQ_BUNDLE_DIR` is set. It
+reports each file as `same`, `STALE` or `NEW`, and lists settings the
+template has gained that your `smartiq.env` lacks — the gap that silently
+cost a wide-feed run its driver heap.
+
+The jar is excluded unless `--with-jar` is passed: it is ~65MB, and a
+deployment often ships it through a different channel.
+
+
 ---
 
 ## 6. JDBC driver deployment (driver AND executors)

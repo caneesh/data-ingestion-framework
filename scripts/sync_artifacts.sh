@@ -3,9 +3,18 @@
 # Copy the run-time artifacts from this checkout into the directory the
 # launcher reads, and say exactly what changed.
 #
-#   scripts/sync_artifacts.sh              # sync into $SMARTIQ_CONF_DIR
-#   scripts/sync_artifacts.sh --check      # report drift, change nothing
-#   scripts/sync_artifacts.sh --to /path   # sync somewhere else
+#   scripts/sync_artifacts.sh                 # sync into $SMARTIQ_CONF_DIR
+#   scripts/sync_artifacts.sh --check         # report drift, change nothing
+#   scripts/sync_artifacts.sh --to /path      # sync somewhere else
+#   scripts/sync_artifacts.sh --from /bundle  # source is an extracted bundle,
+#                                             # not a git checkout
+#
+# TWO DEPLOYMENT SHAPES. On a machine with the repo, sources are read from
+# the checkout. On a server that only ever receives an EXPORTED bundle —
+# no git, no repo — point --from at the extracted directory (or set
+# SMARTIQ_BUNDLE_DIR). The bundle carries MANIFEST.sha256 and
+# SOURCE_COMMIT, so the server can still say which commit it is running and
+# whether a file was modified after export.
 #
 # WHY THIS EXISTS: four consecutive lower-environment runs failed because a
 # file in the run directory was older than the repo — a stale jar, then a
@@ -25,12 +34,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="${SMARTIQ_ENV_FILE:-$SCRIPT_DIR/smartiq.env}"
 
-MODE="sync"; TARGET=""
+MODE="sync"; TARGET=""; BUNDLE="${SMARTIQ_BUNDLE_DIR:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --check) MODE="check"; shift ;;
     --to)    TARGET="${2:?--to needs a directory}"; shift 2 ;;
-    -h|--help) sed -n '3,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --from)  BUNDLE="${2:?--from needs a directory}"; shift 2 ;;
+    -h|--help) sed -n '3,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "ERROR: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -46,18 +56,43 @@ if [[ -z "$TARGET" ]]; then
 fi
 [[ -d "$TARGET" ]] || { echo "ERROR: destination is not a directory: $TARGET" >&2; exit 2; }
 
-EX="$REPO/docs/examples/smartiq_pdp"
-JAR_SRC="${SMARTIQ_JAR_SOURCE:-$REPO/ingestion-app/target/ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar}"
-
-SOURCES=(
-  "$EX/lower-env/feed-smartiq-pdp-e2e.conf"
-  "$EX/lower-env/smartiq-pdp-e2e-schema.conf"
-  "$EX/feed-smartiq-pdp.conf"
-  "$EX/smartiq-pdp-schema.conf"
-  "$JAR_SRC"
+ARTIFACTS=(
+  feed-smartiq-pdp-e2e.conf
+  smartiq-pdp-e2e-schema.conf
+  feed-smartiq-pdp.conf
+  smartiq-pdp-schema.conf
 )
+JAR_NAME="ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar"
 
-echo "repo   $REPO ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo 'not a git checkout'))"
+# A bundle is FLAT (as exported); a checkout keeps the repo layout. Fall
+# back to the bundle automatically when this is not a git checkout, so the
+# server needs no extra flag once SMARTIQ_BUNDLE_DIR is set.
+if [[ -z "$BUNDLE" && ! -d "$REPO/.git" ]]; then
+  # The scripts themselves ship inside the bundle, so their parent is it.
+  [[ -f "$SCRIPT_DIR/../feed-smartiq-pdp.conf" ]] && BUNDLE="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+
+SOURCES=()
+if [[ -n "$BUNDLE" ]]; then
+  [[ -d "$BUNDLE" ]] || { echo "ERROR: --from is not a directory: $BUNDLE" >&2; exit 2; }
+  for a in "${ARTIFACTS[@]}"; do SOURCES+=("$BUNDLE/$a"); done
+  [[ -f "$BUNDLE/$JAR_NAME" ]] && SOURCES+=("$BUNDLE/$JAR_NAME")
+  SOURCE_DESC="bundle $BUNDLE"
+  [[ -f "$BUNDLE/SOURCE_COMMIT" ]] &&
+    SOURCE_DESC="$SOURCE_DESC (exported from $(head -1 "$BUNDLE/SOURCE_COMMIT"))"
+else
+  EX="$REPO/docs/examples/smartiq_pdp"
+  SOURCES=(
+    "$EX/lower-env/feed-smartiq-pdp-e2e.conf"
+    "$EX/lower-env/smartiq-pdp-e2e-schema.conf"
+    "$EX/feed-smartiq-pdp.conf"
+    "$EX/smartiq-pdp-schema.conf"
+    "${SMARTIQ_JAR_SOURCE:-$REPO/ingestion-app/target/$JAR_NAME}"
+  )
+  SOURCE_DESC="repo $REPO ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo 'no git'))"
+fi
+
+echo "source $SOURCE_DESC"
 echo "target $TARGET"
 [[ "$MODE" == "check" ]] && echo "(--check: reporting only)"
 echo
@@ -91,11 +126,13 @@ done
 # Settings drift: smartiq.env is intentionally never overwritten (it holds
 # site values), so a key ADDED to the template after the file was created
 # is invisible — which is exactly how a needed setting goes missing.
-if [[ -f "$ENV_FILE" && -f "$SCRIPT_DIR/smartiq.env.example" ]]; then
+TEMPLATE="$SCRIPT_DIR/smartiq.env.example"
+[[ -f "$TEMPLATE" ]] || TEMPLATE="${BUNDLE:-}/scripts/smartiq.env.example"
+if [[ -f "$ENV_FILE" && -f "$TEMPLATE" ]]; then
   MISSING_KEYS=""
   while IFS= read -r key; do
     grep -qE "^[[:space:]]*${key}=" "$ENV_FILE" || MISSING_KEYS="$MISSING_KEYS $key"
-  done < <(grep -oE '^[A-Z_]+=' "$SCRIPT_DIR/smartiq.env.example" | tr -d '=')
+  done < <(grep -oE '^[A-Z_]+=' "$TEMPLATE" | tr -d '=')
   if [[ -n "$MISSING_KEYS" ]]; then
     echo
     echo "  settings in the template but NOT in $(basename "$ENV_FILE"):"

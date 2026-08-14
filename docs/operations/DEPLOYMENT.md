@@ -276,6 +276,37 @@ unzip -p <jar> META-INF/MANIFEST.MF | grep Build-Time
 The same value is recorded in `ingest_run_audit.framework_version`, so the
 ledger says which build produced every batch.
 
+### Minimal deployment: build the jar, copy six files
+
+The whole repository is not needed on the server. Build the jar wherever you
+have the source, then copy:
+
+```
+scripts/run_smartiq.sh              # the launcher
+scripts/run_ingest.sh               # it delegates here
+scripts/ingest_submit_common.sh     # which sources this
+scripts/smartiq.env                 # your settings (chmod 600, never in git)
+<conf dir>/feed-<feed>.conf         # SMARTIQ_CONF_DIR points here
+<conf dir>/<feed>-schema.conf       # beside the feed — it is include'd by name
+<lib>/ingestion-app-...-jar-with-dependencies.jar
+<lib>/mssql-jdbc-<ver>.jre11.jar
+```
+
+**All three scripts must sit in one directory** — the launcher delegates to
+`run_ingest.sh`, which sources `ingest_submit_common.sh`. Copying only
+`run_smartiq.sh` now fails with a message saying so rather than a bare
+"No such file or directory".
+
+`sync_artifacts.sh` and `build_bundle.sh` are optional conveniences; the
+launcher skips its staleness check when there is no checkout, so nothing
+breaks without them.
+
+Then simply:
+
+```bash
+./scripts/run_smartiq.sh prod INCR --run-id pdp-$(date +%H%M%S)
+```
+
 ### Deploying to a server that is not a git checkout
 
 The runtime server commonly receives an EXPORTED copy rather than a clone,

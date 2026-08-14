@@ -40,6 +40,18 @@ esac
 MODE="INCR"
 if [[ "${1:-}" == "FULL" || "${1:-}" == "INCR" ]]; then MODE="$1"; shift; fi
 
+# ---- required siblings ------------------------------------------------------
+# This launcher delegates to run_ingest.sh, which sources
+# ingest_submit_common.sh. A deployment that copies only THIS file gets a
+# bare "No such file or directory" naming a path, with no hint that two
+# more scripts belong beside it.
+for sibling in run_ingest.sh ingest_submit_common.sh; do
+  [[ -f "$SCRIPT_DIR/$sibling" ]] || die "missing $SCRIPT_DIR/$sibling
+  This launcher needs three scripts side by side:
+    run_smartiq.sh  run_ingest.sh  ingest_submit_common.sh
+  Copy the whole scripts/ directory, not just run_smartiq.sh."
+done
+
 # ---- site settings ----------------------------------------------------------
 [[ -f "$ENV_FILE" ]] || die "no site settings at $ENV_FILE
   Create it once:  cp $SCRIPT_DIR/smartiq.env.example $ENV_FILE && chmod 600 $ENV_FILE"

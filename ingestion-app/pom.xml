@@ -87,7 +87,15 @@
           <archive>
             <manifest>
               <mainClass>com.hcsc.generic.ingest.app.IngestMain</mainClass>
+              <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
             </manifest>
+            <!-- The runtime server receives an scp'd jar, not a checkout, so
+                 nothing else can say WHICH BUILD is running. Stamping it here
+                 is what lets the driver log and the audit ledger answer that
+                 without git. -->
+            <manifestEntries>
+              <Build-Time>${maven.build.timestamp}</Build-Time>
+            </manifestEntries>
           </archive>
         </configuration>
         <executions>

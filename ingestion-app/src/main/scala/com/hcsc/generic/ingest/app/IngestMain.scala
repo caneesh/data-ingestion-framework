@@ -19,6 +19,12 @@ object IngestMain {
   def main(args: Array[String]): Unit = {
     registerConnectors()
 
+    // FIRST line in every driver log. The jar is scp'd to a server that is
+    // not a checkout, so this is the only thing that can distinguish a
+    // freshly built jar from the one already there — a distinction that has
+    // cost several debugging rounds.
+    logger.info(s"[Build] ingestion framework ${com.hcsc.generic.ingest.BuildInfo.summary}")
+
     val cli = CliParser.parse(args)
 
     val baseConf: Config = loadBaseConfig(cli.confPath)

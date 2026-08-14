@@ -252,6 +252,30 @@ spark-submit --class com.hcsc.generic.ingest.app.IngestMain --master yarn \
 ```
 
 
+### Which build is running?
+
+Every driver log opens with the jar's own identity:
+
+```
+[Build] ingestion framework 1.0.0-SNAPSHOT (built 2026-08-14T01:41:54Z)
+```
+
+Stamped into the assembly manifest at package time, so it travels with the
+jar. This matters because the usual path — download the repo as a ZIP
+(which strips `.git`), build on a laptop, `scp` the jar — leaves neither
+machine able to say which build a jar came from. Two jars of the same
+SNAPSHOT version are indistinguishable by name, size or version; only the
+build time separates them.
+
+Compare it with what you just built:
+
+```bash
+unzip -p <jar> META-INF/MANIFEST.MF | grep Build-Time
+```
+
+The same value is recorded in `ingest_run_audit.framework_version`, so the
+ledger says which build produced every batch.
+
 ### Deploying to a server that is not a git checkout
 
 The runtime server commonly receives an EXPORTED copy rather than a clone,

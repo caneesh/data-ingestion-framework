@@ -502,9 +502,7 @@ object AuditService {
   /** Build identity from the jar manifest; "unknown" when running from
     * classes (tests, IDE) where no manifest is present. */
   private[ingest] lazy val frameworkVersion: String =
-    Option(classOf[AuditService].getPackage)
-      .flatMap(p => Option(p.getImplementationVersion))
-      .getOrElse("unknown")
+    com.hcsc.generic.ingest.BuildInfo.summary
 
   /** The identity the run executed under. Prefers the Hadoop login user so
     * a Kerberised cluster records the real principal rather than whatever

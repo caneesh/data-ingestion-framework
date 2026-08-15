@@ -13,6 +13,38 @@ Companion docs: [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.m
 
 ---
 
+## Resetting a watermark (and the continuity failure that follows)
+
+Clearing a watermark to re-pull history is a legitimate operation, but the
+NEXT run then fails reconciliation by construction:
+
+```
+Reconciliation failed: watermark_continuity:
+  expected=2026-05-01 20:34:20.0  actual=1900-01-01 00:00:00
+```
+
+The run started at `incremental.initial_value` while the ledger still
+records where the previous window ended. The two stores disagree about
+history — which is exactly what the check exists to detect, and exactly
+what a manual reset creates. **The data is intact.** The message now says
+so, naming `initial_value` as the reason.
+
+Two ways through:
+
+1. **Accept it once.** Set `audit.reconciliation.on_mismatch = "WARN"` in
+   the feed for that single run, then put it back to `FAIL`. This is a feed
+   config value, not a Spark `--conf`.
+2. **Do not reset at all.** To see real rows flow, change a source row
+   instead — the watermark then advances normally and continuity holds:
+
+   ```sql
+   UPDATE dbo.<table> SET <watermark_column> = SYSUTCDATETIME() WHERE <key> = '<value>';
+   ```
+
+Option 2 is preferable whenever the goal is to exercise the pipeline rather
+than to genuinely re-load history.
+
+
 ## Driver OutOfMemoryError on a wide feed
 
 Symptom: `java.lang.OutOfMemoryError: Java heap space` in DRIVER threads

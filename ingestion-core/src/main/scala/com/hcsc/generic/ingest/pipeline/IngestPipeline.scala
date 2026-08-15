@@ -1066,10 +1066,30 @@ final class IngestPipeline(
             "not this read. Re-run with a NEW --run-id, or use --force-reprocess to append " +
             "anyway (duplicating what that attempt already wrote)"
         else ""
+      // A continuity failure whose ACTUAL start is the configured
+      // initial_value has one overwhelmingly likely cause: the watermark was
+      // cleared or reset, so this run began from the beginning of time while
+      // the ledger still records where the last one ended. That is a
+      // deliberate operator action, not corruption, and saying so turns a
+      // confusing failure into an expected one.
+      val resetHint = {
+        val initial = ConfigUtils.optString(feedConf, "source.incremental.initial_value")
+        val continuity = failed.find(_._1 == "watermark_continuity")
+        (initial, continuity) match {
+          case (Some(iv), Some((_, expected, actual, _))) if actual.trim == iv.trim =>
+            s". NOTE: the window started at '$actual', which is this feed's configured " +
+              s"incremental.initial_value — the watermark was reset or cleared, while the " +
+              s"ledger still records the previous window ending at '$expected'. The data is " +
+              "intact; the two stores simply disagree about history. Expected after a manual " +
+              "watermark reset: re-run with audit.reconciliation.on_mismatch = WARN for that " +
+              "one run, or leave the watermark alone and change a source row instead"
+          case _ => ""
+        }
+      }
       if (onMismatch == "FAIL")
-        throw new IllegalStateException(s"Reconciliation failed: $summary$skipHint")
+        throw new IllegalStateException(s"Reconciliation failed: $summary$skipHint$resetHint")
       else
-        logger.warn(s"[Pipeline] Reconciliation mismatches: $summary$skipHint")
+        logger.warn(s"[Pipeline] Reconciliation mismatches: $summary$skipHint$resetHint")
     }
   }
 }

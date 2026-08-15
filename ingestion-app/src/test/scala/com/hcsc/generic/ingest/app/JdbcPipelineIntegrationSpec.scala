@@ -511,6 +511,35 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       "the failed run must not advance the watermark")
   }
 
+  test("a continuity failure caused by a watermark RESET says so, rather than reading as corruption") {
+    // The operational case: an operator clears the watermark deliberately to
+    // re-pull history. The run then starts at initial_value while the ledger
+    // still records where the last window ended, so continuity fails BY
+    // CONSTRUCTION. Two bare timestamps give no hint that this is the
+    // expected consequence of a deliberate action rather than tampering.
+    // claims_reset is a fresh entity, so its watermark store starts empty —
+    // the same state a manual reset leaves behind.
+    spark.sql(
+      "INSERT INTO j_audit.ingest_run_audit " + LEDGER_COLS + " VALUES " +
+        "('prior-run', 'claims_reset', 'raw', 'SUCCESS', " +
+        "0, 0, 0, 0, 0, 0, 0, CAST(NULL AS STRING), '', TIMESTAMP '2030-01-01 00:00:00', 'FULL', " +
+        "'2027-01-01 00:00:00.0', '2027-02-01 00:00:00.0')")
+    h2("INSERT INTO claims VALUES ('C009', 160, '2026-01-09 09:00:00')")
+
+    val e = intercept[IllegalStateException] {
+      new IngestPipeline(spark, auditedConf("reset"),
+        Cli(entity = "claims_reset", mode = "FULL", runId = Some("rrun-1")), logger).run()
+    }
+    val m = String.valueOf(e.getMessage)
+    assert(m.contains("watermark_continuity"), s"still the same check: $m")
+    assert(m.contains("initial_value"),
+      s"must name initial_value as the reason the window started where it did: $m")
+    assert(m.toLowerCase.contains("reset") || m.toLowerCase.contains("cleared"),
+      s"must say the watermark was reset, not leave the operator guessing: $m")
+    assert(m.contains("data is intact"),
+      s"must state that this is a bookkeeping disagreement, not data loss: $m")
+  }
+
   test("FULL_SNAPSHOT_ABSENCE tombstones keys missing from a complete snapshot; reactivation revives them") {
     import org.apache.spark.sql.functions.col
     // FULL_TABLE every run = a complete snapshot each time (the incremental

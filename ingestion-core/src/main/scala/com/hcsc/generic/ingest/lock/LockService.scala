@@ -44,7 +44,13 @@ final class LockService(
   /** concurrency.wait_ms: total budget to WAIT for a held entity instead of
     * failing fast (the default, 0). The claim is retried until the budget
     * runs out; the last contention error propagates unchanged. */
-  waitMillis: Long = 0L
+  waitMillis: Long = 0L,
+  /** concurrency.stale_heartbeat_intervals: consecutive missed heartbeats
+    * after which a holder is treated as crashed and its lease taken over.
+    * 3 tolerates a GC pause or metastore blip while still clearing a dead
+    * holder in ~1 lease rather than the full lease. 0 disables the takeover
+    * and restores lease-expiry-only behaviour. */
+  staleHeartbeatIntervals: Int = 3
 ) extends RunLock {
   require(database.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"lock database '$database' is not a safe SQL identifier")
   require(table.matches("[a-zA-Z_][a-zA-Z0-9_]*"), s"lock table '$table' is not a safe SQL identifier")
@@ -155,9 +161,18 @@ final class LockService(
       else if (ageMs <= 2 * beatMs)
         s"last heartbeat ${ageMin}m ago (renews every ~${beatMin}m) — one interval missed; " +
           "re-check in a few minutes before concluding it died"
-      else
+      else if (staleHeartbeatIntervals <= 0)
         s"last heartbeat ${ageMin}m ago but it renews every ~${beatMin}m — the holder has almost " +
-          "certainly CRASHED without releasing"
+          "certainly CRASHED without releasing (automatic takeover is disabled by " +
+          "concurrency.stale_heartbeat_intervals = 0)"
+      else
+        // Beyond the takeover threshold the holder is not reported at all —
+        // it is taken over — so reaching here means it is silent but still
+        // within the grace period. Saying when the takeover happens is more
+        // useful than a verdict the operator would have to act on manually.
+        s"last heartbeat ${ageMin}m ago (renews every ~${beatMin}m) — silent, and will be taken " +
+          s"over automatically once it has missed $staleHeartbeatIntervals intervals; " +
+          "no action needed"
     s"PIPE_001 entity '$entity' is locked by run '${held.holder}' " +
       s"(lease until ${held.leaseUntil.map(_.toString).getOrElse("?")}; $verdict). Two concurrent " +
       "runs of one entity would extract overlapping windows and overwrite each other's curated " +
@@ -166,14 +181,48 @@ final class LockService(
       s"'${held.holder}' to the lock table."
   }
 
-  /** Latest row per holder decides its state; a holder is active when that
-    * row is a CLAIM whose lease has not expired. */
+  /**
+    * Holders still considered to own the entity.
+    *
+    * A holder is active when its latest row is a CLAIM whose lease has not
+    * expired AND whose heartbeat is not provably dead.
+    *
+    * THE HEARTBEAT TEST IS THE SELF-HEALING PART. A live run re-CLAIMs every
+    * leaseMillis/3, so silence for several intervals means the holder died
+    * without releasing — a killed driver, a lost terminal, an evicted
+    * container. Waiting out the remaining lease serves nobody: the entity is
+    * blocked while nothing is running, which happened twice in testing and
+    * cost four hours each time before the lease was shortened.
+    *
+    * The threshold is deliberately generous. One missed renewal is a GC
+    * pause or a metastore blip, not death; the verdict needs
+    * `staleHeartbeatIntervals` consecutive misses. A live holder is still
+    * beating and therefore cannot be stolen from — which is what makes this
+    * safe rather than a race.
+    *
+    * Set `concurrency.stale_heartbeat_intervals = 0` to disable and fall
+    * back to lease-expiry only.
+    */
   private def activeClaims(entity: String): Seq[Claim] = {
     val now = System.currentTimeMillis()
+    val beatMillis = math.max(leaseMillis / 3, 1L)
     claimsFor(entity)
       .groupBy(_.holder)
       .flatMap { case (_, rows) => rows.sortBy(r => (r.eventTs.getTime, r.action)).lastOption }
       .filter(c => c.action == "CLAIM" && c.leaseUntil.exists(_.getTime > now))
+      .filter { c =>
+        if (staleHeartbeatIntervals <= 0) true
+        else {
+          val silentFor = now - c.eventTs.getTime
+          val dead = silentFor > beatMillis * staleHeartbeatIntervals
+          if (dead)
+            logger.warn(s"[Lock] entity=$entity holder='${c.holder}' has not renewed for " +
+              s"${silentFor / 60000}m (heartbeat every ~${beatMillis / 60000}m, " +
+              s"threshold $staleHeartbeatIntervals intervals): treating it as CRASHED and " +
+              "taking the lease over. Its lease had not yet expired.")
+          !dead
+        }
+      }
       .toSeq
   }
 
@@ -256,6 +305,8 @@ object LockService {
               table = conc.flatMap(c => ConfigUtils.optString(c, "table")).getOrElse("ingest_run_locks"),
               leaseMillis = conc.flatMap(c => ConfigUtils.optLong(c, "lease_minutes")).getOrElse(240L) * 60000L,
               settleMillis = conc.flatMap(c => ConfigUtils.optLong(c, "settle_ms")).getOrElse(2000L),
+              staleHeartbeatIntervals = conc.flatMap(c =>
+                ConfigUtils.optLong(c, "stale_heartbeat_intervals")).getOrElse(3L).toInt,
               logger = logger,
               waitMillis = conc.flatMap(c => ConfigUtils.optLong(c, "wait_ms")).getOrElse(0L)))
           case None if conc.isDefined =>

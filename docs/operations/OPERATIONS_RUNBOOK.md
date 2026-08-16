@@ -13,6 +13,58 @@ Companion docs: [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.m
 
 ---
 
+## Self-healing: what recovers itself, and what must not
+
+Much of the framework already recovers without intervention: the watermark
+advances only on success (a failed run re-reads its window), the run-id and
+window guards make a rerun idempotent, failed curated batches stay PENDING
+for the next `--pending` drain, `record_hash` makes a re-publish a no-op,
+and a crashed run's lock is now taken over rather than waited out. A
+scheduler rerun of a failed job has always been safe.
+
+### Exit codes: is retrying worth it?
+
+| Exit | Class | Scheduler action |
+|---|---|---|
+| `0` | success (including an empty no-op) | — |
+| `10` | `TRANSIENT` — connection reset, YARN preemption, lock contention, watermark conflict | retry with backoff |
+| `20` | `DATA_INTEGRITY` — reconciliation, contract, curated integrity | **never retry**; alert |
+| `30` | `CONFIGURATION` — `CFG_*`, missing file, bad credential | **never retry**; alert |
+| `1` | unclassified | retry once, then alert |
+
+Classification is deliberately conservative: anything not confidently
+identified stays `1`, exactly as before. A missed `TRANSIENT` costs one
+manual rerun; a wrong one would make a scheduler retry a data-integrity
+failure forever and call it self-healing.
+
+**The exit code only propagates in CLIENT mode.** In YARN cluster mode
+`spark-submit` reports the final application state, not the driver's exit
+code. Two mode-independent channels carry the same verdict:
+
+```
+[Outcome] class=TRANSIENT exitCode=10 retryable=true entity=... runId=... stage=...
+```
+
+and the notification payload, whose message is prefixed `[TRANSIENT]`,
+`[DATA_INTEGRITY]` and so on. For a cluster-mode Control-M job, branch on
+the log marker or the alert rather than the code.
+
+### Stale lock takeover
+
+A holder that stops renewing for `concurrency.stale_heartbeat_intervals`
+(default 3) consecutive heartbeats is treated as crashed and its lease is
+taken over, instead of blocking the entity for the remaining lease. A live
+holder is still beating and cannot be stolen from, which is what makes this
+safe. Set the value to `0` to restore lease-expiry-only behaviour.
+
+### What deliberately does NOT self-heal
+
+Reconciliation mismatches, contract violations, watermark continuity and
+reject-threshold breaches all mean *the data is not what was expected*.
+Retrying reproduces them; suppressing them removes the guarantees the
+framework exists to provide. These page a human by design.
+
+
 ## Resetting a watermark (and the continuity failure that follows)
 
 Clearing a watermark to re-pull history is a legitimate operation, but the

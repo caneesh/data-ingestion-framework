@@ -148,13 +148,52 @@ class LockServiceSpec extends AnyFunSuite with BeforeAndAfterAll {
     // stopped hours ago, without sleeping for hours).
     service(leaseMillis = 600000L).acquire("beat_stale", "holder-3")
     Thread.sleep(400L)
-    val staleReader = service(leaseMillis = 300L)   // heartbeat interval 100ms
+    // Takeover DISABLED here on purpose: with it enabled (the default) a
+    // holder this silent is taken over rather than reported, so the CRASHED
+    // verdict is only reachable — and only actionable — for sites that have
+    // turned automatic takeover off. That branch still exists and still has
+    // to tell the operator how to release by hand.
+    val staleReader = new LockService(spark, "l_audit", "ingest_run_locks",
+      leaseMillis = 300L, settleMillis = 0L, logger,
+      waitMillis = 0L, staleHeartbeatIntervals = 0)
     val stale = intercept[PipelineLockException](staleReader.acquire("beat_stale", "holder-4"))
     val sm = String.valueOf(stale.getMessage)
     assert(sm.contains("CRASHED"),
       s"a holder silent for many renewal intervals must be reported as crashed: $sm")
     assert(sm.contains("RELEASE"),
       s"must say HOW to force-release, not merely that one can: $sm")
+  }
+
+  test("a holder silent for several heartbeats is taken over, without waiting out its lease") {
+    // Self-healing: a killed driver holds a lease it can no longer renew.
+    // Waiting out the remainder blocks the entity while NOTHING is running —
+    // which cost four hours twice during testing. The heartbeat proves death
+    // objectively, so the lease can be taken over early.
+    val shortBeat = service(leaseMillis = 600L)   // heartbeat interval 200ms
+    shortBeat.acquire("takeover", "dead-holder")
+    Thread.sleep(900L)                            // > 3 intervals of silence
+
+    // A long lease on the READER keeps the stored claim unexpired, so the
+    // ONLY thing that can let this through is the heartbeat verdict.
+    val reader = new LockService(spark, "l_audit", "ingest_run_locks",
+      leaseMillis = 600L, settleMillis = 0L, logger)
+    reader.acquire("takeover", "new-run")         // must not throw
+  }
+
+  test("a BEATING holder is never taken over, however long its lease") {
+    val lock = service(leaseMillis = 600000L)     // heartbeat interval ~200s
+    lock.acquire("beating", "live-holder")
+    // Its claim row was written just now: well inside one interval.
+    intercept[PipelineLockException](lock.acquire("beating", "other-run"))
+  }
+
+  test("stale_heartbeat_intervals = 0 restores lease-expiry-only behaviour") {
+    val strict = new LockService(spark, "l_audit", "ingest_run_locks",
+      leaseMillis = 600000L, settleMillis = 0L, logger,
+      waitMillis = 0L, staleHeartbeatIntervals = 0)
+    strict.acquire("nohb", "holder-a")
+    // Even with the takeover disabled the unexpired lease still blocks.
+    intercept[PipelineLockException](strict.acquire("nohb", "holder-b"))
   }
 
   test("forceRelease evicts the active holder") {

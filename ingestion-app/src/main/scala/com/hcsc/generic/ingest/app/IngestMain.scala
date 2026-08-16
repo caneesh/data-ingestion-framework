@@ -69,25 +69,48 @@ object IngestMain {
     } catch {
       case error: Throwable =>
         logger.error(s"Ingest failed entity=${cli.entity}", error)
-        // Single hook covering every terminal failure: stage failures,
-        // reconciliation mismatches and lock contention all reach here by
-        // rethrowing. Best-effort by construction — the run has already
-        // failed, and an unreachable webhook must not change how it failed
-        // or mask the original exception.
+
+        // Is retrying this worth a scheduler's time? Classified here, at the
+        // one point every terminal failure reaches by rethrowing.
+        val failure = com.hcsc.generic.ingest.runtime.FailureClass.classify(error)
+
+        // THREE channels, because no single one works everywhere. The exit
+        // code propagates through spark-submit in CLIENT mode only — in YARN
+        // CLUSTER mode spark-submit reports the final APPLICATION state, not
+        // the driver JVM's code — so the log marker and the notification
+        // carry the same verdict for schedulers that cannot see the code.
+        logger.error(s"[Outcome] class=${failure.name} exitCode=${failure.exitCode} " +
+          s"retryable=${failure.retryable} entity=${cli.entity} " +
+          s"runId=${cli.runId.getOrElse("<unassigned>")} stage=${cli.stage}")
+
+        // Best-effort by construction — the run has already failed, and an
+        // unreachable webhook must not change how it failed or mask the
+        // original exception.
         try {
           com.hcsc.generic.ingest.notify.NotificationService(feedConf, logger)
             .notifyFailure(cli.entity, cli.runId.getOrElse("<unassigned>"),
-              cli.stage, String.valueOf(error.getMessage))
+              cli.stage, s"[${failure.name}] ${String.valueOf(error.getMessage)}")
         } catch {
           case notifyError: Throwable =>
             logger.warn(s"[Notify] failure notification could not be sent: " +
               s"${notifyError.getMessage}")
         }
+        classifiedExit = failure.exitCode
         throw error
     } finally {
       spark.stop()
+      // AFTER spark.stop(), so the context shuts down cleanly first. Only an
+      // explicitly classified failure changes the code; Unclassified is 1,
+      // exactly what an uncaught throw already produced.
+      if (classifiedExit != 0 &&
+          classifiedExit != com.hcsc.generic.ingest.runtime.FailureClass.Unclassified.exitCode)
+        System.exit(classifiedExit)
     }
   }
+
+  /** Set by the failure handler, read by the finally block after the Spark
+    * context has stopped. */
+  @volatile private var classifiedExit: Int = 0
 
   /**
     * Loads the base configuration, tolerating a BARE filename on either

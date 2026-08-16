@@ -126,6 +126,8 @@ feeds.claims {
 | CFG_017 | `freshness.compare_as` not a valid Spark type; `compare_as` and `compare_format` both declared; unparseable `tie_breakers` / `dedup.order_by` ordering syntax |
 | CFG_018 | `--conf-path` names a file that does not exist (typically: not shipped with `--files`) |
 
+Self-healing knobs: `concurrency.stale_heartbeat_intervals` (default 3; 0 disables crashed-holder takeover).
+
 ## Logical comparison types
 
 Physical storage keeps whatever type the user chooses (e.g. an all-string

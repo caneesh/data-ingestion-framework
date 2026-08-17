@@ -125,6 +125,7 @@ feeds.claims {
 | CFG_016 | `ingestion.execution = DECOUPLED` without `watermark.advance_after = RAW` (incremental sources) or without the run ledger; DECOUPLED feed invoked with `--stage all` |
 | CFG_017 | `freshness.compare_as` not a valid Spark type; `compare_as` and `compare_format` both declared; unparseable `tie_breakers` / `dedup.order_by` ordering syntax |
 | CFG_018 | `--conf-path` names a file that does not exist (typically: not shipped with `--files`) |
+| CFG_019 | `--override-path` names a file that does not exist (fail-closed: an override that silently did not apply is worse than a failed run) |
 
 Self-healing knobs: `concurrency.stale_heartbeat_intervals` (default 3; 0 disables crashed-holder takeover).
 
@@ -172,3 +173,51 @@ Control-M section; wrapper scripts live in `scripts/`.
 CDC-events example and a file-feed example live in `application.conf`'s
 commented blocks; the interactive generator (`ingestion-config-gen`)
 produces feeds that pass this validator by construction.
+
+
+## Operational override layer (`--override-path`)
+
+A deployed feed config sits behind change control. Operational values —
+a lock lease, a reject threshold, an alert webhook, a table name — often
+need to change faster than a change order can be raised. `--override-path`
+supplies a second HOCON file whose values **always win** over the feed:
+
+```bash
+spark-submit ... \
+  --files /opt/ingest/conf/feed-smartiq-pdp.conf,/opt/ingest/conf/smartiq-override.conf \
+  ... --conf-path ./feed-smartiq-pdp.conf --override-path ./smartiq-override.conf
+```
+
+Via the wrappers, set `INGEST_OVERRIDE_FILE` in the env file — the script
+ships it with `--files` and passes `--override-path` automatically.
+
+### Semantics
+
+| Behaviour | Rule |
+|-----------|------|
+| Precedence | The override wins for **every path it declares**, at any depth. There is no path the feed can protect. |
+| Objects | Merge — overriding `concurrency.lease_minutes` leaves the rest of `concurrency` untouched. |
+| Lists | Replaced wholesale, never appended. |
+| New paths | Permitted — an override may introduce a setting the feed never declared. |
+| Scope | The whole config root, not just `feeds.*` — `app.spark.session_time_zone` is overridable too. Spark's own `--conf` settings are not: they are the submit command, not this file. |
+| Substitutions | Resolved **after** the merge, so `${...}` in either file sees the combined view. |
+| Missing file | Hard failure, **CFG_019**. An override that silently did not apply is the worst outcome. |
+| Empty / blank path | Treated as "no override"; wrapper variables that expand to empty do not fail the run. |
+
+### Auditability
+
+The layer is deliberately loud, because an unversioned file that changes
+behaviour is exactly the drift this framework exists to catch:
+
+- Every overridden path is logged **by name** at WARN under `[Override]`,
+  marked `(replaces the feed's value)` or `(new)`.
+- Paths that reduce a safety guarantee — `allow_insecure_tls`,
+  `on_mismatch`, `max_reject_percent`, `audit.enabled`, `concurrency.lock`,
+  `confirm_complete_extract` and similar — are additionally logged as an
+  explicit WARNING. Overriding them is permitted; doing so quietly is not.
+- The ledger's `config_fingerprint` gains an `+ovr:<digest>` suffix, so an
+  overridden run is never indistinguishable from a normal one. The base
+  fingerprint hashes key **structure** only and cannot see a changed value —
+  this suffix closes that gap.
+- **Values are never logged or stored**, only path names and a digest: an
+  override file may legitimately carry a credential.

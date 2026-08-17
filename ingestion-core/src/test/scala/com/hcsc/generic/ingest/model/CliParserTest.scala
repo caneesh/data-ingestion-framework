@@ -14,6 +14,7 @@ class CliParserTest extends AnyFunSuite {
     assert(cli.mode == "FULL")
     assert(cli.stage == "all")
     assert(cli.confPath.isEmpty)
+    assert(cli.overridePath.isEmpty, "no override unless one is asked for")
     assert(cli.rawFlag.isEmpty)
     assert(cli.resumeIngestDt.isEmpty)
   }
@@ -23,6 +24,7 @@ class CliParserTest extends AnyFunSuite {
       "--entity", "order",
       "--mode", "INCR",
       "--conf-path", "/etc/app.conf",
+      "--override-path", "/etc/app-override.conf",
       "--raw-flag", "CSV",
       "--stage", "raw",
       "--resume-ingest-dt", "2024-01-01"
@@ -30,6 +32,7 @@ class CliParserTest extends AnyFunSuite {
     assert(cli.entity == "order")
     assert(cli.mode == "INCR")
     assert(cli.confPath == Some("/etc/app.conf"))
+    assert(cli.overridePath == Some("/etc/app-override.conf"))
     assert(cli.rawFlag == Some("CSV"))
     assert(cli.stage == "raw")
     assert(cli.resumeIngestDt == Some("2024-01-01"))

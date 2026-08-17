@@ -149,7 +149,11 @@ final class AuditService(
     * hashed, which is enough to detect that something changed.
     */
   private lazy val configFingerprint: String =
-    feedConf.map(AuditService.fingerprint).getOrElse("")
+    feedConf.map(AuditService.fingerprint).getOrElse("") +
+      // An override changes VALUES, which the structural hash cannot see. A
+      // run configured by an override must never look identical in the
+      // ledger to one that was not.
+      com.hcsc.generic.ingest.runtime.OverrideContext.fingerprintSuffix
 
   private val fileTableDdl =
     "run_id STRING, entity STRING, file_name STRING, file_path STRING, checksum STRING, " +

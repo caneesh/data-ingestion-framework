@@ -176,6 +176,7 @@ They share `ingest_submit_common.sh`, configured by environment:
 | `INGEST_JARS` | **the vendor JDBC driver(s)**, comma-separated |
 | `INGEST_EXTRA_FILES` | files the feed config `include`s, comma-separated |
 | `INGEST_ENV_VARS` | variable NAMES forwarded to a cluster-mode driver |
+| `INGEST_OVERRIDE_FILE` | optional override config; its values **win** over the feed (see below) |
 
 `INGEST_JAR` and `INGEST_JARS` differ by one letter and mean different
 things; the wrapper rejects an `INGEST_JAR` that looks like a JDBC driver
@@ -187,6 +188,31 @@ The wrapper validates before submitting: every path in `--files` and
 an empty path and fail inside `prepareLocalResources` with *"Can not create
 a Path from an empty string"* — an error naming neither the option nor the
 file.
+
+### Changing a setting without a change order
+
+`INGEST_OVERRIDE_FILE` points at a second HOCON file whose values take
+precedence over the deployed feed config for every path it declares. The
+wrapper ships it with `--files` and passes `--override-path` automatically,
+so raising a lease or relaxing a threshold during an incident is an edit to
+one small file rather than a redeployment of the feed:
+
+```hocon
+# /opt/ingest/conf/smartiq-override.conf  — deployed on its own
+feeds.smartiq_pdp.concurrency.lease_minutes = 120
+```
+
+Objects merge (the rest of `concurrency` is untouched), lists are replaced
+wholesale, and a named-but-missing file is a hard **CFG_019** failure rather
+than a silent no-op. Every overridden path is logged by name under
+`[Override]`, safety-reducing paths are flagged as warnings, and the ledger's
+`config_fingerprint` gains an `+ovr:` suffix so an overridden run is never
+mistaken for a normal one. Values are never logged — the file may carry a
+credential. Full semantics: `docs/architecture/CONFIGURATION_MODEL.md`.
+
+**Remove the override once the underlying change is deployed.** It is
+unversioned by design, which makes it the right tool for hours and the wrong
+one for months.
 
 A feed-specific launcher like `run_smartiq.sh` is worth writing per pipeline:
 it keeps site values in one gitignored settings file, prompts for the

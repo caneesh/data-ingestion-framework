@@ -4,6 +4,10 @@ case class Cli(
   entity: String = "",
   mode: String = "FULL",
   confPath: Option[String] = None,
+  /** Operational override layer. Every value here WINS over the same path in
+    * the feed config, so a lease, a threshold or a table name can change
+    * without reissuing the feed through change control. */
+  overridePath: Option[String] = None,
   rawFlag: Option[String] = None,
   stage: String = "all",
   resumeIngestDt: Option[String] = None,
@@ -47,6 +51,9 @@ object CliParser {
           index += 2
         case "--conf-path" =>
           cli = cli.copy(confPath = Some(value("--conf-path")))
+          index += 2
+        case "--override-path" =>
+          cli = cli.copy(overridePath = Some(value("--override-path")))
           index += 2
         case "--raw-flag" =>
           cli = cli.copy(rawFlag = Some(value("--raw-flag")))

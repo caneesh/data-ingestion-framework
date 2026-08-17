@@ -27,7 +27,7 @@ object IngestMain {
 
     val cli = CliParser.parse(args)
 
-    val baseConf: Config = loadBaseConfig(cli.confPath)
+    val baseConf: Config = loadBaseConfig(cli.confPath, cli.overridePath)
 
     val feedConf = baseConf.getConfig(s"feeds.${cli.entity}")
 
@@ -133,7 +133,10 @@ object IngestMain {
     * confusing "No configuration setting found for key 'feeds'" instead of
     * the actual problem, which is that the file was never shipped.
     */
-  private[app] def loadBaseConfig(confPath: Option[String]): Config = confPath match {
+  private[app] def loadBaseConfig(
+    confPath: Option[String],
+    overridePath: Option[String] = None
+  ): Config = confPath match {
     case Some(path) =>
       val file = new File(path).getAbsoluteFile
       if (!file.isFile)
@@ -144,7 +147,12 @@ object IngestMain {
       logger.info(s"[Config] --conf-path='$path' resolved='$file' " +
         s"includes resolve against '${file.getParent}'")
       withIncludeDiagnostics(file.getParentFile) {
-        ConfigFactory.parseFile(file, ConfigParseOptions.defaults().setAllowMissing(false)).resolve()
+        val base = ConfigFactory.parseFile(
+          file, ConfigParseOptions.defaults().setAllowMissing(false))
+        // Merge BEFORE resolve: substitutions in either file must see the
+        // combined view, and resolving the feed first would freeze values the
+        // override is meant to replace.
+        applyOverride(base, overridePath).resolve()
       }
     case None =>
       Option(System.getProperty("config.file")).map(_.trim).filter(_.nonEmpty).foreach { p =>
@@ -158,9 +166,87 @@ object IngestMain {
       logger.info(s"[Config] -Dconfig.file=${effective.map(_.toString).getOrElse("<unset>")} " +
         s"cwd='${workingDir.getAbsolutePath}'")
       withIncludeDiagnostics(effective.map(_.getParentFile).getOrElse(workingDir)) {
-        ConfigFactory.load().resolve()
+        applyOverride(ConfigFactory.load(), overridePath).resolve()
       }
   }
+
+  /**
+    * Applies the operational override layer, if one was supplied.
+    *
+    * WHY: a deployed feed config sits behind change control, but operational
+    * values — a lock lease, a reject threshold, a webhook, a table name —
+    * legitimately need to change faster than that process allows. An
+    * override file is deployed on its own and WINS over the feed for every
+    * path it declares.
+    *
+    * The risk is the mirror image of the benefit: a file that silently
+    * changes behaviour is exactly the drift this project has spent weeks
+    * chasing. So every overridden path is LOGGED BY NAME, and paths that
+    * reduce a safety guarantee are logged as warnings. Values are never
+    * logged — an override may carry a credential.
+    */
+  private[app] def applyOverride(base: Config, overridePath: Option[String]): Config =
+    overridePath.map(_.trim).filter(_.nonEmpty) match {
+      case None => base
+      case Some(path) =>
+        val file = new File(path).getAbsoluteFile
+        if (!file.isFile)
+          throw new IllegalArgumentException(
+            s"CFG_019: override file not found: '$path' (resolved to '$file'). " +
+              "It must be shipped like the feed config — --files /p/override.conf " +
+              "--override-path ./override.conf — or the flag omitted entirely.")
+
+        val overrideConf =
+          ConfigFactory.parseFile(file, ConfigParseOptions.defaults().setAllowMissing(false))
+
+        import scala.collection.JavaConverters._
+        val paths = overrideConf.entrySet().asScala.map(_.getKey).toSeq.sorted
+        if (paths.isEmpty)
+          logger.warn(s"[Override] '$file' declares no values; the feed config applies unchanged")
+        else {
+          logger.warn(s"[Override] ${paths.size} value(s) from '$file' TAKE PRECEDENCE over the " +
+            "feed config for this run:")
+          paths.foreach { p =>
+            // The config is deliberately UNRESOLVED here, and hasPath throws
+            // on an unresolved substitution. This label is a courtesy; it
+            // must never be the reason a run dies.
+            val label = scala.util.Try(base.hasPath(p))
+              .map(if (_) " (replaces the feed's value)" else " (new)")
+              .getOrElse("")
+            logger.warn(s"[Override]   $p$label")
+          }
+          // Named individually: silently weakening one of these through an
+          // unversioned file is the failure mode worth shouting about.
+          val safetyPaths = paths.filter(p => SafetyReducingOverrides.exists(p.contains))
+          if (safetyPaths.nonEmpty)
+            logger.warn(s"[Override] WARNING — these REDUCE a safety guarantee and are in effect " +
+              s"for this run: ${safetyPaths.mkString(", ")}")
+        }
+        // The ledger must be able to say a run was overridden: the
+        // structural fingerprint alone cannot see a changed VALUE.
+        com.hcsc.generic.ingest.runtime.OverrideContext.record(paths, overrideDigest(overrideConf))
+        overrideConf.withFallback(base)
+    }
+
+  /** Digest over the override's rendered content, so two different override
+    * files touching the same paths are distinguishable in the ledger. Only
+    * the digest is ever stored — the content may carry a credential. */
+  private def overrideDigest(conf: Config): String = {
+    import scala.collection.JavaConverters._
+    val rendered = conf.entrySet().asScala.toSeq
+      .map(e => e.getKey + "=" + e.getValue.render()).sorted.mkString("\n")
+    java.security.MessageDigest.getInstance("SHA-256")
+      .digest(rendered.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+      .take(8).map("%02x".format(_)).mkString
+  }
+
+  /** Override paths that trade a guarantee for convenience. Overriding them
+    * is permitted — that is the point of the layer — but never quietly. */
+  private val SafetyReducingOverrides = Seq(
+    "allow_insecure_tls", "allow_insecure_http", "trustServerCertificate",
+    "on_mismatch", "audit.enabled", "allow_unsafe_legacy_merge",
+    "max_reject_percent", "max_reject_count", "confirm_complete_extract",
+    "concurrency.lock", "metadata_columns", "force")
 
   private def workingDir: File = new File("").getAbsoluteFile
 

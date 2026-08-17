@@ -1,0 +1,46 @@
+# Operational override — SmartIQ_PDP
+#
+# Every value in this file WINS over feed-smartiq-pdp.conf. It exists so an
+# operational change can happen in the time an incident allows rather than in
+# the time a change order takes.
+#
+#   INGEST_OVERRIDE_FILE=/opt/ingest/conf/override-smartiq-pdp.conf
+#
+# in the env file is all that is needed; run_smartiq.sh ships it and lists the
+# paths it sets before submitting.
+#
+# RULES
+#   - Objects merge: setting concurrency.lease_minutes leaves the rest of the
+#     concurrency block exactly as the feed defines it.
+#   - Lists are replaced wholesale, never appended to.
+#   - A path named here but absent on disk FAILS the run (CFG_019). An
+#     override that silently did not apply is the outcome worth preventing.
+#   - Every path set here is logged by name, and the run ledger's
+#     config_fingerprint gains an "+ovr:" suffix. Values are never logged.
+#
+# DELETE THIS FILE once the underlying change is deployed through the normal
+# process. It is unversioned by design — the right tool for hours, the wrong
+# one for months.
+
+feeds.smartiq_pdp {
+
+  # ---- the common cases ----------------------------------------------------
+
+  # A long-running full load kept tripping the lease while it was still alive.
+  # concurrency.lease_minutes = 120
+
+  # A known upstream data problem is producing rejects above the feed's 1%,
+  # and the batch must still land while the source team fixes it.
+  # quality.max_reject_percent = 5.0
+
+  # Route alerts somewhere else for the duration of an on-call handover.
+  # notify.webhook.url = "https://hooks.example.com/services/XXXX"
+
+  # ---- the loud ones -------------------------------------------------------
+  # These REDUCE a guarantee. They are permitted — that is the point of the
+  # layer — and are additionally logged as an explicit WARNING so the run is
+  # never quietly weaker than the feed says it is. Pair each with a ticket.
+
+  # reconciliation.on_mismatch = "WARN"
+  # source.jdbc.allow_insecure_tls = true
+}

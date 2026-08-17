@@ -56,6 +56,10 @@ if [[ -z "$TARGET" ]]; then
 fi
 [[ -d "$TARGET" ]] || { echo "ERROR: destination is not a directory: $TARGET" >&2; exit 2; }
 
+# An operator's INGEST_OVERRIDE_FILE is deliberately NOT in this list. It is
+# authored on the server for a situation the repo does not know about, so a
+# sync must never overwrite it — and it must never be resurrected by a sync
+# after the operator deletes it.
 ARTIFACTS=(
   feed-smartiq-pdp-e2e.conf
   smartiq-pdp-e2e-schema.conf

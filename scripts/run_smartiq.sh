@@ -148,6 +148,24 @@ if [[ "$TARGET" == "prod" && -z "${INGEST_DRIVER_MEMORY:-}" ]]; then
   note "        INGEST_DRIVER_MEMORY=4g"
 fi
 
+# ---- operational override ---------------------------------------------------
+# Surfaced BEFORE submitting, because a file that silently changes behaviour is
+# exactly the drift this pipeline has spent weeks chasing. The wrapper ships it
+# and the driver logs every overridden path; this note is so the operator at
+# the terminal knows it is in play without reading the driver log.
+if [[ -n "${INGEST_OVERRIDE_FILE:-}" ]]; then
+  [[ -f "$INGEST_OVERRIDE_FILE" ]] || die "INGEST_OVERRIDE_FILE does not exist: $INGEST_OVERRIDE_FILE
+  Remove it from $ENV_FILE, or point it at a real file. It is not skipped
+  silently: the values it carries are the whole reason it was set."
+  note "OVERRIDE ACTIVE  $INGEST_OVERRIDE_FILE"
+  note "      Its values take precedence over the feed config. Paths set:"
+  # KEY NAMES ONLY — an override may legitimately carry a credential, so
+  # everything after the first '=' or ':' is cut before anything is printed.
+  grep -vE '^\s*(#|//|$)' "$INGEST_OVERRIDE_FILE" \
+    | sed -e 's/[=:].*//' -e 's/^/        /' >&2
+  note "      Remove it once the underlying change is deployed."
+fi
+
 # ---- raw flag ---------------------------------------------------------------
 # Stamped on every RAW row as file_type, so a full load and an incremental are
 # distinguishable in the data itself rather than only by joining the ledger.

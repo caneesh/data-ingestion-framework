@@ -77,9 +77,22 @@ submit_ingest() {
   local CONF_NAME; CONF_NAME="$(basename "$CONF_FILE")"
 
   # Fail here, with the cause named, rather than minutes later inside YARN.
+  # The override file, when present, must be SHIPPED like the feed config.
   local FILES
   FILES="$(_ingest_clean_list "--files (feed config + INGEST_EXTRA_FILES)" \
-            "$CONF_FILE,${INGEST_EXTRA_FILES:-}")" || return 2
+            "$CONF_FILE,${INGEST_EXTRA_FILES:-},${INGEST_OVERRIDE_FILE:-}")" || return 2
+
+  # Operational override layer: values here win over the deployed feed, so a
+  # lease or a threshold can change without reissuing the feed through change
+  # control. Referenced by BASENAME because --files lands it in the container
+  # working directory, exactly like the feed config.
+  local OVERRIDE_ARGS=()
+  if [[ -n "${INGEST_OVERRIDE_FILE:-}" ]]; then
+    OVERRIDE_ARGS=(--override-path "./$(basename "$INGEST_OVERRIDE_FILE")")
+    echo "INFO: override file in effect: $INGEST_OVERRIDE_FILE" >&2
+    echo "      Its values TAKE PRECEDENCE over the feed config; the driver log" >&2
+    echo "      lists every overridden path under [Override]." >&2
+  fi
 
   if [[ ! -f "$JAR_FILE" ]]; then
     echo "ERROR: application jar not found: '$JAR_FILE'" >&2
@@ -186,5 +199,6 @@ submit_ingest() {
     "$JAR_FILE" \
     --entity "$ENTITY" \
     --conf-path "$CONF_ARG" \
+    ${OVERRIDE_ARGS[@]+"${OVERRIDE_ARGS[@]}"} \
     "$@"
 }

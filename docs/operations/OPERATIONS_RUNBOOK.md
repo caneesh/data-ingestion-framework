@@ -217,6 +217,48 @@ Do not shorten it so far that a normal metastore stall misses a renewal:
 the heartbeat abandons ownership on the FIRST failure and the run aborts.
 10–30 minutes is a reasonable band.
 
+### Changing a setting mid-incident (`INGEST_OVERRIDE_FILE`)
+
+A feed config sits behind change control; an incident does not wait for one.
+Point `INGEST_OVERRIDE_FILE` at a small HOCON file and its values win over
+the feed for every path it declares:
+
+```hocon
+# /opt/ingest/conf/override-smartiq-pdp.conf
+feeds.smartiq_pdp.concurrency.lease_minutes = 120
+```
+
+```bash
+# in the env file, or exported for a single run
+INGEST_OVERRIDE_FILE=/opt/ingest/conf/override-smartiq-pdp.conf
+```
+
+Objects merge, so the line above leaves the rest of `concurrency` alone.
+Lists are replaced wholesale. A path named but missing on disk **fails the
+run (CFG_019)** — an override that silently did not apply would be the worst
+outcome, since the run would look normal while behaving under the settings
+you meant to change.
+
+It is deliberately loud. `run_smartiq.sh` lists the overridden paths before
+submitting, the driver logs each one under `[Override]` (safety-reducing
+paths — `on_mismatch`, `max_reject_percent`, `allow_insecure_tls`,
+`audit.enabled`, `concurrency.lock` — get an extra WARNING), and the ledger's
+`config_fingerprint` gains an `+ovr:<digest>` suffix so an overridden run is
+identifiable afterwards:
+
+```sql
+SELECT run_id, stage, status, config_fingerprint
+FROM   membership_common_raw.ingest_run_audit
+WHERE  entity = 'smartiq_pdp' AND config_fingerprint LIKE '%+ovr:%'
+ORDER  BY event_ts DESC;
+```
+
+Values are never logged or stored — only path names and a digest — because
+an override may carry a credential. Template:
+`docs/examples/smartiq_pdp/override-smartiq-pdp.conf.example`.
+
+**Delete it once the real change is deployed.** It is unversioned by design.
+
 ### Avoid creating stale locks
 
 Losing the terminal kills the driver before it can release. Detach anything

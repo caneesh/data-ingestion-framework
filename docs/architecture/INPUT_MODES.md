@@ -84,3 +84,12 @@ Reported honestly:
    run) until table-level locking is added.
 4. **Kafka Avro payloads** are not yet decoded (needs spark-avro; explicit
    `UnsupportedOperationException`).
+5. **File row-removal by position does not survive an input split.**
+   `skip_first_n` and `trailer.by_last_row` order rows with
+   `monotonically_increasing_id()`, which tracks physical line order only
+   while a file is read as a single input split (~one HDFS block). Above
+   that the ordering is arbitrary and the WRONG rows are dropped — silently,
+   since the row count is still correct. Both also funnel every row of a
+   file through one partition. `trailer.marker` is a content filter with no
+   ordering dependency and is the safe form at any size; the order-dependent
+   options warn on every run.

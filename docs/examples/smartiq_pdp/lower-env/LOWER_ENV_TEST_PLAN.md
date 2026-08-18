@@ -82,11 +82,13 @@ SHOW TABLES IN membership_common_raw LIKE 'ingest_*';
 ```
 
 Expected: `ingest_run_audit`, `ingest_file_audit`, `ingest_reconciliation`,
-`ingest_header_audit`, `ingest_rejects`, `ingest_file_registry`,
-`ingest_watermarks`, `ingest_run_locks`. **If any already exist from
+`ingest_header_audit`, `ingest_rejects`, `ingest_watermarks`,
+`ingest_run_locks`. (No `ingest_file_registry` — that is the file-intake
+duplicate registry, and this is a JDBC feed.) **If any already exist from
 another pipeline, rename yours in the feed config before running** —
 otherwise this feed appends to their table. Only the `audit.*`,
-`rejects.*`, `watermark_store.*` and `concurrency.*` keys decide the names.
+`rejects.*`, `watermark_store.*`, `concurrency.*` and — for file feeds —
+`idempotency.*` keys decide the names.
 
 No database-creation privilege is needed: the framework issues
 `CREATE DATABASE` only when the database is genuinely absent.

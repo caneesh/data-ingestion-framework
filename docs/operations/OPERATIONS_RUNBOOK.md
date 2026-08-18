@@ -567,6 +567,14 @@ forensic record for restart safety and reconciliation. Apply a retention policy
 only with explicit approval and after confirming no in-flight run depends on
 recent rows (watermarks and file registry especially).
 
+Note that `--stage retention` covers the audit tables, rejects, raw
+partitions and watermarks but **not** `ingest_file_registry` — deliberately,
+since trimming it re-enables re-ingestion of any file whose checksum is
+dropped. The registry therefore grows for the life of the feed, and file
+intake reads every checksum for the entity into driver memory on each run.
+That is fine at daily cadence for years; if a feed ever makes it large,
+raise driver memory rather than truncating the table.
+
 ## 7. Entity run locks (PIPE_001)
 
 Every run (coupled, curated replay, retention) takes an entity-level lease

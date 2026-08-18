@@ -83,6 +83,12 @@ final class FileIntakeService(
   private val idempotencyEnabled =
     idempotencyConf.exists(c => ConfigUtils.optBoolean(c, "enabled").getOrElse(true))
 
+  /** Duplicate protection was turned off ON PURPOSE (`enabled = false`) as
+    * opposed to lost to a misplaced config block. The two look identical to
+    * every other code path and must not read the same in the log. */
+  private val idempotencyDeclinedExplicitly =
+    idempotencyConf.exists(c => ConfigUtils.optBoolean(c, "enabled").contains(false))
+
   private val duplicatePolicy = idempotencyConf
     .flatMap(c => ConfigUtils.optString(c, "duplicate_policy"))
     .getOrElse(DuplicatePolicy.Skip)
@@ -98,8 +104,39 @@ final class FileIntakeService(
 
   def managed: Boolean = layout.isDefined
 
+  /**
+    * Announces the duplicate-protection posture once per run.
+    *
+    * WHY THIS IS LOUD: `idempotency` is read from its OWN block. A feed that
+    * declares `registry_table` anywhere else — `rejects { }` is the natural
+    * guess, and an earlier revision of DEPLOYMENT.md said exactly that —
+    * leaves this service with no idempotency config at all, which silently
+    * disables checksum duplicate detection entirely. Every re-delivered file
+    * is then re-ingested with no error and no warning, and the duplicate
+    * rows surface days later in curated. A managed folder feed almost never
+    * wants that, so running without it has to be a visible decision.
+    */
+  private def logIdempotencyPosture(): Unit =
+    if (managed) {
+      if (idempotencyEnabled)
+        logger.info(s"[FileIntake] Duplicate protection ON: registry=$registryTable " +
+          s"policy=$duplicatePolicy")
+      else if (idempotencyDeclinedExplicitly)
+        logger.info("[FileIntake] Duplicate protection OFF by configuration " +
+          "(idempotency.enabled = false): re-delivered files WILL be re-ingested")
+      else
+        logger.warn("[FileIntake] Duplicate protection is OFF for this managed folder feed: " +
+          "no idempotency { database = ..., registry_table = ... } block was found, so file " +
+          "checksums are neither computed nor consulted and a RE-DELIVERED FILE WILL BE " +
+          "RE-INGESTED. Note the block name: registry_table declared under rejects { } (or " +
+          "anywhere else) is ignored — it is read from idempotency { } only. If this feed " +
+          "genuinely needs no duplicate protection, declare " +
+          "idempotency { enabled = false } to record that decision and silence this warning.")
+    }
+
   /** Stages landing files for processing. None = feed uses a static path. */
   def stage(ctx: RunContext): Option[Seq[StagedFile]] = layout.map { l =>
+    logIdempotencyPosture()
     val fs = FsUtils.fileSystem(l.landing, hadoopConf)
     val candidates = listCandidates(fs, l)
     logger.info(s"[FileIntake] Found ${candidates.size} candidate file(s) in landing/inprogress")

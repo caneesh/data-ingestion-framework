@@ -125,12 +125,21 @@ EXISTS`; nothing needs pre-creating.
 | reconciliation | `audit.database` + `reconciliation_table` | `ingest_reconciliation` |
 | header audit | `audit.database` + `header_table` | `ingest_header_audit` |
 | rejects | `rejects.database` + `table` | `ingest_rejects` |
-| file registry | `rejects.database` + `registry_table` | `ingest_file_registry` |
+| file registry | `idempotency.database` + `idempotency.registry_table` | `ingest_file_registry` |
 | watermarks | `source.incremental.watermark_store.database` + `table` | `ingest_watermarks` |
 | run locks | `concurrency.database` (else `audit.database`) + `table` | `ingest_run_locks` |
 
 `watermark_store.database` is **required** for the hive store — it does not
 inherit `audit.database`, and its absence raises `JDBC_003`.
+
+The file registry is the one control table read from a block of its own.
+`registry_table` declared under `rejects { }` is **ignored** — and because a
+missing `idempotency { }` block simply means "no duplicate protection",
+misplacing it silently disables checksum duplicate detection and every
+re-delivered file is re-ingested. A managed folder feed logs
+`[FileIntake] Duplicate protection is OFF ...` at WARN when this happens;
+treat that line as a configuration error unless the feed declares
+`idempotency { enabled = false }` deliberately.
 
 ### Sites that cannot create databases
 

@@ -282,9 +282,32 @@ object IngestMain {
     val audit = com.hcsc.generic.ingest.audit.AuditService(spark, feedConf)
     val lock = com.hcsc.generic.ingest.lock.RunLock.fromConfig(spark, feedConf, logger)
     val held = if (cli.dryRun) None else lock.map { l => l.acquire(ctx.entity, ctx.runId); l }
+    // A purge can outlast lease_minutes — the SmartIQ feed runs a 30-minute
+    // lease, and a sweep over raw partitions plus four audit tables is not
+    // reliably shorter than that. Without renewal the lease lapses mid-purge,
+    // another run legitimately claims the entity and appends rows, and the
+    // staged INSERT OVERWRITE silently discards them. The pipeline has always
+    // heartbeated for exactly this reason; retention was the one lock holder
+    // that did not.
+    val heartbeat = held.map { l =>
+      val hb = new com.hcsc.generic.ingest.lock.LockHeartbeat(
+        l, ctx.entity, ctx.runId, math.max(l.leaseMillis / 3, 1000L), logger)
+      hb.start()
+      hb
+    }
+    // Renewal failure is the case the heartbeat cannot fix: ownership may
+    // already have passed to another run, so the purge must ABORT rather than
+    // overwrite. This is a deliberate new failure mode — a retention job that
+    // previously "succeeded" while eating another run's rows now fails loudly.
+    val ownershipGuard: () => Unit = () =>
+      if (heartbeat.exists(_.ownershipLost))
+        throw new com.hcsc.generic.ingest.lock.PipelineLockException(
+          "PIPE_001 lease ownership lost mid-retention; aborting BEFORE the purge overwrite. " +
+            "Rows appended by whichever run now holds the entity would have been discarded. " +
+            "Nothing was purged by this attempt; re-run retention once the entity is idle.")
     try {
-      val results = new com.hcsc.generic.ingest.retention.RetentionService(spark, feedConf, logger)
-        .run(dryRun = cli.dryRun)
+      val results = new com.hcsc.generic.ingest.retention.RetentionService(
+        spark, feedConf, logger, ownershipGuard).run(dryRun = cli.dryRun)
       // delete_count makes the purge volume queryable and trendable; the
       // per-table breakdown stays in the message, which cannot be aggregated.
       val purged = results.map { case (_, _, n) => n }.sum
@@ -305,6 +328,7 @@ object IngestMain {
         }
         throw e
     } finally {
+      heartbeat.foreach(hb => try hb.stop() catch { case _: Exception => () })
       held.foreach(l =>
         try l.release(ctx.entity, ctx.runId)
         catch { case e: Exception => logger.warn(s"[Retention] Lock release failed: ${e.getMessage}") })

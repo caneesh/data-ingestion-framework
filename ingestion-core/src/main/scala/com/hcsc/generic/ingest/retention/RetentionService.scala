@@ -28,7 +28,26 @@ import com.hcsc.generic.ingest.schema.ColumnMapping.quotedCol
   * outcome as a run-audit row AFTER purging (so the record of the purge
   * itself survives it). This class performs only the purges.
   */
-final class RetentionService(spark: SparkSession, feedConf: Config, logger: Logger) {
+final class RetentionService(
+  spark: SparkSession,
+  feedConf: Config,
+  logger: Logger,
+  /**
+    * Called immediately before every DESTRUCTIVE step, and expected to throw
+    * if this run no longer owns the entity lease.
+    *
+    * WHY: every purge below is read-then-overwrite. A run that lost its lease
+    * mid-purge has already computed its survivor set; another run may then
+    * legitimately claim the entity and APPEND ledger, reject or watermark
+    * rows — which the pending INSERT OVERWRITE would silently discard. The
+    * damage is invisible: no error, and the missing rows are the audit trail
+    * that would have recorded them.
+    *
+    * Defaults to a no-op so embedded and test callers behave exactly as
+    * before; the CLI supplies a real heartbeat-backed guard.
+    */
+  ownershipGuard: () => Unit = () => ()
+) {
 
   private val retention = ConfigUtils.optConfig(feedConf, "retention")
 
@@ -164,8 +183,11 @@ final class RetentionService(spark: SparkSession, feedConf: Config, logger: Logg
             case _ => None
           }
         }
-        if (!dryRun) expired.foreach { case (k, v) =>
-          spark.sql(s"ALTER TABLE $table DROP IF EXISTS PARTITION ($k='${v.replace("'", "''")}')")
+        if (!dryRun && expired.nonEmpty) {
+          ownershipGuard()
+          expired.foreach { case (k, v) =>
+            spark.sql(s"ALTER TABLE $table DROP IF EXISTS PARTITION ($k='${v.replace("'", "''")}')")
+          }
         }
         Seq((table, s"partitions older than $cutoff dropped", expired.size.toLong))
       }
@@ -204,8 +226,15 @@ final class RetentionService(spark: SparkSession, feedConf: Config, logger: Logg
     * one table in a single statement). */
   private def rewriteKeeping(table: String, survivors: org.apache.spark.sql.DataFrame): Unit = {
     val staging = s"${table}_retention_stg"
+    ownershipGuard()
     survivors.write.mode(SaveMode.Overwrite).format("orc").saveAsTable(staging)
-    try spark.sql(s"INSERT OVERWRITE TABLE $table SELECT * FROM $staging")
-    finally spark.sql(s"DROP TABLE IF EXISTS $staging")
+    try {
+      // Checked AGAIN here, not only above: materializing the survivors of a
+      // large table takes real time, and this is the instant the overwrite
+      // becomes irreversible. Anything appended after the staging read would
+      // be erased by the statement on the next line.
+      ownershipGuard()
+      spark.sql(s"INSERT OVERWRITE TABLE $table SELECT * FROM $staging")
+    } finally spark.sql(s"DROP TABLE IF EXISTS $staging")
   }
 }

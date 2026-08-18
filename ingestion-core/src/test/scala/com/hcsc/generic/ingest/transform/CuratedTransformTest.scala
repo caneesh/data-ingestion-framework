@@ -157,45 +157,65 @@ class CuratedTransformTest extends AnyFunSuite with SharedSparkSession {
     assert(result.columns.toSeq == Seq("name"))
   }
 
+  test("normalizeKeys FAILS on a column that is not present (CUR_010)") {
+    // The defect this replaces: a typo here left business keys
+    // un-normalized, so the merge join matched nothing and every row
+    // inserted as new — duplicate keys in a current-state table, silently.
+    import spark.implicits._
+    val df = Seq("Alice").toDF("name")
+    val conf = ConfigFactory.parseString(
+      """merge.normalize { custmer_id = "upper(custmer_id)" }""")
+    val thrown = intercept[IllegalStateException](transform.normalizeKeys(df, conf))
+    assert(thrown.getMessage.contains("CUR_010"))
+    assert(thrown.getMessage.contains("custmer_id"), "the offending entry must be named")
+    assert(thrown.getMessage.contains("name"),
+      "listing the available columns is what turns this into a one-look fix")
+  }
+
   // ---------------------------------------------------------------------------
-  // filterNullKeys
+  // splitNullKeys — the kept side
+  //
+  // These previously ran through filterNullKeys, a wrapper returning
+  // splitNullKeys(...)._1 that no production code ever called. The wrapper is
+  // gone; the null/blank-key behaviour it asserted is real, so the tests were
+  // pointed at the live method rather than deleted with it.
   // ---------------------------------------------------------------------------
 
-  test("filterNullKeys drops rows with null key values when drop=true") {
+  test("splitNullKeys keeps the valid side: drops rows with null key values when drop=true") {
     import spark.implicits._
     val df = Seq(Some("Alice"), None).toDF("name")
-    val result = transform.filterNullKeys(df, Seq("name"), drop = true, blanks = false)
+    val result = transform.splitNullKeys(df, Seq("name"), drop = true, blanks = false)._1
     assert(result.count() == 1)
     assert(result.select("name").as[String].collect().head == "Alice")
   }
 
-  test("filterNullKeys drops rows with blank key values when drop=true and blanks=true") {
+  test("splitNullKeys keeps the valid side: drops rows with blank key values when drop=true and blanks=true") {
     import spark.implicits._
     val df = Seq("Alice", "  ", "Bob", "").toDF("name")
-    val result = transform.filterNullKeys(df, Seq("name"), drop = true, blanks = true)
+    val result = transform.splitNullKeys(df, Seq("name"), drop = true, blanks = true)._1
     val names = result.select("name").as[String].collect().toSet
     assert(names == Set("Alice", "Bob"))
   }
 
-  test("filterNullKeys keeps blank rows when blanks=false") {
+  test("splitNullKeys keeps the valid side: keeps blank rows when blanks=false") {
     import spark.implicits._
     val df = Seq("Alice", "  ", "Bob").toDF("name")
-    val result = transform.filterNullKeys(df, Seq("name"), drop = true, blanks = false)
+    val result = transform.splitNullKeys(df, Seq("name"), drop = true, blanks = false)._1
     // Only true nulls should be dropped; blank strings are kept
     assert(result.count() == 3)
   }
 
-  test("filterNullKeys is no-op when drop=false") {
+  test("splitNullKeys keeps the valid side: is no-op when drop=false") {
     import spark.implicits._
     val df = Seq(Some("Alice"), None).toDF("name")
-    val result = transform.filterNullKeys(df, Seq("name"), drop = false, blanks = false)
+    val result = transform.splitNullKeys(df, Seq("name"), drop = false, blanks = false)._1
     assert(result.count() == 2)
   }
 
-  test("filterNullKeys is no-op when keys list is empty") {
+  test("splitNullKeys keeps the valid side: is no-op when keys list is empty") {
     import spark.implicits._
     val df = Seq(Some("Alice"), None).toDF("name")
-    val result = transform.filterNullKeys(df, Seq.empty, drop = true, blanks = false)
+    val result = transform.splitNullKeys(df, Seq.empty, drop = true, blanks = false)._1
     assert(result.count() == 2)
   }
 

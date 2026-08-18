@@ -73,18 +73,34 @@ final class CuratedTransform(spark: SparkSession) {
     else withModified.withColumn("last_modified_op", lit("I"))
   }
 
+  /**
+    * Applies `curated.merge.normalize` — the per-column expressions that put
+    * business keys into a comparable form before the merge.
+    *
+    * A configured column that is not present is a HARD FAILURE (CUR_010).
+    * Skipping it silently was the worst possible outcome: normalization is
+    * what makes a key match its counterpart in the target, so a typo left
+    * keys un-normalized, the merge join found nothing to match, and every
+    * row inserted as new instead of updating — duplicate business keys
+    * accumulating in a current-state table with no error anywhere. This now
+    * fails like every other missing merge input (CUR_006 partition keys,
+    * CUR_008 freshness columns, the merge.keys check in CuratedService).
+    */
   def normalizeKeys(df: DataFrame, conf: Config): DataFrame = {
     ConfigUtils.stringMap(conf, "merge.normalize").foldLeft(df) {
       case (acc, (name, sql)) =>
         ColumnMapping.findColumn(acc, name) match {
           case Some(actual) => acc.withColumn(actual, expr(sql))
-          case None => acc
+          case None =>
+            throw new IllegalStateException(
+              s"CUR_010 curated.merge.normalize targets column '$name', which is not present " +
+                s"in the incoming data (available: ${acc.columns.sorted.mkString(", ")}). " +
+                "Normalization decides whether a business key matches its target row, so " +
+                "skipping it would silently insert duplicates instead of merging. Fix the " +
+                "column name or remove the entry.")
         }
     }
   }
-
-  def filterNullKeys(df: DataFrame, keys: Seq[String], drop: Boolean, blanks: Boolean): DataFrame =
-    splitNullKeys(df, keys, drop, blanks)._1
 
   /**
     * Splits rows into (valid, dropped) on null/blank business keys so the

@@ -567,6 +567,15 @@ forensic record for restart safety and reconciliation. Apply a retention policy
 only with explicit approval and after confirming no in-flight run depends on
 recent rows (watermarks and file registry especially).
 
+`--stage retention` now holds its entity lease with the same heartbeat the
+pipeline uses, and **aborts with PIPE_001 if a lease renewal has failed**
+rather than completing the purge. That is deliberate: every purge is a
+read-then-overwrite, so a run that lost the entity would discard whatever
+the new holder appended in the meantime — silently, since the discarded
+rows are the audit trail. An aborted attempt purges nothing; re-run it once
+the entity is idle. A retention job that starts failing this way is
+reporting a real lock problem, not a regression.
+
 Note that `--stage retention` covers the audit tables, rejects, raw
 partitions and watermarks but **not** `ingest_file_registry` — deliberately,
 since trimming it re-enables re-ingestion of any file whose checksum is

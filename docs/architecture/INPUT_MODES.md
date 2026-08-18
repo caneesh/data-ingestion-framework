@@ -48,10 +48,18 @@ one, from any source.
 - Tombstones / CDC deletes: `deletes { mode = SOFT, indicator_column =
   "kafka_tombstone" }`, or a payload op column for CDC streams
   (insert/update flow through the merge; delete via the indicator).
-- Streaming: `KafkaStreamingRunner.start(spark, feedConf, entity, logger)`
-  wires `readStream → decode → foreachBatch → CuratedMicroBatch`. Empty
-  micro-batches no-op; FULL_OVERWRITE is refused for micro-batches;
-  replaying a batch id is idempotent.
+- Streaming: **not wired to the CLI — do not plan against it.**
+  `KafkaStreamingRunner.start(spark, feedConf, entity, logger)` exists and
+  wires `readStream → decode → foreachBatch → CuratedMicroBatch`, but
+  nothing calls it: there is no `--stage streaming`, no scheduler entry
+  point, and no test. It has therefore never executed. Treat it as a design
+  sketch for the micro-batch path, not a capability. Kafka is supported
+  **in batch mode** (`--stage all` with `offsets.track = true`), which is
+  tested and is what the offset ledger above describes.
+
+  Wiring it up is a project rather than a fix: it needs a CLI stage, a
+  long-running driver contract, checkpoint lifecycle ownership and first
+  execution of code that has never run.
 
 ## Exactly-once statement (non-transactional Hive targets)
 

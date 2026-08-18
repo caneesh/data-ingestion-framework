@@ -29,7 +29,7 @@ data-ingestion-framework/
 ├── ingestion-file/      # File-based source connector (CSV, JSON, Parquet, etc.)
 ├── ingestion-jdbc/      # JDBC source connector (SQL Server, DB2, Oracle, etc.)
 ├── ingestion-config-gen/  # Interactive feed configuration generator (CLI wizard)
-├── ingestion-kafka/     # Kafka streaming source connector
+├── ingestion-kafka/     # Kafka batch source connector (offset-tracked)
 └── ingestion-app/       # Main application entry point
 ```
 

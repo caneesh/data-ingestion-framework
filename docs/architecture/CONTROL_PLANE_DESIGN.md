@@ -426,6 +426,10 @@ that is exactly the reproducibility the store exists to provide.
 
 ## Related
 
+- [CONTROL_PLANE_IMPLEMENTATION_PLAN.md](../reports/CONTROL_PLANE_IMPLEMENTATION_PLAN.md)
+  — the phased implementation of this design: contracts C1–C5, store DDL,
+  test strategy, risks
+
 - [ARCHITECTURE.md](ARCHITECTURE.md) — module map and extension points
 - [CONFIGURATION_MODEL.md](CONFIGURATION_MODEL.md) — the config surface this
   renders to, and the `CFG_*` matrix validation enforces

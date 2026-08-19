@@ -1,7 +1,8 @@
 # Embedding the Framework in an Application (Control Plane)
 
-**Status:** design, not implemented. No code in this repository depends on
-it. Where this document and the code disagree, the code wins.
+**Status:** design. §6's feed service API is now PROTOTYPED and tested
+(`confgen.service.FeedService`); everything else — store, submit, UI — is
+not built. Where this document and the code disagree, the code wins.
 
 The framework today is a batch job configured by HOCON files on disk. This
 describes how an application can own feed definitions, configuration and
@@ -115,9 +116,10 @@ Five responsibilities, in order:
    `config_fingerprint` is only useful if the definition behind it is
    immutable and addressable.
 2. **Render** a version to HOCON. See §5 for why HOCON stays.
-3. **Validate** server-side on save, via the two existing validators. This
-   is the single largest win available: it moves `CFG_*` failures from 3am
-   to the moment someone clicks Save.
+3. **Validate** server-side on save, via `DryRunValidator` (which already
+   subsumes the CFG_* matrix — see §6). This is the single largest win
+   available: it moves `CFG_*` failures from 3am to the moment someone
+   clicks Save.
 4. **Submit**: write the rendered config to a staging directory,
    `spark-submit`, capture the exit code — `10` transient (retry is
    worthwhile), `20` data integrity (never retry), `30` configuration,
@@ -204,11 +206,36 @@ Not the UI. Extract a small, tested **feed service API** from
 file:
 
 ```scala
-render(definition: FeedDefinition): Config      // stored record -> config
-validate(feed: Config): ValidationReport         // both validators, merged
-fingerprint(feed: Config): String                // change detection
-write(feed: Config, target: Path): Path          // rendered artifact to ship
+render(definition: FeedDefinition): Config        // stored record -> config
+validate(feed: Config): ValidationReport          // DryRunValidator (see below)
+fingerprint(feed: Config): String                 // ledger's recipe
+write(entity: String, feed: Config, dir: Path)    // artifacts to ship
 ```
+
+**Built:** `com.hcsc.generic.ingest.confgen.service.FeedService`, with
+`FeedDefinition(entity, sourceType, settings)` as the storable record —
+the same ordered answer set drafts already round-trip, so the model gains a
+store without gaining a second definition of what a feed is.
+
+Two things the prototype settled that this document originally got wrong or
+left implicit:
+
+- **Validation is one call, not two.** `DryRunValidator` already invokes
+  `FeedCompatibilityValidator` internally for the CFG_* matrix. Calling both
+  — the obvious reading of "merged" — reports every CFG_* twice. There is a
+  test pinning this, because the mistake is invisible on any feed that
+  happens to have zero CFG errors.
+- **`write` must refuse to ship what it did not validate.** Rendering and
+  parsing are separate code paths, so the written file is re-parsed and
+  compared to the validated configuration; a mismatch raises CFG_020 rather
+  than producing a deployable artifact. A control plane that validates X and
+  ships Y is worse than one that does not validate, because its report says
+  the feed is safe.
+
+The tested guarantee is **fidelity**: a feed rendered headlessly from a
+stored definition is byte-identical to what the interactive generator
+produces from the same answers. Without that the wizard's test suite stops
+being evidence about the service.
 
 Everything else — store, UI, approval workflow, scheduler integration —
 sits on top of that and can change without touching the framework. It is
@@ -241,9 +268,12 @@ provider and key; the store holds references, never values.
 `DryRunValidator`'s placeholder substitution already assumes this. A feed
 store that accumulates credentials is a breach waiting for an audit.
 
-**Open:** how feed *versions* map to `config_fingerprint` (the fingerprint
+**Open:** how feed *versions* map to `config_fingerprint`. The fingerprint
 hashes key structure, so two versions differing only in a value collide —
-the override marker exists for this reason and the same gap applies here);
+now demonstrated by a test in `FeedServiceTest` rather than asserted here,
+so the limitation is discovered in CI rather than by an auditor. A store
+must carry its own version identifier and must never use the fingerprint as
+its change detector;
 whether approval workflow belongs in the app or the existing change
 process; whether schema contracts are authored in the app or continue to
 be included files.

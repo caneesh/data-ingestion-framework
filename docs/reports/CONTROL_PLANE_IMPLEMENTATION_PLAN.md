@@ -117,7 +117,8 @@ CREATE TABLE feed_version (
   version_id          BIGSERIAL PRIMARY KEY,
   feed_id             BIGINT NOT NULL REFERENCES feed,
   version_no          INT    NOT NULL,
-  settings            TEXT   NOT NULL,  -- drafts encoding: {id, scalar|items|blocks}
+  settings            TEXT,             -- drafts encoding; NULL for IMPORTED versions
+                                        -- (hand-authored feeds are not re-renderable, by design)
   rendered_hocon      TEXT   NOT NULL,
   rendered_schema     TEXT,
   rendered_sha256     TEXT   NOT NULL,  -- THE change detector
@@ -162,6 +163,14 @@ CREATE TABLE feed_promotion (
 );
 ```
 
+`settings` is nullable because an **imported** version — a hand-authored
+feed adopted from an existing deployment — has no wizard-shaped definition
+behind it. `validate`, `fingerprint` and `write` all operate on a parsed
+`Config`, so only `render` is unavailable for such a version, and that is
+the honest state: re-rendering a production feed from reconstructed answers
+could produce something subtly different. `rendered_hocon` is always
+present and is what ships.
+
 `ON DELETE RESTRICT` on submissions is the reproducibility guarantee in
 schema form: a referenced version cannot be purged. Save-time rule (not a
 column): reject any version whose `rendered_hocon` contains an inline
@@ -172,7 +181,7 @@ secret value rather than a `{provider, key}` reference.
 | Phase | Delivers | Exit criterion | Size |
 |---|---|---|---|
 | **P0** (done) | `FeedService` + 10 tests | in `main` | — |
-| **P1** | `feed-lint`: a headless CLI over `FeedService.validate` for CI — validates every stored definition / example feed on each commit | wired into `.github/workflows/build.yml`; a deliberately broken feed fails the build | S |
+| **P1** (part done) | `ShippedFeedValidationTest` already validates both SmartIQ feeds on every build — **and immediately found that `DryRunValidator` required `raw.path`, which `HiveSink` documents as optional and no shipped feed declares**, so every feed here would have failed the lint on day one. Remaining: a `feed-lint` CLI pointing at an arbitrary directory (server feeds live outside this repo) | a deliberately broken feed in an external directory fails the build | S |
 | **P2** | Store + service layer: C5 DDL, DAO, version immutability, save-time validation caching, inline-secret rejection | a definition survives store → load → render byte-identically (fidelity test against P0) | M |
 | **P3** | Submission runner on an edge node: C2 + C3, submission-row-first ordering, ledger-confirmed outcomes | an e2e feed runs end-to-end from the store with `run_id` visible in both `feed_submission` and the ledger | M |
 | **P4** | Observation + reconciliation: C4 Hive-JDBC reads, bypass report, override report, unapproved-version report | the reports run against the real ledger and a seeded violation is caught | S–M |
@@ -219,7 +228,20 @@ Deliberately deferred, each a separate decision:
 | Store availability | store down ⇒ no *new* submissions | acceptable by design — running jobs and scheduled Control-M jobs are unaffected; the framework never calls the app (design §5) |
 | Host stack constraint | JVM / Scala 2.12 binary compat | HTTP wrapper if and when a non-JVM host appears |
 
-## 8. Out of scope
+## 8. Pilot
+
+[SmartIQ control-plane onboarding](../examples/smartiq_pdp/CONTROL_PLANE_ONBOARDING.md)
+walks P1–P5 against the SmartIQ feeds step by step, with the verification
+query for each. It is the pilot because SmartIQ is the only feed with
+production history AND is hand-authored, so it exercises the import path
+(validate / fingerprint / write on a parsed `Config`; `settings = NULL`
+because an imported version is deliberately not re-renderable).
+
+Writing it found the `raw.path` defect recorded in P1 — worth noting that
+applying the plan to a real feed surfaced in minutes what the generic plan
+had not.
+
+## 9. Out of scope
 
 Everything in design §8 (no second run store, no second config format, no
 runtime config service, no scheduler, no duplicated validation, no

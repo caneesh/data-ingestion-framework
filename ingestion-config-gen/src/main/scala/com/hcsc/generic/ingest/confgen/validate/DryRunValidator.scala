@@ -49,8 +49,14 @@ object DryRunValidator {
   private def commonErrors(feed: Config): Seq[String] = {
     def missing(path: String) =
       if (feed.hasPath(path)) None else Some(s"$path is required")
+    // raw.path is deliberately NOT required: HiveSink treats an absent path
+    // as a MANAGED table in the warehouse, which is what every shipped feed
+    // (both reference templates and both SmartIQ feeds) actually uses. The
+    // rule was written against wizard output, which always supplies a path,
+    // so it rejected valid hand-authored production feeds — the exact
+    // failure that makes validation untrustworthy in the other direction.
     Seq(missing("entity"), missing("source.type"), missing("raw.database"),
-      missing("raw.table"), missing("raw.path")).flatten ++
+      missing("raw.table")).flatten ++
       // Same cross-section rules the pipeline enforces at startup
       // (CFG_001..CFG_009): a generated feed must never fail there.
       com.hcsc.generic.ingest.config.FeedCompatibilityValidator.validate(feed)

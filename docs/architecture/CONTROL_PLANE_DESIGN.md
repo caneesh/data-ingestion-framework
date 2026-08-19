@@ -268,12 +268,14 @@ provider and key; the store holds references, never values.
 `DryRunValidator`'s placeholder substitution already assumes this. A feed
 store that accumulates credentials is a breach waiting for an audit.
 
-**Open:** how feed *versions* map to `config_fingerprint`. The fingerprint
-hashes key structure, so two versions differing only in a value collide —
-now demonstrated by a test in `FeedServiceTest` rather than asserted here,
-so the limitation is discovered in CI rather than by an auditor. A store
-must carry its own version identifier and must never use the fingerprint as
-its change detector;
+**Resolved in §9:** how feed *versions* map to runs. Not through
+`config_fingerprint` — it hashes key structure and collides on value-only
+edits (demonstrated by a test in `FeedServiceTest`, so it fails in CI
+rather than surprising an auditor). The join is `run_id`, which the caller
+pins via `--run-id`, recorded in `feed_submission`. The fingerprint keeps
+the narrower job of corroboration.
+
+**Open:**
 whether approval workflow belongs in the app or the existing change
 process; whether schema contracts are authored in the app or continue to
 be included files.
@@ -289,6 +291,136 @@ be included files.
 - **A reimplementation of any validation rule.** See §5.
 - **An in-process multi-feed runner** unless §4's global state is removed
   first and single-flight execution is acceptable.
+
+---
+
+## 9. Feed store schema
+
+Sketch, not built. Four tables. The reasoning matters more than the column
+names, so each table states what it exists to make possible.
+
+### The join key is `run_id`, not `config_fingerprint`
+
+This dissolves §7's open question rather than answering it.
+
+The run ledger has no feed-version column, and adding one would change the
+framework. It does not need one: **`--run-id` is caller-supplied** —
+`IngestPipeline` generates a UUID only when the CLI omits it — and the
+ledger keys every row by it. So the control plane pins the run id at submit
+time and records `run_id -> version_id` in its own table. One join, no
+framework change, no reliance on a digest that cannot tell two versions
+apart.
+
+`config_fingerprint` keeps a narrower and better job: **corroboration**. If
+the ledger's fingerprint for a run does not match what the store recorded
+for that version, something bypassed the control plane or an override
+applied. That is a reconciliation query, not an identity.
+
+### Tables
+
+**`feed`** — stable identity. One row per entity, forever.
+
+```
+feed_id          PK
+entity           the framework's key everywhere: lock, ledger, RAW lineage,
+                 table names. Unique within environment. Never edited.
+environment      dev | test | prod
+source_type      jdbc | file | kafka
+created_ts, created_by
+```
+
+**`feed_version`** — the immutable definition. A change is a new row.
+
+```
+version_id       PK  <- the identity config_fingerprint cannot provide
+feed_id          FK
+version_no       monotonic per feed
+settings         the ordered answer set (see encoding below) — the EDITABLE source
+rendered_hocon   the exact artifact that ships     <- see "store the artifact"
+rendered_schema  the split schema contract, when the feed has one
+rendered_sha256  content hash of rendered_hocon    <- the real change detector
+config_fingerprint  the framework's digest, for corroboration only
+status           DRAFT | APPROVED | RETIRED
+validation_status, validation_errors, validation_warnings, sql_preview
+                 cached from FeedService.validate at save time
+created_ts, created_by, approved_ts, approved_by, change_ref
+```
+
+**`feed_submission`** — the join to the ledger, and the reason this design
+needs no framework change.
+
+```
+run_id           PK  <- passed to the framework as --run-id
+version_id       FK
+mode, stage, extra_args
+artifact_path    where rendered_hocon was written for this run
+submitted_ts, submitted_by
+override_applied BOOLEAN, override_digest     <- cross-checks the ledger's +ovr:
+exit_code        0 | 10 transient | 20 data integrity | 30 config | 1 unclassified
+failure_class, finished_ts
+```
+
+**`feed_promotion`** — optional, for traceability across environments.
+
+```
+from_version_id, to_version_id, promoted_ts, promoted_by, change_ref
+```
+
+### Decisions
+
+**Store the rendered artifact, not only the definition.** Render logic
+lives in the framework and changes with it, so re-rendering a two-year-old
+`settings` row under today's code may not reproduce what ran. Keeping
+`rendered_hocon` makes a past run reproducible by construction; keeping
+`settings` keeps it editable. Both, not either.
+
+**`rendered_sha256` is the change detector.** `config_fingerprint` hashes
+key structure only and collides on value-only edits — pinned by a test in
+`FeedServiceTest`, so the limitation cannot quietly disappear. Never branch
+on the fingerprint to decide whether a feed changed.
+
+**Encode `settings` the way drafts already do.** `Drafts.save` serializes
+each answer as `{id, scalar | items | blocks}`, with blocks unwrapped from
+`Config`. That encoding round-trips today and handles the awkward case
+(structured blocks like schema columns and filters). Reuse it rather than
+inventing a JSON mapping that has to be kept in step with `AnswerValue`.
+
+**Do not span environments with one version.** `entity` is load-bearing —
+lock key, ledger key, stamped on every RAW row, and embedded in table
+names. Today `smartiq_pdp` and `smartiq_pdp_e2e` are separate entities in
+separate files, which is correct. Making one definition render into many
+environments turns `entity` into a derived value and quietly changes the
+meaning of every lock and ledger row. Keep feeds per environment and link
+them with `feed_promotion`.
+
+**Relational, not Hive.** The store needs updates, uniqueness constraints
+and transactions. Hive is append-only and is the wrong tool — which is also
+why this does not live beside the control tables.
+
+**Secrets never enter the store.** Feeds already reference them
+(`password = { provider = "env", key = "SMARTIQ_DB_PASSWORD" }`), so
+holding the definition holds only the reference. Reject any version whose
+rendered artifact contains an inline secret at save time; the store must
+not become a credential archive that an audit discovers.
+
+### What this makes answerable
+
+| Question | Query |
+|---|---|
+| What configuration produced this curated row? | RAW `run_id` -> `feed_submission` -> `feed_version.rendered_hocon` |
+| What changed between two runs? | diff `rendered_hocon` of their two versions |
+| Did anything run outside the control plane? | ledger `run_id`s with no `feed_submission` row |
+| Was an unmanaged override in effect? | ledger `config_fingerprint LIKE '%+ovr:%'` vs `submission.override_applied` |
+| Which feeds are running unapproved definitions? | `feed_submission` joined to `feed_version.status != APPROVED` |
+
+The last two are the governance holes §7 names. Neither is solvable by the
+framework alone; both fall out of this schema for free.
+
+### Retention
+
+Submissions accumulate and can be trimmed on the same policy as the ledger.
+**Versions must never be purged while a submission references them** —
+that is exactly the reproducibility the store exists to provide.
 
 ---
 

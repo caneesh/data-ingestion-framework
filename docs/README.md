@@ -40,6 +40,7 @@ The minimum set for taking this to production.
 | [CONFIGURATION_MODEL.md](architecture/CONFIGURATION_MODEL.md) | the full feed-config surface and the incompatibility matrix (`CFG_*`) |
 | [CURATED_PARTITIONING.md](architecture/CURATED_PARTITIONING.md) | curated write strategies and partition handling |
 | [DECOUPLING_DESIGN.md](architecture/DECOUPLING_DESIGN.md) | independent raw and curated jobs, batch checkpointing |
+| [CONTROL_PLANE_DESIGN.md](architecture/CONTROL_PLANE_DESIGN.md) | **design, not implemented** — embedding the framework in an application that owns feeds, configuration and run history |
 | [INPUT_MODES.md](architecture/INPUT_MODES.md) | batch, streaming and CDC into the shared curated writer |
 
 ## reports/ — point in time, not living documentation

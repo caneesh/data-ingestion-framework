@@ -486,6 +486,72 @@ class JdbcPipelineIntegrationSpec extends AnyFunSuite with BeforeAndAfterAll {
       "the failed run must not seed the watermark")
   }
 
+  // ---------------------------------------------------------------------------
+  // Volume floor: the empty batch that every other check calls healthy
+  // ---------------------------------------------------------------------------
+
+  test("an empty extract passes every OTHER reconciliation check — which is the problem") {
+    // Establishes the baseline the floor exists to fix. The window is empty
+    // (the watermark is already past every row), so the identities hold
+    // trivially: 0 = 0 + 0, and 0 curated rows account for 0 accepted rows.
+    // The run is SUCCESS and nothing is alerted; the consumer is the
+    // detector. This test documents that behaviour rather than endorsing it.
+    val conf = auditedConf("emptyok")
+    new IngestPipeline(spark, conf,
+      Cli(entity = "claims_emptyok", mode = "INCR", runId = Some("eok-1")), logger).run()
+    // second run: same window, nothing new at source
+    new IngestPipeline(spark, conf,
+      Cli(entity = "claims_emptyok", mode = "INCR", runId = Some("eok-2")), logger).run()
+
+    import org.apache.spark.sql.functions.col
+    val failures = spark.table("j_audit.ingest_reconciliation")
+      .filter(col("run_id") === "eok-2" && col("passed") === false)
+      .count()
+    assert(failures == 0,
+      "without a floor an empty extract is indistinguishable from a healthy quiet window")
+  }
+
+  test("min_accepted_rows turns that silent empty run into a reconciliation failure") {
+    val conf = ConfigFactory.parseString(
+      """audit { reconciliation { min_accepted_rows = 1 } }""")
+      .withFallback(auditedConf("floor"))
+
+    // First run consumes the rows and advances the watermark.
+    new IngestPipeline(spark, conf,
+      Cli(entity = "claims_floor", mode = "INCR", runId = Some("flr-1")), logger).run()
+
+    // Second run has nothing to extract — previously SUCCESS, now caught.
+    val e = intercept[IllegalStateException] {
+      new IngestPipeline(spark, conf,
+        Cli(entity = "claims_floor", mode = "INCR", runId = Some("flr-2")), logger).run()
+    }
+    assert(e.getMessage.contains("accepted_meets_minimum"),
+      s"expected the volume floor to fail the run, got: ${e.getMessage}")
+  }
+
+  test("the floor is recorded in the ledger like every other check, pass or fail") {
+    // Operators diagnose from ingest_reconciliation, so a check that only
+    // ever throws would be invisible on the runs that passed it.
+    import org.apache.spark.sql.functions.col
+    val rows = spark.table("j_audit.ingest_reconciliation")
+      .filter(col("check_name") === "accepted_meets_minimum")
+      .select("run_id", "expected", "actual", "passed").collect()
+    assert(rows.exists(r => r.getString(0) == "flr-1" && r.getBoolean(3)),
+      "the passing run must record the check too")
+    assert(rows.exists(r => r.getString(0) == "flr-2" && !r.getBoolean(3)),
+      "the failing run must record what was expected and what arrived")
+  }
+
+  test("a feed without a floor is completely unaffected") {
+    // The whole feature is opt-in; absent config must behave exactly as
+    // before, which is what protects every existing feed.
+    import org.apache.spark.sql.functions.col
+    val recorded = spark.table("j_audit.ingest_reconciliation")
+      .filter(col("check_name") === "accepted_meets_minimum" && col("run_id") === "eok-2")
+      .count()
+    assert(recorded == 0, "no floor configured means no check emitted")
+  }
+
   test("watermark continuity mismatch between store and ledger fails reconciliation") {
     import org.apache.spark.sql.functions.col
     // A ghost ledger entry claims a newer window was already extracted for

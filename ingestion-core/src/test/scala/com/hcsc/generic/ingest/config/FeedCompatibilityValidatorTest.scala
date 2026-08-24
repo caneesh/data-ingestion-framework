@@ -78,6 +78,26 @@ class FeedCompatibilityValidatorTest extends AnyFunSuite {
       .exists(_.contains("CFG_007")))
   }
 
+  test("a negative volume floor is rejected (CFG_021)") {
+    // A floor that can never trip reads as protection in the config while
+    // detecting nothing — worse than declaring none.
+    assert(errorsOf("""audit { reconciliation { min_accepted_rows = -1 } }""")
+      .exists(_.contains("CFG_021")))
+  }
+
+  test("a volume floor with audit disabled is rejected (CFG_021)") {
+    // The floor is evaluated as a reconciliation check and recorded in the
+    // ledger; without the ledger it silently does nothing.
+    assert(errorsOf(
+      """audit { enabled = false, reconciliation { min_accepted_rows = 1 } }""")
+      .exists(_.contains("CFG_021")))
+  }
+
+  test("a zero floor is legal — it declares 'empty is expected' explicitly") {
+    assert(!errorsOf("""audit { enabled = true, reconciliation { min_accepted_rows = 0 } }""")
+      .exists(_.contains("CFG_021")))
+  }
+
   test("JDBC watermark blocks on file sources are rejected (CFG_008)") {
     assert(errorsOf(
       """source { type = "file", incremental { watermark_type = "TIMESTAMP" } }""")

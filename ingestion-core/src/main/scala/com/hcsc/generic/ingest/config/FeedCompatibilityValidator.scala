@@ -71,6 +71,16 @@ object FeedCompatibilityValidator {
     if (reconciliationFails && auditEnabled.contains(false))
       errors += "CFG_007 audit.reconciliation.on_mismatch=FAIL requires audit.enabled=true"
 
+    // A volume floor that can never trip is worse than none: it reads as
+    // protection in the config while detecting nothing.
+    ConfigUtils.optLong(feed, "audit.reconciliation.min_accepted_rows").foreach { floor =>
+      if (floor < 0)
+        errors += s"CFG_021 audit.reconciliation.min_accepted_rows must be >= 0, found $floor"
+      else if (auditEnabled.contains(false))
+        errors += "CFG_021 audit.reconciliation.min_accepted_rows requires audit.enabled=true " +
+          "(the floor is evaluated as a reconciliation check and recorded in the ledger)"
+    }
+
     // File feeds use folder/watermark-free intake; JDBC incremental blocks
     // configured on them will be silently ignored — reject instead.
     if (sourceType.contains("file") && feed.hasPath("source.incremental"))

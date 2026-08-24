@@ -125,6 +125,7 @@ feeds.claims {
 | CFG_016 | `ingestion.execution = DECOUPLED` without `watermark.advance_after = RAW` (incremental sources) or without the run ledger; DECOUPLED feed invoked with `--stage all` |
 | CFG_017 | `freshness.compare_as` not a valid Spark type; `compare_as` and `compare_format` both declared; unparseable `tie_breakers` / `dedup.order_by` ordering syntax |
 | CFG_018 | `--conf-path` names a file that does not exist (typically: not shipped with `--files`) |
+| CFG_021 | `audit.reconciliation.min_accepted_rows` is negative, or set with `audit.enabled = false` (a floor that can never trip reads as protection while detecting nothing) |
 | CUR_010 | `curated.merge.normalize` targets a column absent from the incoming data (skipping it would leave business keys un-normalized and insert duplicates instead of merging) |
 | CFG_019 | `--override-path` names a file that does not exist (fail-closed: an override that silently did not apply is worse than a failed run) |
 
@@ -175,6 +176,59 @@ CDC-events example and a file-feed example live in `application.conf`'s
 commented blocks; the interactive generator (`ingestion-config-gen`)
 produces feeds that pass this validator by construction.
 
+
+## Reject thresholds are UNBOUNDED unless set
+
+`rejects.max_reject_percent` and `rejects.max_reject_count` are both
+optional, and absent means **no ceiling**. A feed can reject every row and
+still report SUCCESS — curated simply does not advance, and nothing alerts.
+
+```hocon
+rejects {
+  max_reject_percent = 1.0    # systemic breakage trips this
+  max_reject_count   = 100    # small-batch guard: 1% of 20 rows is 0.2 rows
+}
+```
+
+Set both. Percent alone never fires on small windows; count alone scales
+badly as volume grows. Rows still land in the reject table below the
+ceiling — the threshold is the alarm, not the acceptance test.
+
+## Detecting the run that did nothing (`min_accepted_rows`)
+
+Every reconciliation check except this one is an **identity** — it proves
+no rows vanished between two stages. Identities pass trivially on an empty
+batch: `0 = 0 + 0`, and zero curated rows account for zero accepted rows.
+So a run that extracted nothing is, to every other check, perfectly
+healthy, and the first person to notice is the consumer.
+
+```hocon
+audit.reconciliation.min_accepted_rows = 1
+```
+
+Fewer accepted rows than the floor emits a failing `accepted_meets_minimum`
+check, which obeys the existing `reconciliation.on_mismatch` policy
+(`FAIL` by default) and is recorded in `ingest_reconciliation` whether it
+passes or fails.
+
+**Opt-in on purpose.** An empty incremental window is legitimate for many
+feeds — nothing changed at source. Declaring a floor is a feed asserting
+"fewer rows than this means the extract is broken, not that the world was
+quiet". Choose it by looking at real history and setting it below the
+quietest legitimate window:
+
+```sql
+SELECT accepted_count, event_ts FROM <audit_db>.ingest_run_audit
+WHERE entity = '<entity>' AND stage = 'raw' AND status = 'SUCCESS'
+ORDER BY event_ts DESC LIMIT 20;
+```
+
+Measured on **accepted** rows, not curated mutations: a batch where every
+row is unchanged (`record_hash` match) publishes nothing and is healthy.
+
+What it catches that nothing else does: a source outage returning empty, a
+watermark advanced past real data, a filter that stopped matching, a table
+renamed by a source migration.
 
 ## Operational override layer (`--override-path`)
 

@@ -974,6 +974,13 @@ final class IngestPipeline(
     * different job: it is the row count that run recorded writing to RAW,
     * which is exactly the slice this replay re-reads.
     */
+  /** Minimum ACCEPTED rows a healthy run of this feed produces. Absent =
+    * no floor, which is the historical behaviour and stays the default:
+    * many feeds legitimately see empty incremental windows. */
+  private lazy val minAcceptedRows: Option[Long] =
+    ConfigUtils.optConfig(feedConf, "audit")
+      .flatMap(a => ConfigUtils.optLong(a, "reconciliation.min_accepted_rows"))
+
   private def reconcile(
     raw: Option[RawOutcome],
     curated: Option[CuratedResult],
@@ -994,6 +1001,30 @@ final class IngestPipeline(
         val expectedRaw = c.acceptedCount - o.overlapSkipped
         checks += (("raw_equals_accepted", expectedRaw.toString, c.rawCount.toString, c.rawCount == expectedRaw))
       }
+      // VOLUME FLOOR (audit.reconciliation.min_accepted_rows). Every other
+      // check here is an IDENTITY — it proves nothing vanished between two
+      // stages — and identities pass TRIVIALLY on an empty batch: 0 = 0 + 0,
+      // and 0 curated rows account for 0 accepted rows. So a run that
+      // extracted nothing at all is, to every other check, perfectly
+      // healthy, and the first person to notice is the consumer looking at
+      // yesterday's data.
+      //
+      // The causes are indistinguishable from a legitimate quiet window
+      // without this: a source outage returning empty, a watermark advanced
+      // past real data, a filter that stopped matching, a table renamed by
+      // a source migration.
+      //
+      // OPT-IN, because an empty incremental window is genuinely normal for
+      // many feeds. Declaring a floor is a feed saying "fewer rows than this
+      // means something is wrong with the extract, not with the world."
+      // Measured on ACCEPTED rows, not curated mutations: a batch where
+      // every row is unchanged (record_hash match) publishes nothing and is
+      // perfectly healthy.
+      if (!ctx.dryRun && c.acceptedCount >= 0) minAcceptedRows.foreach { floor =>
+        checks += (("accepted_meets_minimum", s">=$floor", c.acceptedCount.toString,
+          c.acceptedCount >= floor))
+      }
+
       // Measured overlap reread (DEDUPLICATED_APPEND): informational record
       // so operators can see exactly how much of the window was re-extracted.
       if (o.overlapSkipped > 0)

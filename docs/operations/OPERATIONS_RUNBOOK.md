@@ -324,6 +324,31 @@ categories classified by `SqlFailureClassifier` are retried.
 
 ---
 
+### accepted_meets_minimum — the extract came back empty
+
+The feed declared `audit.reconciliation.min_accepted_rows` and this run
+accepted fewer. The run failed *before* anyone downstream saw a stale
+table, which is the point.
+
+This is **not** a data-integrity failure — nothing was corrupted, nothing
+was lost. It means the extract returned less than this feed considers
+possible. Check, in order:
+
+1. **Is the source reachable and populated?** Run the previewed extraction
+   SQL by hand against the source.
+2. **Has the watermark overrun the data?** Compare the stored watermark to
+   `MAX(<watermark column>)` at source — a watermark ahead of the data
+   selects nothing, forever.
+3. **Did the source change underneath the feed?** A renamed table, a
+   changed filter column, or a migration that reset timestamps.
+4. **Was it genuinely quiet?** If zero is legitimate for this window
+   (a weekend, a holiday), the floor is set too high — lower it or remove
+   it rather than muting reconciliation wholesale.
+
+Re-running does not help until the cause is fixed: the same window will
+return the same nothing. The watermark did **not** advance, so no data is
+skipped once the cause is resolved.
+
 ## 2. Watermark operations
 
 Incremental feeds track their position in an **append-only** history table.

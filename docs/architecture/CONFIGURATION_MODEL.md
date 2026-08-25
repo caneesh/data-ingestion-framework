@@ -125,6 +125,7 @@ feeds.claims {
 | CFG_016 | `ingestion.execution = DECOUPLED` without `watermark.advance_after = RAW` (incremental sources) or without the run ledger; DECOUPLED feed invoked with `--stage all` |
 | CFG_017 | `freshness.compare_as` not a valid Spark type; `compare_as` and `compare_format` both declared; unparseable `tie_breakers` / `dedup.order_by` ordering syntax |
 | CFG_018 | `--conf-path` names a file that does not exist (typically: not shipped with `--files`) |
+| CFG_022 | `reconcile.on_mismatch` is not REPORT/FAIL; `--stage reconcile` on a feed with no curated block, a missing curated table, or a business key absent from it |
 | CFG_021 | `audit.reconciliation.min_accepted_rows` is negative, or set with `audit.enabled = false` (a floor that can never trip reads as protection while detecting nothing) |
 | CUR_010 | `curated.merge.normalize` targets a column absent from the incoming data (skipping it would leave business keys un-normalized and insert duplicates instead of merging) |
 | CFG_019 | `--override-path` names a file that does not exist (fail-closed: an override that silently did not apply is worse than a failed run) |
@@ -176,6 +177,63 @@ CDC-events example and a file-feed example live in `application.conf`'s
 commented blocks; the interactive generator (`ingestion-config-gen`)
 produces feeds that pass this validator by construction.
 
+
+## Source reconciliation (`--stage reconcile`)
+
+Every other check is a WITHIN-RUN identity: it proves no rows vanished
+between two stages of one execution. None of them asks whether curated,
+cumulatively, still agrees with the source — so a batch lost **outside**
+the pipeline (a dropped partition, a run that never happened, a manual
+edit) leaves the ledger perfectly clean.
+
+```hocon
+reconcile {
+  enabled     = true
+  on_mismatch = "REPORT"     # REPORT (default) | FAIL
+}
+```
+
+```bash
+./scripts/run_ingest.sh <conf> <entity> INCR --stage reconcile
+```
+
+Run it as a **separate schedule** — it issues real queries against the
+source system — not as part of every load.
+
+### Why it is key-based, not timestamp-bounded
+
+The intuitive design compares both sides "as of the committed watermark".
+It is wrong and reports drift forever: a row ingested before the watermark
+carries that old timestamp in curated, and when the source edits it again
+afterwards the source row falls **outside** a `<= watermark` filter while
+the curated copy still falls inside. The counts then differ by exactly the
+number of rows edited since the last run — normal lag, reported as loss,
+until the alert is ignored.
+
+Key existence is timestamp-independent, which is what makes the comparison
+trustworthy.
+
+### The checks
+
+| Check | Meaning |
+|---|---|
+| `source_curated_cardinality` | `COUNT(*)` both sides. Passes when curated is **not short** — curated may legitimately exceed source when source deletes are retained |
+| `source_keys_present_in_curated` | source keys with no curated row. **Non-zero is real data loss** — the alarm |
+| `curated_keys_absent_from_source` | curated keys gone from source. **Informational, always passing**: under `deletes.mode = IGNORE` these are upstream deletions deliberately retained. The NUMBER is the finding — for a feed asserting no source deletes occur, this is the measurement that tests it |
+
+Business keys come from `curated.merge.keys` (or the contract's
+`business_key`), and the **source** column name is resolved through the
+contract's `aliases`, so a correctly-onboarded feed needs no extra
+configuration. Only key columns leave the source — on a 364-column table
+that is the difference between a cheap comparison and a second full
+extract. The same non-watermark filters as the extraction are applied, so
+deliberately excluded rows are not reported as missing.
+
+`REPORT` is the default deliberately: unlike an in-run check there is no
+batch to stop and nothing to roll back, and a nightly comparison that goes
+red gets silenced rather than read. Findings are recorded in
+`ingest_reconciliation` alongside the in-run checks and alerted through the
+usual notification channel.
 
 ## Reject thresholds are UNBOUNDED unless set
 

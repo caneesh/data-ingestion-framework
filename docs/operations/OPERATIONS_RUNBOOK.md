@@ -324,6 +324,48 @@ categories classified by `SqlFailureClassifier` are retried.
 
 ---
 
+### source_keys_present_in_curated — rows the source has and curated does not
+
+Raised by `--stage reconcile`. This is the one finding that no in-run check
+can produce: every run reconciled correctly, and curated is still missing
+rows. It means data was lost **outside** a run.
+
+Identify them first — the check reports a count, not the keys:
+
+```sql
+-- keys in the source key pull that have no curated row; run the same
+-- projection the stage uses, then anti-join
+SELECT s.<key> FROM <source_keys> s
+LEFT ANTI JOIN <curated_db>.<table> c ON s.<key> = c.<key>;
+```
+
+Then work through the causes, most likely first:
+
+1. **A run that never happened.** Check the ledger for a gap in
+   `event_ts` — the framework cannot detect its own absence, so a missed
+   schedule leaves no trace except missing data.
+2. **A dropped or purged partition.** Check whether retention ran with a
+   misconfigured period; RAW partition drops are irreversible.
+3. **A watermark that skipped a window.** `watermark_continuity` would
+   normally catch this, but an out-of-band watermark edit defeats it.
+4. **Rows filtered out deliberately.** Confirm `source.where` and any
+   contract-level filtering — the comparison applies the same filters, so
+   this should not produce false positives, but a filter changed since the
+   original load will.
+
+**Recovery** is a replay bounded to the affected window, not a full
+reload: `--stage curated --replay-from <date> --replay-to <date>` when the
+RAW rows exist, or a watermark rewind plus re-extract when they do not
+(see §2.3). Re-running `--stage reconcile` afterwards is the proof.
+
+### curated_keys_absent_from_source — informational, but read it
+
+Always passes; the number is the point. Under `deletes.mode = IGNORE`
+these are rows deleted upstream and deliberately retained. A **non-zero
+count on a feed that assumes no source deletes occur** means the
+assumption is wrong — revisit the delete policy with the source team
+before a consumer asks why a deleted record is still in the warehouse.
+
 ### accepted_meets_minimum — the extract came back empty
 
 The feed declared `audit.reconciliation.min_accepted_rows` and this run

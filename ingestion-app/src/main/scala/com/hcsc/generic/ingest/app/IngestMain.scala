@@ -56,6 +56,12 @@ object IngestMain {
             new com.hcsc.generic.ingest.pipeline.CuratedBatchDriver(spark, feedConf, cli, logger).run()
           else
             new IngestPipeline(spark, feedConf, cli, logger).curatedReplay()
+        case "reconcile" =>
+          // Independent SOURCE-vs-CURATED comparison (Tier 1 cardinality,
+          // Tier 2 key sets). Scheduled separately from ingestion — it
+          // issues real queries against the source system — and REPORTS by
+          // default rather than failing: there is no batch to stop.
+          runReconcile(spark, feedConf, cli)
         case "retention" =>
           // Config-driven purge of raw partitions, reject/audit rows and
           // watermark history; honors --dry-run. Runs under the entity lock
@@ -332,6 +338,72 @@ object IngestMain {
       held.foreach(l =>
         try l.release(ctx.entity, ctx.runId)
         catch { case e: Exception => logger.warn(s"[Retention] Lock release failed: ${e.getMessage}") })
+    }
+  }
+
+  private def runReconcile(spark: SparkSession, feedConf: Config, cli: Cli): Unit = {
+    import com.hcsc.generic.ingest.runtime.{RunContext, StageStatus}
+    val ctx = RunContext(
+      runId = cli.runId.getOrElse(java.util.UUID.randomUUID().toString),
+      entity = cli.entity, mode = cli.mode,
+      rawFlag = cli.rawFlag.getOrElse(""), dryRun = cli.dryRun)
+    val audit = com.hcsc.generic.ingest.audit.AuditService(spark, feedConf)
+    val service = new com.hcsc.generic.ingest.jdbc.reconcile
+      .SourceReconciliationService(spark, feedConf, logger)
+
+    // The entity lock keeps the comparison from reading a half-written
+    // curated table, and the HEARTBEAT keeps a long comparison from losing
+    // the lease under itself — the exact defect retention shipped with.
+    val lock = com.hcsc.generic.ingest.lock.RunLock.fromConfig(spark, feedConf, logger)
+    val held = if (cli.dryRun) None else lock.map { l => l.acquire(ctx.entity, ctx.runId); l }
+    val heartbeat = held.map { l =>
+      val hb = new com.hcsc.generic.ingest.lock.LockHeartbeat(
+        l, ctx.entity, ctx.runId, math.max(l.leaseMillis / 3, 1000L), logger)
+      hb.start()
+      hb
+    }
+    try {
+      val checks = service.run()
+      if (checks.isEmpty) {
+        logger.warn("[Reconcile] no checks were produced — nothing to compare")
+        return
+      }
+      // Recorded in the SAME table as the in-run checks, so one query
+      // answers "is this feed consistent" across both kinds.
+      audit.recordReconciliation(ctx, checks.map(c => (c.name, c.expected, c.actual, c.passed)))
+
+      val failed = checks.filterNot(_.passed)
+      val summary = checks
+        .map(c => s"${c.name}: expected=${c.expected} actual=${c.actual} passed=${c.passed}")
+        .mkString("; ")
+      audit.recordStage(ctx, "reconcile",
+        if (failed.isEmpty) StageStatus.Success else StageStatus.Failed, message = summary)
+
+      if (failed.isEmpty) logger.info(s"[Reconcile] all checks passed — $summary")
+      else {
+        logger.error(s"[Reconcile] MISMATCH — $summary")
+        // Best-effort alert on the channel failures already use; the
+        // finding is worthless if nobody sees it before the consumer does.
+        try {
+          com.hcsc.generic.ingest.notify.NotificationService(feedConf, logger)
+            .notifyFailure(ctx.entity, ctx.runId, "reconcile", summary)
+        } catch {
+          case e: Throwable => logger.warn(s"[Notify] reconcile alert not sent: ${e.getMessage}")
+        }
+        if (service.onMismatch == "FAIL")
+          throw new IllegalStateException(s"Source reconciliation failed: $summary")
+      }
+    } catch {
+      case e: Throwable =>
+        try audit.recordStage(ctx, "reconcile", StageStatus.Failed,
+          message = String.valueOf(e.getMessage))
+        catch { case audErr: Throwable => e.addSuppressed(audErr) }
+        throw e
+    } finally {
+      heartbeat.foreach(hb => try hb.stop() catch { case _: Exception => () })
+      held.foreach(l =>
+        try l.release(ctx.entity, ctx.runId)
+        catch { case e: Exception => logger.warn(s"[Reconcile] Lock release failed: ${e.getMessage}") })
     }
   }
 

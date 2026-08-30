@@ -431,7 +431,7 @@ filenames, since the stock message names only what was missing.
 | `--mode` | `FULL` (overwrite) or `INCR` (watermark + keyed merge). Default `FULL`. |
 | `--conf-path` | Standalone HOCON file instead of the bundled `application.conf`. |
 | `--override-path` | Operational override file; its values win over the feed config for every path it declares. Missing file = CFG_019. |
-| `--stage` | `all` (default), `raw`, `retention`, or `curated` / `curated-only` / `c` to rebuild CURATED from existing RAW. |
+| `--stage` | `all` (default), `raw`, `retention`, `reconcile` (source-vs-curated comparison), or `curated` / `curated-only` / `c` to rebuild CURATED from existing RAW. |
 | `--run-id` | Stable run identifier (letters, digits, `_`, `-`); reaches staging tables and audit records. |
 | `--resume` | Resume a failed run; requires `--run-id` of the run to resume. |
 | `--resume-ingest-dt` | Resume scoped to a specific RAW ingest date. |

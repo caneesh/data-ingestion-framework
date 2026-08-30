@@ -51,7 +51,8 @@ Arguments are parsed by `ingestion-core/.../model/Cli.scala` (`CliParser`):
 | `--entity <name>` | Yes | Feed name from config |
 | `--mode <FULL\|INCR>` | Yes | Load mode (validated: must be FULL or INCR) |
 | `--conf-path <path>` | No | Path to `application.conf` (else classpath) |
-| `--stage <all\|raw\|curated\|curated-only\|c>` | No | Stage to run (default `all`) |
+| `--override-path <path>` | No | Operational override file; its values win over the feed (§5, CFG_019 if missing) |
+| `--stage <all\|raw\|curated\|curated-only\|c\|retention\|reconcile>` | No | Stage to run (default `all`); `retention` purges per the retention block, `reconcile` compares source vs curated |
 | `--raw-flag <value>` | No | Override the `file_type` partition value |
 | `--resume-ingest-dt <dt>` | No | Resume curated from a specific RAW partition |
 | `--run-id <id>` | No | Pin the run id (stamped on RAW rows as `run_id`) |
@@ -62,8 +63,18 @@ Arguments are parsed by `ingestion-core/.../model/Cli.scala` (`CliParser`):
 | `--validate-only` | No | Validate headers/mappings only; no writes, no moves, no audit |
 | `--explain-mapping` | No | With `--validate-only`, print the resolved mapping |
 
+Batch selectors for decoupled curated runs (`--pending`, `--replay-last`,
+`--replay-from`/`--replay-to`, `--replay-failed`, `--replay-source-system`)
+are documented in
+[../architecture/DECOUPLING_DESIGN.md](../architecture/DECOUPLING_DESIGN.md).
+
 Enforced at parse time: `--entity` required; `--mode` ∈ {FULL, INCR};
 `--stage` in the allowed set; `--resume` requires `--run-id`.
+
+**Exit codes** (client mode; in YARN cluster mode spark-submit reports the
+application state, so schedulers read the ledger or the `[Outcome]` log
+line): `0` success, `10` transient (retry worthwhile), `20` data integrity
+(never retry), `30` configuration, `1` unclassified.
 
 ---
 
@@ -186,6 +197,8 @@ They share `ingest_submit_common.sh`, configured by environment:
 | `INGEST_EXTRA_FILES` | files the feed config `include`s, comma-separated |
 | `INGEST_ENV_VARS` | variable NAMES forwarded to a cluster-mode driver |
 | `INGEST_OVERRIDE_FILE` | optional override config; its values **win** over the feed (see below) |
+| `INGEST_DRIVER_MEMORY` | driver heap (e.g. `4g`) — required for wide feeds, which build a large plan before reading any row |
+| `INGEST_EXECUTOR_MEMORY` | executor heap override |
 
 `INGEST_JAR` and `INGEST_JARS` differ by one letter and mean different
 things; the wrapper rejects an `INGEST_JAR` that looks like a JDBC driver
@@ -437,6 +450,8 @@ Default driver class per dialect (`dialect/JdbcDialect.scala`):
 | `AZURE_MANAGED_IDENTITY` | optional `client_id` | `authentication=ActiveDirectoryMSI` (+ `msiClientId`) |
 | `AZURE_SERVICE_PRINCIPAL` | `client_id`, secret-backed `client_secret` | `authentication=ActiveDirectoryServicePrincipal` |
 | `ENTRA_ID_PASSWORD` | `user`, `password` | `authentication=ActiveDirectoryPassword` |
+| `ENTRA_DEFAULT` (`AZURE_DEFAULT_CREDENTIAL`) | — | `authentication=ActiveDirectoryDefault` |
+| `ENTRA_INTEGRATED` | OS-level Kerberos on every Spark host | `authentication=ActiveDirectoryIntegrated` |
 | `ACCESS_TOKEN` | secret-backed token | `accessToken` |
 
   Prefer MSI or service principal for long extractions — a pre-fetched
@@ -457,6 +472,8 @@ as `{ provider = "<type>", ... }` for `auth.user` and `auth.password`.
 | `sysprop` | `{ provider = "sysprop", key = "db.password" }` | Pass via `-D` in driver/executor java options. Missing → JDBC_002. |
 | `file` | `{ provider = "file", path = "/etc/secrets/db" }` | File must exist and be readable on the resolving host (UTF-8, trimmed). Missing/unreadable → JDBC_002. |
 | `cyberark` | see below | CyberArk Central Credential Provider (CCP). |
+| `conjur` | `{ provider = "conjur", url, account, host_id, api_key, variable }` | CyberArk Conjur; `api_key` is itself a secret reference. Plain http rejected without `allow_insecure_http`. |
+| `azure_keyvault` | `{ provider = "azure_keyvault", vault_url, secret_name }` | Azure Key Vault via `DefaultAzureCredential`; needs the Azure SDK on the classpath (provider self-disables when absent). |
 
 **CyberArk CCP** retrieves the account from a CCP endpoint; one vault object
 serves both user id (`attribute = "UserName"`) and password (`Content`,
@@ -484,9 +501,10 @@ keystore settings passed in driver java options, e.g.:
 TLS verification is never disabled. CCP HTTP errors (401/403, missing
 attribute) map to JDBC_002.
 
-**Azure Key Vault / Databricks scopes** are not built in but plug in by
-registering a custom `SecretProvider` (no extra SDK unless your custom
-provider needs one). See [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md#extension-points)
+**Conjur and Azure Key Vault are built in** (registered alongside CCP;
+each self-disables with a logged warning when its optional SDK is absent
+from the classpath). Anything else plugs in by registering a custom
+`SecretProvider` — see [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md#extension-points)
 for the registration contract.
 
 ---
@@ -528,7 +546,7 @@ Metrics counters accumulate in-process via `JdbcMetrics`
 - [ ] Managed Identity / approved secret storage in use; no plaintext credentials in HOCON or logs
 - [ ] Executor-to-Azure-SQL firewall requirements documented and validated (executor probe if needed)
 - [ ] Custom SQL restricted (single SELECT, no semicolons/DDL/DML) and audited via query hash
-- [ ] Source and target counts reconcile (`ingest_reconciliation`)
+- [ ] Source and target counts reconcile (`ingest_reconciliation`); `--stage reconcile` scheduled for cumulative source-vs-curated key comparison
 - [ ] SQL Server Testcontainers integration tests pass where Docker is available
 - [ ] Operations runbook reviewed by the production support team
 

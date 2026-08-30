@@ -217,14 +217,16 @@ trustworthy.
 
 | Check | Meaning |
 |---|---|
-| `source_curated_cardinality` | `COUNT(*)` both sides. Passes when curated is **not short** — curated may legitimately exceed source when source deletes are retained |
+| `source_curated_cardinality` | `COUNT(*)` both sides. **Keyless feeds:** passes when curated is not short. **Keyed feeds:** informational (always passes) — in-batch dedup and quarantined rows legitimately shrink curated, so Tier 2 carries the alarm and this records the trend |
 | `source_keys_present_in_curated` | source keys with no curated row. **Non-zero is real data loss** — the alarm |
 | `curated_keys_absent_from_source` | curated keys gone from source. **Informational, always passing**: under `deletes.mode = IGNORE` these are upstream deletions deliberately retained. The NUMBER is the finding — for a feed asserting no source deletes occur, this is the measurement that tests it |
 
 Business keys come from `curated.merge.keys` (or the contract's
 `business_key`), and the **source** column name is resolved through the
 contract's `aliases`, so a correctly-onboarded feed needs no extra
-configuration. Only key columns leave the source — on a 364-column table
+configuration. Null/blank-key source rows are excluded from the
+comparison — the curated merge quarantines them (CUR_001) so they can never
+have a curated row; they are accounted for in `ingest_rejects`. Only key columns leave the source — on a 364-column table
 that is the difference between a cheap comparison and a second full
 extract. The same non-watermark filters as the extraction are applied, so
 deliberately excluded rows are not reported as missing.

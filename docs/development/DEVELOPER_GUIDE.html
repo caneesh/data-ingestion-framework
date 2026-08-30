@@ -550,7 +550,7 @@ spark-submit \
     <tr><td><code>--mode</code></td><td><code>FULL</code> (overwrite) or <code>INCR</code> (watermark + keyed merge). Default <code>FULL</code>.</td></tr>
     <tr><td><code>--conf-path</code></td><td>Standalone HOCON file instead of the bundled <code>application.conf</code>.</td></tr>
     <tr><td><code>--override-path</code></td><td>Operational override file; its values win over the feed config for every path it declares. Missing file = CFG_019.</td></tr>
-    <tr><td><code>--stage</code></td><td><code>all</code> (default), <code>raw</code>, or <code>curated</code> / <code>curated-only</code> / <code>c</code> to rebuild CURATED from existing RAW.</td></tr>
+    <tr><td><code>--stage</code></td><td><code>all</code> (default), <code>raw</code>, <code>retention</code>, <code>reconcile</code>, or <code>curated</code> / <code>curated-only</code> / <code>c</code> to rebuild CURATED from existing RAW.</td></tr>
     <tr><td><code>--run-id</code></td><td>Stable run identifier (letters, digits, <code>_</code>, <code>-</code>); reaches staging tables and audit records.</td></tr>
     <tr><td><code>--resume</code></td><td>Resume a failed run; requires <code>--run-id</code> of the run to resume.</td></tr>
     <tr><td><code>--resume-ingest-dt</code></td><td>Resume scoped to a specific RAW ingest date.</td></tr>

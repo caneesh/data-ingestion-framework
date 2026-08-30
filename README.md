@@ -558,7 +558,7 @@ spark-submit \
 | `--mode` | Yes | `FULL` or `INCR` |
 | `--conf-path` | No | Path to config file (defaults to classpath) |
 | `--override-path` | No | Operational override file; its values win over the feed config ([semantics](docs/architecture/CONFIGURATION_MODEL.md)) |
-| `--stage` | No | `all`, `raw`, `curated` |
+| `--stage` | No | `all`, `raw`, `curated`, `retention`, `reconcile` |
 | `--raw-flag` | No | Override file_type partition value |
 | `--resume-ingest-dt` | No | Resume curated from specific RAW partition |
 

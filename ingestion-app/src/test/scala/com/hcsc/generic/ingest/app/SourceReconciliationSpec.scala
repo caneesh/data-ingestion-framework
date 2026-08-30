@@ -157,8 +157,13 @@ class SourceReconciliationSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(!loss._3, "a source key with no curated row is data loss and must fail")
     assert(loss._1 == "0", "zero missing keys is what a healthy feed expects")
     assert(loss._2 == "1", s"exactly the un-ingested key must be counted: $loss")
-    assert(!r("source_curated_cardinality")._3,
-      "cardinality must also notice curated is short")
+    // Cardinality deliberately does NOT alarm here: this feed has business
+    // keys, so Tier 2 is the alarm and cardinality is a recorded trend.
+    // (Originally asserted the opposite; that design false-alarmed on any
+    // keyed feed with in-batch duplicates or quarantined rows — the shipped
+    // e2e seed data trips it in its very first scenario.)
+    assert(r("source_curated_cardinality")._3,
+      "keyed-feed cardinality is informational; Tier 2 carries the alarm")
   }
 
   test("rows deleted at source are reported as a NUMBER, not a failure") {
@@ -177,13 +182,38 @@ class SourceReconciliationSpec extends AnyFunSuite with BeforeAndAfterAll {
       "informational by construction — it must never fail the job")
   }
 
-  test("curated exceeding source is not a cardinality failure") {
-    // Follows directly from the previous case: with deletes retained,
-    // curated legitimately outgrows source, so the assertion is only that
-    // curated is not SHORT.
+  test("cardinality on a keyed feed records the counts but never alarms") {
+    // Keyed curated is legitimately shorter than raw source rows (in-batch
+    // dedup, quarantined null keys) and legitimately longer (retained
+    // deletes) — either direction is normal, so for keyed feeds the check
+    // is informational and Tier 2 carries the alarm.
     val r = checks()
-    assert(r("source_curated_cardinality")._3,
-      s"curated >= source must pass: ${r("source_curated_cardinality")}")
+    val card = r("source_curated_cardinality")
+    assert(card._3, s"must always pass on a keyed feed: $card")
+    assert(card._1.startsWith("source=") && card._2.startsWith("curated="),
+      s"both counts must still be recorded for trending: $card")
+  }
+
+  test("null-key source rows are never reported as loss — CUR_001 quarantines them by design") {
+    // The false alarm the shipped e2e feed would have raised: its seed data
+    // deliberately includes a null-business-key row (scenario 4), which the
+    // curated merge quarantines. A row that CANNOT be in curated must not be
+    // counted as missing from it.
+    h2("INSERT INTO forms VALUES (NULL, 900, '2026-03-01 09:00:00')")
+    val r = checks()
+    assert(r("source_keys_present_in_curated")._3,
+      s"a null-key row is accounted for in ingest_rejects, not here: " +
+        r("source_keys_present_in_curated").toString)
+  }
+
+  test("in-batch duplicate keys at source do not read as drift") {
+    // Two source rows, one key: curated keeps one (dedup). Key-based
+    // comparison must see one key present, not one row missing.
+    h2("INSERT INTO forms VALUES ('F001', 101, '2026-03-02 09:00:00')")
+    val r = checks()
+    assert(r("source_keys_present_in_curated")._3,
+      "a duplicated key still EXISTS in curated; dedup is not loss")
+    assert(r("source_curated_cardinality")._3)
   }
 
   test("REPORT is the default policy; FAIL is opt-in") {

@@ -35,9 +35,10 @@ These are the artifacts it keeps in step:
 | `smartiq-pdp-e2e-schema.conf` | `nullable = false` removed from `file_name`; otherwise one null key fails the whole run |
 | `feed-smartiq-pdp-e2e.conf` | control tables moved to `membership_common_raw`, table names now explicit, TLS block added |
 
-Confirm the jar is current: the driver logs
-`[Config] --conf-path='...' includes resolve against '<dir>'` before
-parsing. No such line means the jar is stale.
+Confirm the jar is current: the FIRST line of every driver log is
+`[Build] ingestion framework <version> (built <timestamp>)` — stamped into
+the manifest at package time. If that timestamp is not from your build, you
+are running a stale jar and nothing else you observe can be trusted.
 
 **2. Clear any half-created Hive tables.** A previous run that mixed
 hand-written DDL and framework-created tables at one path leaves files
@@ -74,8 +75,9 @@ done
 ```
 
 **4. Check for control-table name collisions.** The control tables live in
-`membership_common_raw`, which is **shared with other pipelines**, and the
-framework creates eight of them on first write:
+`membership_common_raw`, which is **shared with other pipelines**. Of the
+framework's eight control tables this JDBC feed creates seven on first
+write (no file registry — that is file-intake machinery):
 
 ```sql
 SHOW TABLES IN membership_common_raw LIKE 'ingest_*';
@@ -184,9 +186,9 @@ the scenarios.
 **7. Read three lines before trusting a green run:**
 
 ```
-[Config] --conf-path='...' includes resolve against '<dir>'   # jar is current
-[Jdbc]   url=jdbc:sqlserver://<host>... table=<table>          # the RIGHT database
-[Lock]   entity=smartiq_pdp_e2e lease released by run <id>     # clean exit
+[Build]  ingestion framework ... (built <timestamp>)          # the jar is current
+[Jdbc]   url=jdbc:sqlserver://<host>... table=<table>         # the RIGHT database
+[Lock]   entity=smartiq_pdp_e2e lease released by run <id>    # clean exit
 ```
 
 The middle one matters most: an unforwarded `SMARTIQ_HOST` / `_DB` /
@@ -467,6 +469,8 @@ INGEST_EXTRA_FILES="$PWD/smartiq-pdp-e2e-schema.conf" \
 | `INGEST_EXTRA_FILES` | files `include`d by the feed config, comma-separated |
 | `INGEST_ENV_VARS` | names forwarded to a **cluster-mode** driver; ignored in client mode |
 | `INGEST_JAR` | app jar path, instead of the positional slot |
+| `INGEST_OVERRIDE_FILE` | optional operational override; its values win over the feed config |
+| `INGEST_DRIVER_MEMORY` / `INGEST_EXECUTOR_MEMORY` | heap overrides (the 364-column prod feed needs `INGEST_DRIVER_MEMORY=4g`) |
 
 For the later cluster-mode confirmation run, the same command plus the
 forwarding list:
@@ -485,14 +489,18 @@ terminal; cluster mode needs `yarn logs -applicationId <appId>`. Either
 way, check these three lines before trusting a green run:
 
 ```
-[Config] --conf-path='...' includes resolve against '<dir>'   # the jar is current
-[Jdbc]   url=jdbc:sqlserver://<host>...  table=<table>        # the RIGHT database
+[Build]  ingestion framework ... (built <timestamp>)          # the jar is current
+[Jdbc]   url=jdbc:sqlserver://<host>... table=<table>         # the RIGHT database
 [Lock]   entity=smartiq_pdp_e2e lease released by run <id>    # clean exit
 ```
 
-Exit code 0 means success, including a clean no-op. Non-zero propagates
-the framework's `CFG_` / `JDBC_` / `PIPE_` / `CUR_` code — rerunning the
-same job after a failure is always safe.
+Exit code 0 means success, including a clean no-op. Failures exit with a
+CLASSIFIED code in client mode — `10` transient (retry worthwhile), `20`
+data integrity (never retry), `30` configuration, `1` unclassified; the
+`CFG_` / `JDBC_` / `PIPE_` / `CUR_` codes appear in the error MESSAGE, not
+the exit code. In cluster mode spark-submit reports the YARN application
+state instead — read the `[Outcome] class=... exitCode=...` log line or the
+ledger. Rerunning the same job after a failure is always safe.
 
 Explicit `--run-id` values matter: scenario 7 replays one by id. Use
 `--deploy-mode client` for the first attempt if executor connectivity is
@@ -577,6 +585,26 @@ at a fresh table, clear the watermark row for the entity, and load the two
 rows in section 6 of the seed script. They share `GRP700` but differ by
 section — expect **two** curated rows. A single-column or prefix-only match
 would collapse them into one.
+
+### 9. Source reconciliation finds nothing to report
+
+Both feeds enable `reconcile { }`, so after any scenario:
+
+```bash
+scripts/run_smartiq.sh e2e INCR --stage reconcile
+```
+
+Expected after scenario 5: `source_keys_present_in_curated` **passes** —
+every non-null source key (F001–F005) has a curated row. The null-key row
+from scenario 4 is deliberately excluded from the comparison (it is
+accounted for in `ingest_rejects`, and can never have a curated row), and
+the in-batch duplicate F004 counts as one key, not one missing row.
+`source_curated_cardinality` records both raw counts but never alarms on a
+keyed feed — RAW-vs-curated row counts legitimately differ in both
+directions here. `curated_keys_absent_from_source` reports `0` unless you
+have deleted seed rows at source; delete one and re-run to see it counted
+(informational — the evidence that source deletes occur, which is what the
+production feed's `deletes.mode = IGNORE` assumption needs watched).
 
 ## Troubleshooting
 
@@ -781,8 +809,10 @@ The connection stays encrypted but can no longer detect a
 man-in-the-middle, so the service-account credential is exposed to anyone
 able to intercept it. The framework refuses the downgrade without
 `allow_insecure_tls` and logs `INSECURE TLS override approved` on every
-run. `feed-smartiq-pdp-e2e.conf` carries both lines commented out. Do not
-promote them to production.
+run. **Both shipped feeds currently carry these lines ACTIVE** as the
+stopgap documented in pre-flight step 5 — so this error should not occur
+until the stopgap is removed. When the CA import lands, delete both lines
+from each feed; if you then see this error, the import missed a host.
 
 Do **not** reach for `encrypt = "false"`: it removes encryption entirely
 rather than just the certificate check, and many servers refuse the

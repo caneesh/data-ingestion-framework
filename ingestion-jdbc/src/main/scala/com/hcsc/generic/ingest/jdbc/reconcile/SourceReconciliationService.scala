@@ -92,16 +92,28 @@ final class SourceReconciliationService(
     val checks = scala.collection.mutable.ArrayBuffer.empty[ReconcileCheck]
 
     // ---- Tier 1: cardinality -------------------------------------------------
+    // STRICT ONLY FOR KEYLESS FEEDS. With business keys, curated is
+    // legitimately SHORTER than the source's raw row count: in-batch
+    // duplicates collapse to one row per key, and null-key / rule-rejected
+    // rows are quarantined by design. Asserting curated >= source there
+    // manufactures a false alarm out of normal operation (the e2e seed data
+    // trips it on its FIRST scenario). For keyed feeds Tier 2 is the alarm
+    // and this becomes the recorded trend; for keyless append-only feeds a
+    // short curated really does mean loss, so the assertion stays.
+    val keys = mergeKeys(curatedConf, contract)
     val sourceCount = countSource(cfg)
     val curatedCount = curated.count()
     sourceCount.foreach { sc =>
       logger.info(s"[Reconcile] cardinality source=$sc curated=$curatedCount")
-      checks += ReconcileCheck("source_curated_cardinality", s">=$sc", curatedCount.toString,
-        curatedCount >= sc)
+      if (keys.isEmpty)
+        checks += ReconcileCheck("source_curated_cardinality", s">=$sc", curatedCount.toString,
+          curatedCount >= sc)
+      else
+        checks += ReconcileCheck("source_curated_cardinality",
+          s"source=$sc", s"curated=$curatedCount", passed = true)
     }
 
     // ---- Tier 2: key sets ----------------------------------------------------
-    val keys = mergeKeys(curatedConf, contract)
     if (keys.isEmpty)
       logger.warn("[Reconcile] no business keys (curated.merge.keys or a contract business_key); " +
         "Tier 2 key comparison skipped — cardinality alone cannot identify WHICH rows differ")
@@ -155,7 +167,18 @@ final class SourceReconciliationService(
       val src = sourceColumnFor(k, contract)
       s"${cfg.dialect.quoteIdentifier(src)} AS ${cfg.dialect.quoteIdentifier(k)}"
     }.mkString(", ")
-    val sql = s"(SELECT $projection FROM $base${QueryBuilder.filterWhereClause(cfg)}) src_keys"
+    // NULL/blank keys are excluded at the SOURCE: the curated merge
+    // quarantines them by design (CUR_001), so they can never have a curated
+    // row and would otherwise be reported as data loss on every run. They
+    // are accounted for in ingest_rejects, not here.
+    val notNull = keys.map { k =>
+      val q = cfg.dialect.quoteIdentifier(sourceColumnFor(k, contract))
+      s"$q IS NOT NULL"
+    }.mkString(" AND ")
+    val baseWhere = QueryBuilder.filterWhereClause(cfg)
+    val keyWhere =
+      if (baseWhere.isEmpty) s" WHERE $notNull" else s"$baseWhere AND ($notNull)"
+    val sql = s"(SELECT $projection FROM $base$keyWhere) src_keys"
 
     var reader = spark.read.format("jdbc")
       .option("url", cfg.url).option("driver", cfg.driver)

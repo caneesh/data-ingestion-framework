@@ -825,6 +825,29 @@ deliberate: "the feed is stale" and "I could not tell" must not share an
 alert, or a Hive outage pages the feed team. Tune the hours to the feed's
 SLA; it must exceed the longest legitimate gap between successful loads.
 
+#### Site naming (production Control-M)
+
+The production scheduler names one folder per process:
+`TIDLAK_MBRSHP_<PROJECT>_<FUNCTION>_PROCESS|EVENT[_ODP]`, filtered by
+Application `TIS_Datalake` / Sub Application `MEMBERSHIP` — set both on
+every folder or it will not appear in the team's Planning view. The
+ingestion-vs-audit split above therefore lives in calendars, alert
+destinations and the shared quantitative resource, not in folder nesting:
+
+| Job | Folder |
+|---|---|
+| load | `TIDLAK_MBRSHP_ORDCAP_SMARTIQ_PDP_INCR_DLY_LOAD_PROCESS` |
+| reconcile | `TIDLAK_MBRSHP_ORDCAP_SMARTIQ_PDP_RECON_PROCESS` |
+| retention | `TIDLAK_MBRSHP_ORDCAP_SMARTIQ_PDP_PURGE_PROCESS` (site precedent: `..._WORKEVENT_PURGE_PROCESS`) |
+| freshness | `TIDLAK_MBRSHP_ORDCAP_SMARTIQ_INGESTION_MONITORING_PROCESS` (site precedent: `..._CIDM_INGESTION_MONITORING_PROCESS`) |
+
+`ORDCAP` is an inferred short code for the order-capture project — confirm
+the registered token with the scheduling team before creating folders. The
+`– PRD_CTM` seen in the Planning list is the server annotation, not part of
+the name. A scheduled FULL reload is, by site convention, its own
+`..._FULL_LOAD_PROCESS` folder rather than a parameter change to the daily
+one.
+
 #### Keeping the folders apart
 
 No hard dependency is REQUIRED — the entity lock is authoritative. But a

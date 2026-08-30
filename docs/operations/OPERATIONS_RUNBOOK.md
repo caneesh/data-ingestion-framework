@@ -740,3 +740,102 @@ Exit codes for Control-M: 0 = success, including a clean "nothing pending"
 no-op; non-zero = failure. Failed curated batches stay PENDING, so
 re-running the same job after a failure resumes exactly where it stopped —
 both jobs are safe to rerun unconditionally.
+
+### Control-M folder design: INGESTION vs AUDIT
+
+Two SMART folders, split by what the jobs are FOR rather than what they
+touch. The framework's entity lock serializes any accidental overlap, so
+the folders need no cross-dependencies — only calendars that keep them out
+of each other's way on purpose.
+
+**Run scheduled jobs in CLIENT mode** (`SMARTIQ_DEPLOY_MODE=client` in the
+env file, `INGEST_DRIVER_MEMORY=4g` for the wide feed — the driver now
+builds its plan on the agent host). The classified exit codes below only
+propagate in client mode; in cluster mode spark-submit reports YARN
+application state and every failure reads as 1.
+
+#### Folder 1 — `SMARTIQ_PDP_INGESTION` (the SLA path)
+
+| Job | Command | Schedule |
+|---|---|---|
+| `SMARTIQ_PDP_INGEST` | `run_smartiq.sh prod INCR --resume --run-id pdp_%%ORDERID` | the source's rhythm |
+
+Two deliberate choices in that command line:
+
+- **`--run-id pdp_%%ORDERID`** ties every ledger, RAW and reject row to
+  the exact scheduler execution.
+- **`--resume` always on.** First attempt: no-op (nothing to skip).
+  Control-M rerun (same order id, same run id): skips completed stages and
+  continues from the failure. Without it, a rerun with the same run id
+  hits the RAW idempotency guard and produces the confusing
+  `raw_equals_accepted` mismatch documented above. One command line,
+  correct in both cases.
+
+Folder-level ON rules — this is where the exit codes earn their keep:
+
+| Exit | Action |
+|---|---|
+| 0 | OK |
+| 10 (transient) | rerun, up to 3 times, 10–15 min interval |
+| 20 (data integrity) | **no rerun** — retrying reproduces it exactly; page on-call |
+| 30 (configuration) | **no rerun** — something must be edited; notify the feed owner |
+| 1 (unclassified) | no rerun, notify — unknown is not transient |
+
+Never add a rerun on 20: that is the retry-a-data-failure-forever
+anti-pattern the classification exists to prevent. YARN blind retries are
+already off (`spark.yarn.maxAppAttempts=1` in the wrapper); Control-M is
+the only retry authority. A job Control-M kills leaves a lock whose
+heartbeat died with it — the lease self-clears within ~`lease_minutes`,
+and an immediate rerun that hits PIPE_001 exits 10, which the retry rule
+absorbs.
+
+#### Folder 2 — `SMARTIQ_PDP_AUDIT` (detection and governance, own calendar)
+
+| Job | Command | Schedule | Needs SQL credential? |
+|---|---|---|---|
+| `SMARTIQ_PDP_RECONCILE` | `run_smartiq.sh prod INCR --stage reconcile` | nightly, off-peak | **yes** (queries the source) |
+| `SMARTIQ_PDP_RETENTION` | `run_smartiq.sh prod INCR --stage retention` | weekly, quiet window | no — Hive only |
+| `SMARTIQ_PDP_FRESHNESS` | ledger staleness query (below) | cyclic, every 4h | no — Hive only |
+
+The credential asymmetry is worth preserving in the folder design: only
+the ingestion folder and the reconcile job carry `SMARTIQ_DB_PASSWORD`.
+Retention and freshness run with no database credential at all — smaller
+blast radius, simpler variable management.
+
+Failure routing differs from Folder 1 by intent: these jobs DETECT, they
+do not deliver. Reconcile under the default `on_mismatch = "REPORT"` exits
+0 even with findings (they alert through the notification webhook and land
+in `ingest_reconciliation`); a red nightly comparison job gets silenced
+rather than read. Retention failing with PIPE_001 is the ownership guard
+working, not a regression — it purged nothing; treat as exit 10 and rerun
+in a quiet window.
+
+The freshness job closes the one gap no framework job can: **a run that
+never happens writes nothing** — no ledger row, no alert. It must live
+outside the pipeline:
+
+```bash
+beeline -u "$HIVE_JDBC" --silent=true -e "
+  SELECT CASE WHEN MAX(event_ts) < current_timestamp() - INTERVAL 26 HOURS
+              THEN 1 ELSE 0 END
+  FROM membership_common_raw.ingest_run_audit
+  WHERE entity='smartiq_pdp' AND stage='curated' AND status='SUCCESS'" \
+  | grep -q 1 && exit 1 || exit 0
+```
+
+Exit 1 → alert. Tune the interval to the feed's SLA; it must exceed the
+longest legitimate gap between successful loads.
+
+#### Keeping the folders apart
+
+No hard dependency is REQUIRED — the entity lock is authoritative. But a
+reconcile retrying through a load window is noise, so either separate the
+calendars (ingest per source rhythm; reconcile 02:00; retention Sunday
+03:00; freshness cyclic) or, if schedules may drift together, add a
+Control-M quantitative resource (e.g. `SMARTIQ_PDP_ENTITY`, quantity 1)
+held by every job in both folders. That is a courtesy mutex at the
+scheduler layer; the framework lock remains the real one.
+
+If the feed later becomes DECOUPLED, only Folder 1 changes shape: it gains
+the `run_raw.sh` / `run_curated_pending.sh` pair described above, and the
+audit folder is untouched.

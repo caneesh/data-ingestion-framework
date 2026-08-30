@@ -355,6 +355,47 @@ Then simply:
 ./scripts/run_smartiq.sh prod INCR --run-id pdp-$(date +%H%M%S)
 ```
 
+### Site layout (office network)
+
+The datalake convention separates scripts, binaries and parameters; the
+framework's artifacts map onto it like this (domain spelled `memership`
+exactly as the directories exist):
+
+```
+/datalakebin/prod/gold/integration/
+├── src/scripts/memership/smartiq_pdp/     # ALL launcher scripts, together
+│     run_smartiq.sh  run_ingest.sh  ingest_submit_common.sh
+│     check_freshness.sh  sync_artifacts.sh
+├── bin/memership/smartiq_pdp/             # binaries
+│     ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar
+│     mssql-jdbc-12.4.2.jre11.jar
+└── bin/memership/params/smartiq_pdp/      # parameters (config, env, secret)
+      feed-smartiq-pdp.conf
+      smartiq-pdp-schema.conf              # beside the feed — include'd by name
+      smartiq.env                          # chmod 600
+      smartiq.pwd                          # chmod 400 — the unattended password
+      override-smartiq-pdp.conf            # only while an override is in effect
+```
+
+Because `smartiq.env` lives in the params directory rather than beside the
+scripts, every scheduled invocation sets `SMARTIQ_ENV_FILE`:
+
+```bash
+export SMARTIQ_ENV_FILE=/datalakebin/prod/gold/integration/bin/memership/params/smartiq_pdp/smartiq.env
+```
+
+and inside that env file the three paths point back into the layout:
+
+```bash
+SMARTIQ_CONF_DIR=/datalakebin/prod/gold/integration/bin/memership/params/smartiq_pdp
+SMARTIQ_JAR=/datalakebin/prod/gold/integration/bin/memership/smartiq_pdp/ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar
+SMARTIQ_JDBC_DRIVER=/datalakebin/prod/gold/integration/bin/memership/smartiq_pdp/mssql-jdbc-12.4.2.jre11.jar
+```
+
+The scripts directory must hold the launchers **together** — `run_smartiq.sh`
+delegates to `run_ingest.sh`, which sources `ingest_submit_common.sh`, and
+refuses to start when a sibling is missing.
+
 ### Deploying to a server that is not a git checkout
 
 The runtime server commonly receives an EXPORTED copy rather than a clone,

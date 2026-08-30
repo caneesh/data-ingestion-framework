@@ -795,7 +795,7 @@ absorbs.
 |---|---|---|---|
 | `SMARTIQ_PDP_RECONCILE` | `run_smartiq.sh prod INCR --stage reconcile` | nightly, off-peak | **yes** (queries the source) |
 | `SMARTIQ_PDP_RETENTION` | `run_smartiq.sh prod INCR --stage retention` | weekly, quiet window | no — Hive only |
-| `SMARTIQ_PDP_FRESHNESS` | ledger staleness query (below) | cyclic, every 4h | no — Hive only |
+| `SMARTIQ_PDP_FRESHNESS` | `check_freshness.sh smartiq_pdp 26` | cyclic, every 4h | no — Hive only |
 
 The credential asymmetry is worth preserving in the folder design: only
 the ingestion folder and the reconcile job carry `SMARTIQ_DB_PASSWORD`.
@@ -815,16 +815,15 @@ never happens writes nothing** — no ledger row, no alert. It must live
 outside the pipeline:
 
 ```bash
-beeline -u "$HIVE_JDBC" --silent=true -e "
-  SELECT CASE WHEN MAX(event_ts) < current_timestamp() - INTERVAL 26 HOURS
-              THEN 1 ELSE 0 END
-  FROM membership_common_raw.ingest_run_audit
-  WHERE entity='smartiq_pdp' AND stage='curated' AND status='SUCCESS'" \
-  | grep -q 1 && exit 1 || exit 0
+INGEST_HIVE_JDBC="jdbc:hive2://<host>:10000/default" \
+  scripts/check_freshness.sh smartiq_pdp 26
 ```
 
-Exit 1 → alert. Tune the interval to the feed's SLA; it must exceed the
-longest legitimate gap between successful loads.
+Exit 0 fresh, **1 stale** (alert — including the never-succeeded case),
+**2 the check itself broke** (Hive unreachable). The 1-vs-2 split is
+deliberate: "the feed is stale" and "I could not tell" must not share an
+alert, or a Hive outage pages the feed team. Tune the hours to the feed's
+SLA; it must exceed the longest legitimate gap between successful loads.
 
 #### Keeping the folders apart
 

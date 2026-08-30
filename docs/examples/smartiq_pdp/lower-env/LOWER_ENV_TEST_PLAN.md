@@ -47,16 +47,16 @@ whose schema does not match the table, which surfaces later as
 `DROP TABLE` on an EXTERNAL table does **not** remove the files:
 
 ```sql
-DESCRIBE FORMATTED membership_common_raw.smartiq_pdp_e2e;      -- note Location
-DESCRIBE FORMATTED membership_common_curated.smartiq_pdp_e2e;  -- note Location
+DESCRIBE FORMATTED membership_common_raw.order_capture_smartiq_pdp_e2e;      -- note Location
+DESCRIBE FORMATTED membership_common_curated.order_capture_pdp_forms_e2e;  -- note Location
 ```
 ```bash
 hdfs dfs -rm -r -skipTrash <raw Location>
 hdfs dfs -rm -r -skipTrash <curated Location>
 ```
 ```sql
-DROP TABLE IF EXISTS membership_common_raw.smartiq_pdp_e2e;
-DROP TABLE IF EXISTS membership_common_curated.smartiq_pdp_e2e;
+DROP TABLE IF EXISTS membership_common_raw.order_capture_smartiq_pdp_e2e;
+DROP TABLE IF EXISTS membership_common_curated.order_capture_pdp_forms_e2e;
 ```
 
 Safe here because this is lower-environment test data. For an EXTERNAL
@@ -139,7 +139,7 @@ for an `INCR` run, `'F'` for `FULL`, derived from the mode so the two cannot
 drift. Query it directly rather than joining the ledger:
 
 ```sql
-SELECT file_type, COUNT(*) FROM membership_common_raw.smartiq_pdp_e2e
+SELECT file_type, COUNT(*) FROM membership_common_raw.order_capture_smartiq_pdp_e2e
  GROUP BY file_type;
 ```
 
@@ -220,8 +220,8 @@ production contract, not a variant of it**.
 The entity is `smartiq_pdp_e2e`, distinct from `smartiq_pdp`. Because the
 framework keys watermarks, ledger history and entity locks by entity name,
 this feed gets its own of each automatically. Tables are
-`membership_common_raw.smartiq_pdp_e2e` and
-`membership_common_curated.smartiq_pdp_e2e` — nothing is shared with
+`membership_common_raw.order_capture_smartiq_pdp_e2e` and
+`membership_common_curated.order_capture_pdp_forms_e2e` — nothing is shared with
 production except the databases themselves.
 
 ## Setup
@@ -525,18 +525,18 @@ idempotency test, not a fault.
 
 ```sql
 -- counts per scenario
-SELECT COUNT(*) FROM membership_common_raw.smartiq_pdp_e2e;
-SELECT COUNT(*) FROM membership_common_curated.smartiq_pdp_e2e;
+SELECT COUNT(*) FROM membership_common_raw.order_capture_smartiq_pdp_e2e;
+SELECT COUNT(*) FROM membership_common_curated.order_capture_pdp_forms_e2e;
 
 -- 1: in-batch dedup kept the newer F004, empty strings became NULL
 SELECT file_name, ai_size_contract_count, funding_type,
        ai_groupand_ba_numbers_section_number
-  FROM membership_common_curated.smartiq_pdp_e2e WHERE file_name IN ('F004.pdf','F003.pdf');
+  FROM membership_common_curated.order_capture_pdp_forms_e2e WHERE file_name IN ('F004.pdf','F003.pdf');
 -- expect F004 -> 75 ; F003 section/mds columns NULL (not '')
 
 -- 3: version advanced, business content and audit stamp untouched
 SELECT file_name, last_modified_datetime, ai_size_contract_count, last_modified_op
-  FROM membership_common_curated.smartiq_pdp_e2e WHERE file_name = 'F002.pdf';
+  FROM membership_common_curated.order_capture_pdp_forms_e2e WHERE file_name = 'F002.pdf';
 -- expect 2026-03-03 12:00:00 , content unchanged , op still 'I'
 
 -- NOTE: the control tables live in membership_common_raw because that is
@@ -704,8 +704,8 @@ so it writes exactly the columns the table declares.
 Clean recovery — note the LOCATION *before* dropping, then remove the files:
 
 ```sql
-DESCRIBE FORMATTED membership_common_curated.smartiq_pdp_e2e;   -- note Location
-DESCRIBE FORMATTED membership_common_raw.smartiq_pdp_e2e;
+DESCRIBE FORMATTED membership_common_curated.order_capture_pdp_forms_e2e;   -- note Location
+DESCRIBE FORMATTED membership_common_raw.order_capture_smartiq_pdp_e2e;
 ```
 
 ```bash
@@ -714,8 +714,8 @@ hdfs dfs -rm -r -skipTrash <raw Location>
 ```
 
 ```sql
-DROP TABLE IF EXISTS membership_common_curated.smartiq_pdp_e2e;
-DROP TABLE IF EXISTS membership_common_raw.smartiq_pdp_e2e;
+DROP TABLE IF EXISTS membership_common_curated.order_capture_pdp_forms_e2e;
+DROP TABLE IF EXISTS membership_common_raw.order_capture_smartiq_pdp_e2e;
 ```
 
 Then re-create from the DDLs **with `${LOCATION}` substituted**, or let the
@@ -729,7 +729,7 @@ Because these are EXTERNAL tables over a lower-environment path, deleting
 the files is safe here. Never run the `hdfs dfs -rm -r` step against a path
 holding data you need — for an EXTERNAL table it is the only copy.
 
-**`[PATH_NOT_FOUND] Path does not exist: hdfs://.../${LOCATION}/smartiq_pdp_e2e`**
+**`[PATH_NOT_FOUND] Path does not exist: hdfs://.../${LOCATION}/order_capture_smartiq_pdp_e2e`**
 
 The `${LOCATION}` placeholder in the DDL was never substituted, so the
 EXTERNAL table was created pointing at a directory *literally named*
@@ -739,7 +739,7 @@ create the table happily, and the failure surfaces only at the first read.
 Confirm it:
 
 ```sql
-DESCRIBE FORMATTED membership_common_raw.smartiq_pdp_e2e;
+DESCRIBE FORMATTED membership_common_raw.order_capture_smartiq_pdp_e2e;
 -- the Location row must contain no '$'
 ```
 
@@ -753,8 +753,8 @@ table created over it inherits a schema that may not match (see the
 column-count entry below):
 
 ```sql
-DROP TABLE membership_common_raw.smartiq_pdp_e2e;
-DROP TABLE membership_common_curated.smartiq_pdp_e2e;
+DROP TABLE membership_common_raw.order_capture_smartiq_pdp_e2e;
+DROP TABLE membership_common_curated.order_capture_pdp_forms_e2e;
 ```
 
 Pre-creating is optional; it only validates that your DDL and the framework
@@ -763,9 +763,9 @@ agree. Dropping avoids the placeholder question entirely.
 **Or repoint the existing tables:**
 
 ```sql
-ALTER TABLE membership_common_raw.smartiq_pdp_e2e
+ALTER TABLE membership_common_raw.order_capture_smartiq_pdp_e2e
   SET LOCATION 'hdfs://TSTODPHA/user/<you>/smartiq_e2e/raw/smartiq_pdp_e2e';
-ALTER TABLE membership_common_curated.smartiq_pdp_e2e
+ALTER TABLE membership_common_curated.order_capture_pdp_forms_e2e
   SET LOCATION 'hdfs://TSTODPHA/user/<you>/smartiq_e2e/curated/smartiq_pdp_e2e';
 ```
 

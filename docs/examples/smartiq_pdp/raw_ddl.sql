@@ -39,7 +39,7 @@
 -- Hive ACID tables without the Hive Warehouse Connector. Dropping the
 -- EXTERNAL keyword here would break the pipeline, not just change
 -- ownership semantics.
-CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_raw.smartiq_pdp (
+CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_raw.order_capture_smartiq_pdp (
   `file_name` STRING COMMENT 'src: FileName',
   `form_guid` STRING COMMENT 'src: FormGuid',
   `form` STRING COMMENT 'src: Form',
@@ -423,4 +423,4 @@ CREATE EXTERNAL TABLE IF NOT EXISTS membership_common_raw.smartiq_pdp (
 )
 PARTITIONED BY (`ingest_dt` STRING)
 STORED AS ORC
-LOCATION '${LOCATION}/smartiq_pdp';
+LOCATION '${LOCATION}/order_capture_smartiq_pdp';

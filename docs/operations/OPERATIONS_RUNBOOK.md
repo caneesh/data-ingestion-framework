@@ -836,17 +836,16 @@ destinations and the shared quantitative resource, not in folder nesting:
 
 | Job | Folder |
 |---|---|
-| load | `TIDLAK_MBRSHP_ORDCAP_SMARTIQ_PDP_INCR_DLY_LOAD_PROCESS` |
-| reconcile | `TIDLAK_MBRSHP_ORDCAP_SMARTIQ_PDP_RECON_PROCESS` |
-| retention | `TIDLAK_MBRSHP_ORDCAP_SMARTIQ_PDP_PURGE_PROCESS` (site precedent: `..._WORKEVENT_PURGE_PROCESS`) |
-| freshness | `TIDLAK_MBRSHP_ORDCAP_SMARTIQ_INGESTION_MONITORING_PROCESS` (site precedent: `..._CIDM_INGESTION_MONITORING_PROCESS`) |
+| load | `TIDLAK_MBRSHP_ORDER_CAPTURE_SMARTIQ_PDP_INCR_LOAD_PROCESS` |
+| reconcile | `TIDLAK_MBRSHP_ORDER_CAPTURE_SMARTIQ_PDP_RECON_PROCESS` |
+| retention | `TIDLAK_MBRSHP_ORDER_CAPTURE_SMARTIQ_PDP_PURGE_PROCESS` (site precedent: `..._WORKEVENT_PURGE_PROCESS`) |
+| freshness | `TIDLAK_MBRSHP_ORDER_CAPTURE_SMARTIQ_INGESTION_MONITORING_PROCESS` (site precedent: `..._CIDM_INGESTION_MONITORING_PROCESS`) |
 
-`ORDCAP` is an inferred short code for the order-capture project — confirm
-the registered token with the scheduling team before creating folders. The
-`– PRD_CTM` seen in the Planning list is the server annotation, not part of
-the name. A scheduled FULL reload is, by site convention, its own
-`..._FULL_LOAD_PROCESS` folder rather than a parameter change to the daily
-one.
+Decided 2026-08-30: project token `ORDER_CAPTURE`, no `_ODP` variants for
+this feed, no `DLY` segment. The `– PRD_CTM` seen in the Planning list is
+the server annotation, not part of the name. A scheduled FULL reload is,
+by site convention, its own `..._FULL_LOAD_PROCESS` folder rather than a
+parameter change to the incremental one.
 
 #### Keeping the folders apart
 

@@ -355,7 +355,7 @@ Then simply:
 ./scripts/run_smartiq.sh prod INCR --run-id pdp-$(date +%H%M%S)
 ```
 
-### Site layout (office network)
+### Site layout
 
 The datalake convention separates scripts, binaries and parameters; the
 framework's artifacts map onto it like this (domain spelled `memership`

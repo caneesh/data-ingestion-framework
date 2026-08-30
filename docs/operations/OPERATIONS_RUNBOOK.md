@@ -860,3 +860,83 @@ scheduler layer; the framework lock remains the real one.
 If the feed later becomes DECOUPLED, only Folder 1 changes shape: it gains
 the `run_raw.sh` / `run_curated_pending.sh` pair described above, and the
 audit folder is untouched.
+
+#### Creation walkthrough (for the scheduling team)
+
+Site paths per [DEPLOYMENT.md](DEPLOYMENT.md) — abbreviated below as
+`$SCRIPTS` = `/datalakebin/prod/gold/integration/src/scripts/memership/smartiq_pdp`
+and `$PARAMS` = `/datalakebin/prod/gold/integration/bin/memership/params/smartiq_pdp`.
+
+**Phase 0 — agent host, before touching Control-M**
+
+1. The agent must run where `spark-submit` and `beeline` work (edge node).
+2. Artifacts deployed per the site layout: all launcher scripts together in
+   `$SCRIPTS`; jar + JDBC driver in `bin/`; feed, schema, `smartiq.env`
+   (600) in `$PARAMS`.
+3. `smartiq.env` sets `SMARTIQ_DEPLOY_MODE=client` (exit codes 10/20/30
+   only propagate in client mode) and `INGEST_DRIVER_MEMORY=4g` (the
+   364-column plan builds on this host now).
+4. **Password without a TTY** — the launcher prompts interactively; a
+   scheduled job cannot. Create `$PARAMS/smartiq.pwd`, `chmod 400`, owned
+   by the run-as account; jobs read it into the environment (value never
+   appears in the command text or sysout). Long-term: switch the feed to
+   the `cyberark` provider and delete the file.
+5. Smoke test as the run-as account before defining any job:
+
+   ```bash
+   sudo -u <svc> env SMARTIQ_ENV_FILE=$PARAMS/smartiq.env \
+     $SCRIPTS/run_smartiq.sh prod INCR --validate-only
+   ```
+
+   Green here proves kerberos, HDFS, metastore, SQL Server reachability
+   and config — with Control-M not yet in the picture.
+
+**Phase 1 — job commands (Run As = the smoke-test account)**
+
+Load (`..._INCR_LOAD_PROCESS`):
+
+```bash
+export SMARTIQ_ENV_FILE=$PARAMS/smartiq.env; export SMARTIQ_DB_PASSWORD="$(cat $PARAMS/smartiq.pwd)"; $SCRIPTS/run_smartiq.sh prod INCR --resume --run-id pdp_%%ORDERID
+```
+
+Reconcile (`..._RECON_PROCESS`): same two exports, then
+`$SCRIPTS/run_smartiq.sh prod INCR --stage reconcile`.
+
+Retention (`..._PURGE_PROCESS`) — env-file export only, **no password**:
+`$SCRIPTS/run_smartiq.sh prod INCR --stage retention`.
+
+Freshness (`..._INGESTION_MONITORING_PROCESS`) — no env file, no password:
+
+```bash
+export INGEST_HIVE_JDBC="jdbc:hive2://<host>:10000/default"; $SCRIPTS/check_freshness.sh smartiq_pdp 26
+```
+
+ON/DO rules per the tables above. Set Application `TIS_Datalake` /
+Sub Application `MEMBERSHIP` on every folder.
+
+**Phase 2 — verification, in order, before enabling the calendars**
+
+1. **Order the load job manually.** In sysout: the `[Build]` line (right
+   jar) and `[Jdbc] url=` (right database); exit 0. In Hive, the run id
+   proves the `%%ORDERID` plumbing:
+
+   ```sql
+   SELECT run_id, stage, status FROM membership_common_raw.ingest_run_audit
+   WHERE run_id = 'pdp_<that orderid>';
+   ```
+
+2. **Rerun the same order.** Sysout shows
+   `Stage ... already SUCCESS ... skipping (resume)` — the rerun path
+   works without tripping the RAW idempotency guard.
+3. **Order reconcile manually.** Rows land in `ingest_reconciliation`
+   with the three source-vs-curated check names.
+4. **Fire the freshness alarm once**: run the job with threshold `1`
+   instead of `26` — it must exit 1 and reach the stale-alert
+   destination. Restore `26`.
+5. **Test a classified failure** cheaply: temporarily move `smartiq.pwd`
+   aside → the load job exits 30 (JDBC_002 → CONFIGURATION) → confirm the
+   feed-owner notification fires and **no rerun happens**. Restore the
+   file.
+
+Step 5 is the one to insist on: it is the only proof the ON/DO routing
+works before a real 2am failure exercises it for the first time.

@@ -834,18 +834,24 @@ every folder or it will not appear in the team's Planning view. The
 ingestion-vs-audit split above therefore lives in calendars, alert
 destinations and the shared quantitative resource, not in folder nesting:
 
-| Job | Folder |
+| Folder | Jobs inside |
 |---|---|
-| load | `TIDLAK_MBRSHP_ORDER_CAPTURE_SMARTIQ_PDP_INCR_LOAD_PROCESS` |
-| reconcile | `TIDLAK_MBRSHP_ORDER_CAPTURE_SMARTIQ_PDP_RECON_PROCESS` |
-| retention | `TIDLAK_MBRSHP_ORDER_CAPTURE_SMARTIQ_PDP_PURGE_PROCESS` (site precedent: `..._WORKEVENT_PURGE_PROCESS`) |
-| freshness | `TIDLAK_MBRSHP_ORDER_CAPTURE_SMARTIQ_INGESTION_MONITORING_PROCESS` (site precedent: `..._CIDM_INGESTION_MONITORING_PROCESS`) |
+| `TIDLAK_MBRSHP_ORDER_CAPTURE_SMARTIQ_INGEST_PROCESS` | `SMARTIQ_PDP_INCR_LOAD` |
+| `TIDLAK_MBRSHP_ORDER_CAPTURE_SMARTIQ_AUDIT_PROCESS` | `SMARTIQ_PDP_RECON`, `SMARTIQ_PDP_PURGE`, `SMARTIQ_INGESTION_MONITORING` |
 
-Decided 2026-08-30: project token `ORDER_CAPTURE`, no `_ODP` variants for
-this feed, no `DLY` segment. The `– PRD_CTM` seen in the Planning list is
-the server annotation, not part of the name. A scheduled FULL reload is,
-by site convention, its own `..._FULL_LOAD_PROCESS` folder rather than a
-parameter change to the incremental one.
+Each job carries its own scheduling criteria (daily load; 02:00
+reconcile; Sunday purge; cyclic monitor), so one audit folder holds all
+three without interference. The function names previously agreed per
+process survive as JOB names. Site precedents for the vocabulary:
+`..._WORKEVENT_PURGE_PROCESS`, `..._CIDM_INGESTION_MONITORING_PROCESS`.
+
+Decided 2026-08-30: project token `ORDER_CAPTURE`, no `_ODP` variants, no
+`DLY` segment; consolidated to TWO folders (ingest / audit) rather than
+one per process — the folder groups by purpose and shares notification
+destinations, the jobs carry the calendars. The `– PRD_CTM` seen in the
+Planning list is the server annotation, not part of the name. A scheduled
+FULL reload would be its own `..._FULL_LOAD_PROCESS` folder rather than a
+parameter change to the incremental job.
 
 #### Keeping the folders apart
 
@@ -955,12 +961,12 @@ site-correct in the sibling; building blank means guessing each one. Edit
 four things (name, command, schedule, ON/DO) and inherit the rest.
 
 **1. Workspace.** Planning → Open Workspace against the same server as
-the siblings. Duplicate the template into the four folder names from the
-Site-naming table above. Confirm each folder carries Application
-`TIS_Datalake` / Sub Application `MEMBERSHIP` (else it is invisible in
-the team's filtered view). The monitoring name is exactly 64 characters —
-if the form rejects it, the agreed fallback is dropping `INGESTION_`
-(`..._SMARTIQ_MONITORING_PROCESS`); record the deviation.
+the siblings. Duplicate the template into the TWO folder names from the
+Site-naming table above; the load job lives in the ingest folder, the
+three audit jobs (job names from the same table) in the audit folder,
+each with its own scheduling criteria. Confirm each folder carries
+Application `TIS_Datalake` / Sub Application `MEMBERSHIP` (else it is
+invisible in the team's filtered view).
 
 **2. The load job.** Run As = the smoke-test service account; Host Group
 = the edge node holding the artifacts (inherited); Command = walkthrough

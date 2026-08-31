@@ -72,9 +72,11 @@ ALTER TABLE membership_common_curated.smartiq_pdp
   RENAME TO membership_common_curated.order_capture_pdp_forms;
 
 -- ----------------------------------------------------------------------------
--- CONSUMER BRIDGE: existing queries against the old curated name keep
--- working through a view. Announce a deprecation date, then drop it —
--- an alias kept forever is a second name to maintain, which is the drift
+-- CONSUMER BRIDGE — ONLY if consumers in THIS environment query the old
+-- curated name. Test has none: SKIP this section there, so test mirrors
+-- prod (which is created under the new names and never has the view).
+-- Where it is created: announce a deprecation date, then drop it — an
+-- alias kept forever is a second name to maintain, which is the drift
 -- this rename exists to remove.
 -- ----------------------------------------------------------------------------
 CREATE VIEW membership_common_curated.smartiq_pdp AS

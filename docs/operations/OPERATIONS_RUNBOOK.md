@@ -940,3 +940,53 @@ Sub Application `MEMBERSHIP` on every folder.
 
 Step 5 is the one to insist on: it is the only proof the ON/DO routing
 works before a real 2am failure exercises it for the first time.
+
+#### Client build guide (Control-M 9.21 web)
+
+The click-path that gets the walkthrough above into the Planning client.
+Pane labels drift between Control-M versions — the VALUES are what matter,
+and step 0 shows where your version puts each field.
+
+**0. Steal, don't build.** Open an existing sibling folder
+(`TIDLAK_MBRSHP_MID_INCR_DLY_EXTRACT_PROCESS` is the same shape as the
+load job) and DUPLICATE it. The fields that break silently — Host Group,
+Run As conventions, order method, notification destinations — are already
+site-correct in the sibling; building blank means guessing each one. Edit
+four things (name, command, schedule, ON/DO) and inherit the rest.
+
+**1. Workspace.** Planning → Open Workspace against the same server as
+the siblings. Duplicate the template into the four folder names from the
+Site-naming table above. Confirm each folder carries Application
+`TIS_Datalake` / Sub Application `MEMBERSHIP` (else it is invisible in
+the team's filtered view). The monitoring name is exactly 64 characters —
+if the form rejects it, the agreed fallback is dropping `INGESTION_`
+(`..._SMARTIQ_MONITORING_PROCESS`); record the deviation.
+
+**2. The load job.** Run As = the smoke-test service account; Host Group
+= the edge node holding the artifacts (inherited); Command = walkthrough
+Phase 1, verbatim, one line. Actions pane: DELETE the template's
+inherited ON/DO rules, then:
+
+| On | Do |
+|---|---|
+| Completion Status EQ 10 | Rerun (job Rerun settings: max 3, every 15 min) — the ONLY rerun path |
+| Completion Status EQ 20 | Notify on-call |
+| Completion Status EQ 30 | Notify feed owner |
+| Ended Not OK (catch-all) | Notify |
+
+Verify no template-inherited "auto-rerun on failure" survives — it would
+rerun exit 20.
+
+**3. The audit jobs.** Commands verbatim from Phase 1; purge and
+monitoring carry NO password export (do not "harmonize" them with the
+load command). Monitoring is cyclic, every 240 min, 24/7, with EQ 1 →
+feed destination and EQ 2 → platform destination — different
+destinations, or a Hive outage pages the feed team.
+
+**4. Mutex.** Quantitative resource `SMARTIQ_PDP_ENTITY`, quantity 1;
+added under Prerequisites on load, reconcile and purge (not monitoring —
+it only reads).
+
+**5. Check in, verify, then enable calendars.** Run Phase 2 above, all
+five steps in order, ordering each job manually and reading sysout in
+Monitoring. Calendars go live only after step 5 passes.

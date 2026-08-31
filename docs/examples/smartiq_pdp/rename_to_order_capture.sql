@@ -17,11 +17,47 @@
 -- them. Table names are config only (raw.table / curated.table). Control
 -- tables, databases and HDFS paths are untouched.
 --
--- RUN THIS while no run is in flight (check the Control-M jobs are idle;
--- the entity lock does not guard DDL). These are EXTERNAL tables, so
--- RENAME is metadata-only and every partition and file stays in place —
--- the LOCATION keeps its old directory name, which is harmless. Fresh
--- deployments use the updated raw_ddl.sql / curated_ddl.sql instead.
+-- These are EXTERNAL tables, so RENAME is metadata-only and SYMMETRIC:
+-- every partition and file stays in place, the LOCATION keeps its old
+-- directory name (harmless cosmetic drift — do NOT move data during this
+-- window), and rollback is the reverse ALTER. Fresh deployments use the
+-- updated raw_ddl.sql / curated_ddl.sql instead of this file.
+--
+-- DEPLOYMENT PROCEDURE
+--
+-- Phase A — prepare (before the window)
+--   1. Stage the updated feed configs (commit 7e107ba or later) on the
+--      edge node — NOT into $SMARTIQ_CONF_DIR yet. No jar rebuild: this
+--      change is config-only; a new jar just adds an unrelated variable.
+--   2. Announce to consumers: curated becomes order_capture_pdp_forms,
+--      old name served by a view until <deprecation date> — pick it now.
+--   3. Pick a window with no run in flight; hold the Control-M folders.
+--
+-- Phase B — rehearse in the lower environment
+--   Run the E2E section below, deploy the e2e configs, then prove it:
+--     run_smartiq.sh e2e INCR --run-id rename-check-1   (no-op is fine)
+--     run_smartiq.sh e2e INCR --stage reconcile
+--   Reconcile is the deliberate proof: it REQUIRES the curated table
+--   (CFG_022) and compares keys — a half-worked rename cannot pass it.
+--   An empty INCR alone does not prove the curated name resolves.
+--
+-- Phase C — production window
+--   1. Confirm idle: last ledger row terminal, no YARN app, jobs held.
+--   2. Record SHOW CREATE TABLE for both old tables (rollback reference).
+--   3. Run the PRODUCTION section below (two ALTERs + the bridge view).
+--   4. Deploy the staged configs to $SMARTIQ_CONF_DIR — SAME window; a
+--      config naming a table that does not exist fails its next run.
+--   5. Verify (queries at the bottom of this file), then the real proof:
+--        run_smartiq.sh prod INCR --stage reconcile
+--   6. Release the Control-M holds.
+--
+-- Phase D — after
+--   Watch the next scheduled load; on the deprecation date, confirm no
+--   consumer still hits the view, then run the DROP VIEW below.
+--
+-- ROLLBACK (any point before consumers migrate): reverse the ALTERs,
+-- drop the view, restore the previous configs. Metadata-only both ways —
+-- no data is at risk in this procedure.
 -- ============================================================================
 
 ALTER TABLE membership_common_raw.smartiq_pdp

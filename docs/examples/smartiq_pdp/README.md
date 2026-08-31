@@ -8,7 +8,7 @@ one-to-one:
 | `params/` — feed, schema, override example | `<base>/params/membership/smartiq_pdp/` |
 | `ddl/` — table DDLs + the one-time rename migration | run once via beeline; not deployed |
 | `lower-env/params/`, `lower-env/ddl/` | the e2e twin of the above |
-| `CONTROL_PLANE_ONBOARDING.md`, `PROD_PROMOTION.md` | procedures, not artifacts |
+| `CONTROL_PLANE_ONBOARDING.md`, `PROD_PROMOTION.md`, `QA_TEST_CASES.md` | procedures, not artifacts |
 
 **Scripts are deliberately NOT here.** The launchers live in `/scripts`
 at the repo root and deploy to `<base>/src/scripts/membership/smartiq_pdp/`,

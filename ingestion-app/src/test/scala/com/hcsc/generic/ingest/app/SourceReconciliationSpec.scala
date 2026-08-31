@@ -206,6 +206,18 @@ class SourceReconciliationSpec extends AnyFunSuite with BeforeAndAfterAll {
         r("source_keys_present_in_curated").toString)
   }
 
+  test("BLANK-key source rows are treated like null keys — quarantined, not lost") {
+    // The asymmetry the review caught: the source SQL excludes NULL keys,
+    // but the curated merge quarantines BLANK keys too
+    // (treat_blank_as_null). A blank-keyed row passing IS NOT NULL would
+    // read as permanent data loss.
+    h2("INSERT INTO forms VALUES ('   ', 950, '2026-03-03 09:00:00')")
+    val r = checks()
+    assert(r("source_keys_present_in_curated")._3,
+      s"a blank key can no more reach curated than a null one: " +
+        r("source_keys_present_in_curated").toString)
+  }
+
   test("in-batch duplicate keys at source do not read as drift") {
     // Two source rows, one key: curated keeps one (dedup). Key-based
     // comparison must see one key present, not one row missing.

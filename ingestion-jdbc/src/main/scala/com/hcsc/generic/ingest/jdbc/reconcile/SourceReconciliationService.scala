@@ -167,10 +167,10 @@ final class SourceReconciliationService(
       val src = sourceColumnFor(k, contract)
       s"${cfg.dialect.quoteIdentifier(src)} AS ${cfg.dialect.quoteIdentifier(k)}"
     }.mkString(", ")
-    // NULL/blank keys are excluded at the SOURCE: the curated merge
-    // quarantines them by design (CUR_001), so they can never have a curated
-    // row and would otherwise be reported as data loss on every run. They
-    // are accounted for in ingest_rejects, not here.
+    // NULL keys are excluded in the source SQL (saves transfer); BLANK
+    // keys are excluded Spark-side after load — see keyedOnly below. Both
+    // are quarantined by the curated merge (CUR_001) and accounted for in
+    // ingest_rejects, never here.
     val notNull = keys.map { k =>
       val q = cfg.dialect.quoteIdentifier(sourceColumnFor(k, contract))
       s"$q IS NOT NULL"
@@ -187,15 +187,28 @@ final class SourceReconciliationService(
     cfg.password.foreach(p => reader = reader.option("password", p))
     cfg.connectionProperties.foreach { case (k, v) => reader = reader.option(k, v) }
 
-    val sourceKeys = reader.load().distinct().persist()
+    // BLANK keys are excluded Spark-side (portable across dialects; SQL
+    // above already excluded NULLs to save transfer). The curated merge
+    // treats blank business keys as null (treat_blank_as_null defaults
+    // true) and quarantines them, so a blank-keyed source row can no more
+    // have a curated row than a null-keyed one — without this filter it
+    // reads as data loss on every run. The same filter applies to the
+    // CURATED side: a feed running null_handling ALLOW retains keyless
+    // passthrough rows, which must not pollute the absent-from-source count.
+    import org.apache.spark.sql.functions.{col, trim => sqlTrim}
+    def keyedOnly(df: DataFrame): DataFrame =
+      keys.foldLeft(df)((acc, k) =>
+        acc.filter(col(k).isNotNull && sqlTrim(col(k).cast("string")) =!= ""))
+
+    val sourceKeys = keyedOnly(reader.load()).distinct().persist()
     // Curated keys are matched case-insensitively to the canonical names, as
     // everywhere else in the framework.
-    val curatedKeys = curated.select(keys.map { k =>
+    val curatedKeys = keyedOnly(curated.select(keys.map { k =>
       val actual = curated.columns.find(_.equalsIgnoreCase(k)).getOrElse(
         throw new IllegalStateException(
           s"CFG_022 business key '$k' is not a column of $curatedTable"))
       org.apache.spark.sql.functions.col(actual).as(k)
-    }: _*).distinct().persist()
+    }: _*)).distinct().persist()
 
     try {
       val missing = sourceKeys.join(curatedKeys, keys, "left_anti").count()

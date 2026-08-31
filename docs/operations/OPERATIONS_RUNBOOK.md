@@ -834,24 +834,35 @@ every folder or it will not appear in the team's Planning view. The
 ingestion-vs-audit split above therefore lives in calendars, alert
 destinations and the shared quantitative resource, not in folder nesting:
 
-| Folder | Jobs inside |
-|---|---|
-| `TIDLAK_MBRSHP_ORDER_CAPTURE_SMARTIQ_INGEST_PROCESS` | `SMARTIQ_PDP_INCR_LOAD` |
-| `TIDLAK_MBRSHP_ORDER_CAPTURE_SMARTIQ_AUDIT_PROCESS` | `SMARTIQ_PDP_RECON`, `SMARTIQ_PDP_PURGE`, `SMARTIQ_INGESTION_MONITORING` |
+| Folder | Job | Command (Phase 1 below, verbatim) |
+|---|---|---|
+| `TIDLAK_MBRSHP_ORDER_CAPTURE_INGEST_PROCESS` | `ORDER_CAPTURE_PDP_INCR_LOAD` | `run_smartiq.sh prod INCR --resume --run-id pdp_%%ORDERID` |
+| `TIDLAK_MBRSHP_ORDER_CAPTURE_AUDIT_PROCESS` | `ORDER_CAPTURE_PDP_RECON` | `run_smartiq.sh prod INCR --stage reconcile` |
+| | `ORDER_CAPTURE_PDP_PURGE` | `run_smartiq.sh prod INCR --stage retention` (no password) |
+| | `ORDER_CAPTURE_PDP_MONITORING` | `check_freshness.sh smartiq_pdp 26` |
 
 Each job carries its own scheduling criteria (daily load; 02:00
 reconcile; Sunday purge; cyclic monitor), so one audit folder holds all
-three without interference. The function names previously agreed per
-process survive as JOB names. Site precedents for the vocabulary:
-`..._WORKEVENT_PURGE_PROCESS`, `..._CIDM_INGESTION_MONITORING_PROCESS`.
+three without interference. Jobs keep the `ORDER_CAPTURE_` prefix because
+alerts and Monitoring views often show the job name without its folder.
+
+**Scheduler names say ORDER_CAPTURE; the machinery says smartiq** —
+deliberately, the same plumbing-vs-business split as the curated table
+rename. The scripts (`run_smartiq.sh`), entity (`smartiq_pdp`) and params
+(`smartiq.env`) are deployed artifacts and do NOT rename. The bridge from
+name to command is (1) the job's own Command field, (2) each job's
+Description field — populate it at build time:
+`Script: $SCRIPTS/run_smartiq.sh | Params: $PARAMS | see OPERATIONS_RUNBOOK "Control-M folder design"`
+— and (3) the table above.
 
 Decided 2026-08-30: project token `ORDER_CAPTURE`, no `_ODP` variants, no
-`DLY` segment; consolidated to TWO folders (ingest / audit) rather than
-one per process — the folder groups by purpose and shares notification
-destinations, the jobs carry the calendars. The `– PRD_CTM` seen in the
-Planning list is the server annotation, not part of the name. A scheduled
-FULL reload would be its own `..._FULL_LOAD_PROCESS` folder rather than a
-parameter change to the incremental job.
+`DLY` segment; consolidated to TWO folders (ingest / audit) — the folder
+groups by purpose and shares notification destinations, the jobs carry
+the calendars; SMARTIQ removed from scheduler-facing names (it remains in
+scripts, entity and params, which are plumbing). The `– PRD_CTM` seen in
+the Planning list is the server annotation, not part of the name. A
+scheduled FULL reload would be its own `..._FULL_LOAD_PROCESS` folder
+rather than a parameter change to the incremental job.
 
 #### Keeping the folders apart
 

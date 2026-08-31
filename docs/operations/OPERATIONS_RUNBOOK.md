@@ -860,7 +860,7 @@ the text is self-sufficient for whoever reads it off an alert):
 
 > SmartIQ PDP incremental load (entity smartiq_pdp): SQL Server -> raw
 > order_capture_smartiq_pdp -> curated order_capture_pdp_forms. Script:
-> /datalakebin/prod/gold/integration/src/scripts/memership/smartiq_pdp/run_smartiq.sh;
+> /datalakebin/prod/gold/integration/src/scripts/membership/smartiq_pdp/run_smartiq.sh;
 > params+password: .../params/membership/smartiq_pdp. Exit 10=transient
 > (auto-rerun x3), 20=data integrity (page on-call, NEVER rerun),
 > 30=config (notify feed owner). See OPERATIONS_RUNBOOK.md "Control-M
@@ -871,7 +871,7 @@ the text is self-sufficient for whoever reads it off an alert):
 > Source-vs-curated key reconciliation for entity smartiq_pdp (--stage
 > reconcile), nightly. REPORT mode: findings alert via webhook and land in
 > ingest_reconciliation — a FAILED JOB means the check broke, not the
-> data. Script: .../src/scripts/memership/smartiq_pdp/run_smartiq.sh;
+> data. Script: .../src/scripts/membership/smartiq_pdp/run_smartiq.sh;
 > params+password: .../params/membership/smartiq_pdp. See
 > OPERATIONS_RUNBOOK.md "source_keys_present_in_curated".
 
@@ -881,7 +881,7 @@ the text is self-sufficient for whoever reads it off an alert):
 > partitions, reject/audit rows, watermark history per the feed's
 > retention block. Hive-only — NO SQL credential. PIPE_001 = ownership
 > guard fired, nothing was purged; rerun in a quiet window (treat as exit
-> 10). Script: .../src/scripts/memership/smartiq_pdp/run_smartiq.sh; env:
+> 10). Script: .../src/scripts/membership/smartiq_pdp/run_smartiq.sh; env:
 > .../params/smartiq_pdp/smartiq.env.
 
 `ORDER_CAPTURE_PDP_MONITORING`:
@@ -891,7 +891,7 @@ the text is self-sufficient for whoever reads it off an alert):
 > first — a run that never happened writes nothing, so this is the only
 > detector). Exit 2 = the CHECK broke (Hive unreachable) — platform, not
 > feed. Script:
-> /datalakebin/prod/gold/integration/src/scripts/memership/smartiq_pdp/check_freshness.sh.
+> /datalakebin/prod/gold/integration/src/scripts/membership/smartiq_pdp/check_freshness.sh.
 
 Decided 2026-08-30: project token `ORDER_CAPTURE`, no `_ODP` variants, no
 `DLY` segment; consolidated to TWO folders (ingest / audit) — the folder
@@ -919,7 +919,7 @@ audit folder is untouched.
 #### Creation walkthrough (for the scheduling team)
 
 Site paths per [DEPLOYMENT.md](DEPLOYMENT.md) — abbreviated below as
-`$SCRIPTS` = `/datalakebin/prod/gold/integration/src/scripts/memership/smartiq_pdp`
+`$SCRIPTS` = `/datalakebin/prod/gold/integration/src/scripts/membership/smartiq_pdp`
 and `$PARAMS` = `/datalakebin/prod/gold/integration/params/membership/smartiq_pdp`.
 
 **Phase 0 — agent host, before touching Control-M**

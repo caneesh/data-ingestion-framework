@@ -358,15 +358,15 @@ Then simply:
 ### Site layout
 
 The datalake convention separates scripts, binaries and parameters; the
-framework's artifacts map onto it like this (domain spelled `memership`
+framework's artifacts map onto it like this (domain spelled `membership`
 exactly as the directories exist):
 
 ```
 /datalakebin/prod/gold/integration/
-├── src/scripts/memership/smartiq_pdp/     # ALL launcher scripts, together
+├── src/scripts/membership/smartiq_pdp/     # ALL launcher scripts, together
 │     run_smartiq.sh  run_ingest.sh  ingest_submit_common.sh
 │     check_freshness.sh  sync_artifacts.sh
-├── bin/memership/smartiq_pdp/             # binaries
+├── bin/membership/smartiq_pdp/             # binaries
 │     ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar
 │     mssql-jdbc-12.4.2.jre11.jar
 └── params/membership/smartiq_pdp/      # parameters (config, env, secret)
@@ -388,8 +388,8 @@ and inside that env file the three paths point back into the layout:
 
 ```bash
 SMARTIQ_CONF_DIR=/datalakebin/prod/gold/integration/params/membership/smartiq_pdp
-SMARTIQ_JAR=/datalakebin/prod/gold/integration/bin/memership/smartiq_pdp/ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar
-SMARTIQ_JDBC_DRIVER=/datalakebin/prod/gold/integration/bin/memership/smartiq_pdp/mssql-jdbc-12.4.2.jre11.jar
+SMARTIQ_JAR=/datalakebin/prod/gold/integration/bin/membership/smartiq_pdp/ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar
+SMARTIQ_JDBC_DRIVER=/datalakebin/prod/gold/integration/bin/membership/smartiq_pdp/mssql-jdbc-12.4.2.jre11.jar
 ```
 
 The scripts directory must hold the launchers **together** — `run_smartiq.sh`

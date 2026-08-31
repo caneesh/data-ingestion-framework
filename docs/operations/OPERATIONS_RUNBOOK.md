@@ -440,19 +440,70 @@ Because the store is advance-only on the *automatic* path but `record()` is
 unconditional, `record()` is the only supported way to move a watermark
 **backwards** for a deliberate replay.
 
-### 2.3 Replay from an older watermark
+### 2.3 Rewind: load again from an earlier point
 
-To reprocess a window that was already committed:
+**First ask: is the data already in RAW?** If yes, do not touch the
+watermark — replay from RAW instead (zero source re-extraction):
 
-1. Identify the older `watermark_value` you want to replay from (query §2.1).
-2. Use the manual repair path (§2.2) to append that older value as the new
-   current position.
-3. Re-run the feed in `INCR` mode. The bounded read re-extracts from the
-   re-anchored lower edge up to the freshly captured upper. RAW is
-   at-least-once and the curated merge deduplicates, so replay is safe.
+```bash
+run_smartiq.sh prod INCR --stage curated --replay-from 2026-08-15 --replay-to 2026-08-20
+# or one batch:   --stage curated --run-id <that run's id>
+```
 
-Prefer this over editing history rows directly — the append keeps the audit
-trail intact and respects the version counter.
+Rewind the watermark only when the SOURCE must be re-read (data fixed
+upstream, or RAW lost the window).
+
+The store is append-only BY DESIGN — versioning is the answer to Hive's
+lack of ACID. A rewind is therefore an APPEND of a new highest version
+carrying the older value; nothing is ever updated, and history keeps
+every position the feed has held.
+
+1. **Find the target point and the current version** (§2.1):
+
+   ```sql
+   SELECT watermark_value, watermark_version, run_id, updated_ts
+   FROM   <db>.ingest_watermarks
+   WHERE  entity = '<entity>'
+   ORDER  BY watermark_version DESC LIMIT 10;
+   ```
+
+2. **Append the rewind row** — new version = current max + 1, the OLDER
+   value you want to load from, while **no run is in flight** (a run
+   mid-commit could race the version number):
+
+   ```sql
+   INSERT INTO <db>.ingest_watermarks
+     (entity, watermark_value, run_id, watermark_version, lower_value,
+      query_hash, updated_ts)
+   VALUES
+     ('<entity>', '<older value>', 'manual-rewind-<ticket>',
+      <max_version + 1>, NULL, NULL, current_timestamp());
+   ```
+
+   The value must be TYPE-VALID for the configured `watermark_type`
+   (copy the format from an existing row) or the next run fails with
+   JDBC_004. The ticket in `run_id` is what makes the ledger trail
+   explain itself later.
+
+3. **Run INCR normally.** The bounded read re-extracts from the rewound
+   point to a freshly captured upper.
+
+4. **Expect the continuity check — pre-empt it.** The next run's
+   `watermark_continuity` fails CORRECTLY (its window does not start
+   where the previous run ended; the failure message explains the reset
+   case). Use the override file for exactly one run, then delete it:
+
+   ```hocon
+   feeds.<entity>.audit.reconciliation.on_mismatch = "WARN"
+   ```
+
+5. **The replay is safe by construction**: re-extracted rows re-append
+   into RAW (at-least-once, documented duplicates) and the curated merge
+   absorbs them — unchanged content ignored via `record_hash`, changed
+   content merged by freshness. Nothing regresses.
+
+The `record()` API in §2.2 performs the same unconditional append from
+code; the INSERT above is the operator-executable form of it.
 
 ### 2.4 JDBC_005 conflict recovery
 

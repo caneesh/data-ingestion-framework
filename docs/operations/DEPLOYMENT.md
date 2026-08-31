@@ -369,7 +369,7 @@ exactly as the directories exist):
 ├── bin/memership/smartiq_pdp/             # binaries
 │     ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar
 │     mssql-jdbc-12.4.2.jre11.jar
-└── bin/memership/params/smartiq_pdp/      # parameters (config, env, secret)
+└── params/membership/smartiq_pdp/      # parameters (config, env, secret)
       feed-smartiq-pdp.conf
       smartiq-pdp-schema.conf              # beside the feed — include'd by name
       smartiq.env                          # chmod 600
@@ -381,13 +381,13 @@ Because `smartiq.env` lives in the params directory rather than beside the
 scripts, every scheduled invocation sets `SMARTIQ_ENV_FILE`:
 
 ```bash
-export SMARTIQ_ENV_FILE=/datalakebin/prod/gold/integration/bin/memership/params/smartiq_pdp/smartiq.env
+export SMARTIQ_ENV_FILE=/datalakebin/prod/gold/integration/params/membership/smartiq_pdp/smartiq.env
 ```
 
 and inside that env file the three paths point back into the layout:
 
 ```bash
-SMARTIQ_CONF_DIR=/datalakebin/prod/gold/integration/bin/memership/params/smartiq_pdp
+SMARTIQ_CONF_DIR=/datalakebin/prod/gold/integration/params/membership/smartiq_pdp
 SMARTIQ_JAR=/datalakebin/prod/gold/integration/bin/memership/smartiq_pdp/ingestion-app-1.0.0-SNAPSHOT-jar-with-dependencies.jar
 SMARTIQ_JDBC_DRIVER=/datalakebin/prod/gold/integration/bin/memership/smartiq_pdp/mssql-jdbc-12.4.2.jre11.jar
 ```

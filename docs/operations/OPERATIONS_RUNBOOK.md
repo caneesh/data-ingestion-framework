@@ -861,7 +861,7 @@ the text is self-sufficient for whoever reads it off an alert):
 > SmartIQ PDP incremental load (entity smartiq_pdp): SQL Server -> raw
 > order_capture_smartiq_pdp -> curated order_capture_pdp_forms. Script:
 > /datalakebin/prod/gold/integration/src/scripts/memership/smartiq_pdp/run_smartiq.sh;
-> params+password: .../bin/memership/params/smartiq_pdp. Exit 10=transient
+> params+password: .../params/membership/smartiq_pdp. Exit 10=transient
 > (auto-rerun x3), 20=data integrity (page on-call, NEVER rerun),
 > 30=config (notify feed owner). See OPERATIONS_RUNBOOK.md "Control-M
 > folder design".
@@ -872,7 +872,7 @@ the text is self-sufficient for whoever reads it off an alert):
 > reconcile), nightly. REPORT mode: findings alert via webhook and land in
 > ingest_reconciliation — a FAILED JOB means the check broke, not the
 > data. Script: .../src/scripts/memership/smartiq_pdp/run_smartiq.sh;
-> params+password: .../bin/memership/params/smartiq_pdp. See
+> params+password: .../params/membership/smartiq_pdp. See
 > OPERATIONS_RUNBOOK.md "source_keys_present_in_curated".
 
 `ORDER_CAPTURE_PDP_PURGE`:
@@ -920,7 +920,7 @@ audit folder is untouched.
 
 Site paths per [DEPLOYMENT.md](DEPLOYMENT.md) — abbreviated below as
 `$SCRIPTS` = `/datalakebin/prod/gold/integration/src/scripts/memership/smartiq_pdp`
-and `$PARAMS` = `/datalakebin/prod/gold/integration/bin/memership/params/smartiq_pdp`.
+and `$PARAMS` = `/datalakebin/prod/gold/integration/params/membership/smartiq_pdp`.
 
 **Phase 0 — agent host, before touching Control-M**
 

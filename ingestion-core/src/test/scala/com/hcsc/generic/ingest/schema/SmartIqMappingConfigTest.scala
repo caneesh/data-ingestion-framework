@@ -11,7 +11,7 @@ import org.scalatest.funsuite.AnyFunSuite
   * against the framework. Skipped when the docs tree is absent. */
 class SmartIqMappingConfigTest extends AnyFunSuite {
 
-  private val feedFile = new java.io.File("../docs/examples/smartiq_pdp/feed-smartiq-pdp.conf")
+  private val feedFile = new java.io.File("../docs/examples/smartiq_pdp/params/feed-smartiq-pdp.conf")
 
   test("the generated SmartIQ_PDP feed parses and passes compatibility validation") {
     assume(feedFile.exists(), s"docs tree not present at ${feedFile.getAbsolutePath}")
@@ -62,7 +62,7 @@ class SmartIqMappingConfigTest extends AnyFunSuite {
     // DDL parity — the real "all columns" guarantee: every contract column
     // must exist in BOTH physical tables.
     def ddlColumns(name: String): Set[String] = {
-      val f = new java.io.File(s"../docs/examples/smartiq_pdp/$name")
+      val f = new java.io.File(s"../docs/examples/smartiq_pdp/ddl/$name")
       assume(f.exists(), s"missing $name")
       val src = scala.io.Source.fromFile(f)
       try src.getLines().flatMap(l => "^\\s*`([^`]+)`".r.findFirstMatchIn(l).map(_.group(1)))
@@ -81,7 +81,7 @@ class SmartIqMappingConfigTest extends AnyFunSuite {
     // smartiq_pdp leaves the pre-created table unused and the framework
     // silently creating its own.
     def ddlTable(name: String): String = {
-      val f = new java.io.File(s"../docs/examples/smartiq_pdp/$name")
+      val f = new java.io.File(s"../docs/examples/smartiq_pdp/ddl/$name")
       val src = scala.io.Source.fromFile(f)
       try src.getLines()
         .flatMap("(?i)CREATE\\s+EXTERNAL\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\S+)\\s*\\(".r
@@ -103,7 +103,7 @@ class SmartIqMappingConfigTest extends AnyFunSuite {
     assert(curatedDdl.contains("record_hash"))
     // Latest-per-key curated must not be partitioned (CUR_006 + churn).
     val curatedSrc = scala.io.Source.fromFile(
-      new java.io.File("../docs/examples/smartiq_pdp/curated_ddl.sql"))
+      new java.io.File("../docs/examples/smartiq_pdp/ddl/curated_ddl.sql"))
     val curatedStmt = try curatedSrc.getLines()
       .filterNot(_.trim.startsWith("--")) // comments explain the removal
       .mkString("\n") finally curatedSrc.close()
@@ -113,7 +113,7 @@ class SmartIqMappingConfigTest extends AnyFunSuite {
 
   test("lower-env E2E feed is a faithful subset of the production contract") {
     val e2eFile = new java.io.File(
-      "../docs/examples/smartiq_pdp/lower-env/feed-smartiq-pdp-e2e.conf")
+      "../docs/examples/smartiq_pdp/lower-env/params/feed-smartiq-pdp-e2e.conf")
     assume(e2eFile.exists() && feedFile.exists(), "docs tree not present")
     val e2e = ConfigFactory.parseFile(e2eFile).resolve().getConfig("feeds.smartiq_pdp_e2e")
     val prod = ConfigFactory.parseFile(feedFile).resolve().getConfig("feeds.smartiq_pdp")
@@ -149,7 +149,7 @@ class SmartIqMappingConfigTest extends AnyFunSuite {
 
     def ddlCols(name: String): Set[String] = {
       val src = scala.io.Source.fromFile(
-        new java.io.File(s"../docs/examples/smartiq_pdp/lower-env/$name"))
+        new java.io.File(s"../docs/examples/smartiq_pdp/lower-env/ddl/$name"))
       try src.getLines().flatMap("^\\s*`([^`]+)`".r.findFirstMatchIn(_).map(_.group(1))).toSet
       finally src.close()
     }

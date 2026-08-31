@@ -42,11 +42,11 @@ trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/scripts"
 
 EX="$REPO/docs/examples/smartiq_pdp"
-cp "$EX/feed-smartiq-pdp.conf" "$EX/smartiq-pdp-schema.conf" \
-   "$EX/raw_ddl.sql" "$EX/curated_ddl.sql" \
-   "$EX/lower-env/feed-smartiq-pdp-e2e.conf" "$EX/lower-env/smartiq-pdp-e2e-schema.conf" \
-   "$EX/lower-env/raw_ddl_e2e.sql" "$EX/lower-env/curated_ddl_e2e.sql" \
-   "$EX/lower-env/source_test_data.sql" "$EX/lower-env/LOWER_ENV_TEST_PLAN.md" \
+cp "$EX/params/feed-smartiq-pdp.conf" "$EX/params/smartiq-pdp-schema.conf" \
+   "$EX/ddl/raw_ddl.sql" "$EX/ddl/curated_ddl.sql" \
+   "$EX/lower-env/params/feed-smartiq-pdp-e2e.conf" "$EX/lower-env/params/smartiq-pdp-e2e-schema.conf" \
+   "$EX/lower-env/ddl/raw_ddl_e2e.sql" "$EX/lower-env/ddl/curated_ddl_e2e.sql" \
+   "$EX/lower-env/ddl/source_test_data.sql" "$EX/lower-env/LOWER_ENV_TEST_PLAN.md" \
    "$REPO/ddl/ingest_audit.sql" "$STAGE/"
 cp "$SCRIPT_DIR"/ingest_submit_common.sh "$SCRIPT_DIR"/run_ingest.sh \
    "$SCRIPT_DIR"/run_raw.sh "$SCRIPT_DIR"/run_curated_pending.sh \

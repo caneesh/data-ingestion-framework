@@ -87,10 +87,10 @@ if [[ -n "$BUNDLE" ]]; then
 else
   EX="$REPO/docs/examples/smartiq_pdp"
   SOURCES=(
-    "$EX/lower-env/feed-smartiq-pdp-e2e.conf"
-    "$EX/lower-env/smartiq-pdp-e2e-schema.conf"
-    "$EX/feed-smartiq-pdp.conf"
-    "$EX/smartiq-pdp-schema.conf"
+    "$EX/lower-env/params/feed-smartiq-pdp-e2e.conf"
+    "$EX/lower-env/params/smartiq-pdp-e2e-schema.conf"
+    "$EX/params/feed-smartiq-pdp.conf"
+    "$EX/params/smartiq-pdp-schema.conf"
     "${SMARTIQ_JAR_SOURCE:-$REPO/ingestion-app/target/$JAR_NAME}"
   )
   SOURCE_DESC="repo $REPO ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo 'no git'))"

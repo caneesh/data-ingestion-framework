@@ -69,7 +69,7 @@ the same path, which is what causes step 2:
 ```bash
 BASE=hdfs://TSTODPHA/user/$USER/smartiq_e2e
 for f in raw_ddl_e2e curated_ddl_e2e; do
-  sed "s|\${LOCATION}|$BASE|g" $f.sql > $f.run.sql
+  sed "s|\${LOCATION}|$BASE|g" ddl/$f.sql > $f.run.sql
 done
 # then check DESCRIBE FORMATTED shows a Location containing no '$'
 ```
@@ -229,9 +229,9 @@ production except the databases themselves.
 The pre-flight checklist above is the short form of this section plus the
 run command; this is the detail behind each step.
 
-1. **Source:** run section 0 of `source_test_data.sql` against the lower
+1. **Source:** run section 0 of `ddl/source_test_data.sql` against the lower
    SQL Server to create `dbo.SmartIQ_PDP_E2E`.
-2. **Hive:** run `raw_ddl_e2e.sql` and `curated_ddl_e2e.sql`, **substituting
+2. **Hive:** run `ddl/raw_ddl_e2e.sql` and `ddl/curated_ddl_e2e.sql`, **substituting
    `${LOCATION}` first** — Hive may otherwise create the table with the
    placeholder as a literal directory name, which fails only later at the
    first read:
@@ -239,7 +239,7 @@ run command; this is the detail behind each step.
    ```bash
    BASE=hdfs://TSTODPHA/user/$USER/smartiq_e2e
    for f in raw_ddl_e2e curated_ddl_e2e; do
-     sed "s|\${LOCATION}|$BASE|g" $f.sql > $f.run.sql
+     sed "s|\${LOCATION}|$BASE|g" ddl/$f.sql > $f.run.sql
    done
    # then run the .run.sql files, and check DESCRIBE FORMATTED shows no '$'
    ``` Both are **ORC, EXTERNAL** — keep the `EXTERNAL` keyword:

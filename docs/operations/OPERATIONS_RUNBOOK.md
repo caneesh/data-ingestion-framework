@@ -255,7 +255,7 @@ ORDER  BY event_ts DESC;
 
 Values are never logged or stored — only path names and a digest — because
 an override may carry a credential. Template:
-`docs/examples/smartiq_pdp/override-smartiq-pdp.conf.example`.
+`docs/examples/smartiq_pdp/params/override-smartiq-pdp.conf.example`.
 
 **Delete it once the real change is deployed.** It is unversioned by design.
 

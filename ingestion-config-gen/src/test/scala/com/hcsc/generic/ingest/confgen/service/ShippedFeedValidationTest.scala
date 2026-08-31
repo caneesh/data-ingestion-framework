@@ -40,8 +40,8 @@ class ShippedFeedValidationTest extends AnyFunSuite {
   }
 
   private val shipped = Seq(
-    ("docs/examples/smartiq_pdp/feed-smartiq-pdp.conf", "smartiq_pdp"),
-    ("docs/examples/smartiq_pdp/lower-env/feed-smartiq-pdp-e2e.conf", "smartiq_pdp_e2e"))
+    ("docs/examples/smartiq_pdp/params/feed-smartiq-pdp.conf", "smartiq_pdp"),
+    ("docs/examples/smartiq_pdp/lower-env/params/feed-smartiq-pdp-e2e.conf", "smartiq_pdp_e2e"))
 
   shipped.foreach { case (path, entity) =>
     test(s"shipped feed validates: $entity") {

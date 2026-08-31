@@ -1,4 +1,9 @@
 -- ============================================================================
+-- APPLIES ONLY where tables ALREADY EXIST under the old names (the test
+-- environment). A fresh environment — production promotion — is created
+-- under the new names via raw_ddl.sql / curated_ddl.sql and skips this
+-- file entirely: see PROD_PROMOTION.md.
+--
 -- One-time migration (decided 2026-08-30): rename the SmartIQ_PDP tables.
 --
 --   raw:      smartiq_pdp      -> order_capture_smartiq_pdp

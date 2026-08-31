@@ -851,9 +851,47 @@ deliberately, the same plumbing-vs-business split as the curated table
 rename. The scripts (`run_smartiq.sh`), entity (`smartiq_pdp`) and params
 (`smartiq.env`) are deployed artifacts and do NOT rename. The bridge from
 name to command is (1) the job's own Command field, (2) each job's
-Description field — populate it at build time:
-`Script: $SCRIPTS/run_smartiq.sh | Params: $PARAMS | see OPERATIONS_RUNBOOK "Control-M folder design"`
-— and (3) the table above.
+Description field — copy-paste values below — and (3) the table above.
+
+**Description field values** (paste verbatim; full paths on purpose, so
+the text is self-sufficient for whoever reads it off an alert):
+
+`ORDER_CAPTURE_PDP_INCR_LOAD`:
+
+> SmartIQ PDP incremental load (entity smartiq_pdp): SQL Server -> raw
+> order_capture_smartiq_pdp -> curated order_capture_pdp_forms. Script:
+> /datalakebin/prod/gold/integration/src/scripts/memership/smartiq_pdp/run_smartiq.sh;
+> params+password: .../bin/memership/params/smartiq_pdp. Exit 10=transient
+> (auto-rerun x3), 20=data integrity (page on-call, NEVER rerun),
+> 30=config (notify feed owner). See OPERATIONS_RUNBOOK.md "Control-M
+> folder design".
+
+`ORDER_CAPTURE_PDP_RECON`:
+
+> Source-vs-curated key reconciliation for entity smartiq_pdp (--stage
+> reconcile), nightly. REPORT mode: findings alert via webhook and land in
+> ingest_reconciliation — a FAILED JOB means the check broke, not the
+> data. Script: .../src/scripts/memership/smartiq_pdp/run_smartiq.sh;
+> params+password: .../bin/memership/params/smartiq_pdp. See
+> OPERATIONS_RUNBOOK.md "source_keys_present_in_curated".
+
+`ORDER_CAPTURE_PDP_PURGE`:
+
+> Retention purge for entity smartiq_pdp (--stage retention): raw
+> partitions, reject/audit rows, watermark history per the feed's
+> retention block. Hive-only — NO SQL credential. PIPE_001 = ownership
+> guard fired, nothing was purged; rerun in a quiet window (treat as exit
+> 10). Script: .../src/scripts/memership/smartiq_pdp/run_smartiq.sh; env:
+> .../params/smartiq_pdp/smartiq.env.
+
+`ORDER_CAPTURE_PDP_MONITORING`:
+
+> Ledger freshness for entity smartiq_pdp: alerts when the newest curated
+> SUCCESS is older than 26h. Exit 1 = FEED STALE (check the load job
+> first — a run that never happened writes nothing, so this is the only
+> detector). Exit 2 = the CHECK broke (Hive unreachable) — platform, not
+> feed. Script:
+> /datalakebin/prod/gold/integration/src/scripts/memership/smartiq_pdp/check_freshness.sh.
 
 Decided 2026-08-30: project token `ORDER_CAPTURE`, no `_ODP` variants, no
 `DLY` segment; consolidated to TWO folders (ingest / audit) — the folder

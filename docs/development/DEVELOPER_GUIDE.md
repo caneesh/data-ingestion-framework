@@ -1,8 +1,6 @@
 # Developer Guide
 
 > A styled standalone rendering of this guide is available at
-> [DEVELOPER_GUIDE.html](DEVELOPER_GUIDE.html) (open locally in a browser —
-> GitHub shows it as source). This Markdown file is the source of truth.
 
 A step-by-step guide to using the framework: from source system to curated
 Hive table. You describe a feed in HOCON — where the data lives, what its
@@ -531,5 +529,5 @@ draft files out of git if you chose the `inline` secret provider.
 | [../architecture/ARCHITECTURE.md](../architecture/ARCHITECTURE.md) | Module map, data flow, extension points, enforced invariants |
 | [../operations/DEPLOYMENT.md](../operations/DEPLOYMENT.md) | Assembly, spark-submit, JDBC drivers, secret providers |
 | [../operations/OPERATIONS_RUNBOOK.md](../operations/OPERATIONS_RUNBOOK.md) | Error catalog, watermark/quarantine recovery, restart/resume |
-| [CONFIG_GENERATOR.md](CONFIG_GENERATOR.md) / [RUNNING_CONFIG_GENERATOR.md](RUNNING_CONFIG_GENERATOR.md) | Feed-config wizard |
-| [../operations/SQL_SERVER_AUTH_AUDIT.md](../operations/SQL_SERVER_AUTH_AUDIT.md) | Credential resolution chain, security posture |
+| [CONFIG_GENERATOR.md](CONFIG_GENERATOR.md) / [CONFIG_GENERATOR.md](CONFIG_GENERATOR.md) | Feed-config wizard |
+| [../reports/SQL_SERVER_AUTH_AUDIT.md](../reports/SQL_SERVER_AUTH_AUDIT.md) | Credential resolution chain, security posture |

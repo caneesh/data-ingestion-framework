@@ -16,8 +16,8 @@ The most-used entries:
 - [docs/operations/DEPLOYMENT.md](docs/operations/DEPLOYMENT.md) — build/assembly, spark-submit examples, JDBC driver and secret-provider deployment, Azure SQL notes.
 - [docs/operations/OPERATIONS_RUNBOOK.md](docs/operations/OPERATIONS_RUNBOOK.md) — production support: HDR/JDBC error catalog, watermark and quarantine recovery, restart/resume, stale-state cleanup.
 - [docs/development/CONFIG_GENERATOR.md](docs/development/CONFIG_GENERATOR.md) — interactive wizard that generates and dry-run-validates feed configurations (HOCON/JSON/YAML) for JDBC, file and Kafka sources.
-- [docs/development/RUNNING_CONFIG_GENERATOR.md](docs/development/RUNNING_CONFIG_GENERATOR.md) — step-by-step guide to running the generator: build, interactive/draft/non-interactive modes, using the output with spark-submit, git hygiene, troubleshooting.
-- [docs/operations/SQL_SERVER_AUTH_AUDIT.md](docs/operations/SQL_SERVER_AUTH_AUDIT.md) — evidence-based audit of SQL Server authentication: connection sites, credential resolution chain, CyberArk/Conjur invocation conditions, runtime config precedence, security posture and verification commands.
+- [docs/development/CONFIG_GENERATOR.md](docs/development/CONFIG_GENERATOR.md) — step-by-step guide to running the generator: build, interactive/draft/non-interactive modes, using the output with spark-submit, git hygiene, troubleshooting.
+- [docs/reports/SQL_SERVER_AUTH_AUDIT.md](docs/reports/SQL_SERVER_AUTH_AUDIT.md) — evidence-based audit of SQL Server authentication: connection sites, credential resolution chain, CyberArk/Conjur invocation conditions, runtime config precedence, security posture and verification commands.
 
 ## Architecture
 

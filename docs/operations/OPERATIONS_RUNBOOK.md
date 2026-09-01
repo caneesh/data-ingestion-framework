@@ -1004,22 +1004,34 @@ and `$PARAMS` = `/datalakebin/prod/gold/integration/params/membership/smartiq_pd
 
 **Phase 1 — job commands (Run As = the smoke-test account)**
 
-Load (`..._INCR_LOAD_PROCESS`):
+FULL LITERAL commands, one line each — paste into the Command field
+verbatim. (`$SCRIPTS`/`$PARAMS` above are documentation shorthand only;
+they are NOT defined in the job's shell, so a command containing them
+fails.) `%%ORDERID` is Control-M's substitution and belongs as written;
+`<your-hiveserver2-host>` is the one site value to fill in.
+
+`ORDER_CAPTURE_PDP_INCR_LOAD`:
 
 ```bash
-export SMARTIQ_ENV_FILE=$PARAMS/smartiq.env; export SMARTIQ_DB_PASSWORD="$(cat $PARAMS/smartiq.pwd)"; $SCRIPTS/run_smartiq.sh prod INCR --resume --run-id pdp_%%ORDERID
+export SMARTIQ_ENV_FILE=/datalakebin/prod/gold/integration/params/membership/smartiq_pdp/smartiq.env; export SMARTIQ_DB_PASSWORD="$(cat /datalakebin/prod/gold/integration/params/membership/smartiq_pdp/smartiq.pwd)"; /datalakebin/prod/gold/integration/src/scripts/membership/smartiq_pdp/run_smartiq.sh prod INCR --resume --run-id pdp_%%ORDERID
 ```
 
-Reconcile (`..._RECON_PROCESS`): same two exports, then
-`$SCRIPTS/run_smartiq.sh prod INCR --stage reconcile`.
-
-Retention (`..._PURGE_PROCESS`) — env-file export only, **no password**:
-`$SCRIPTS/run_smartiq.sh prod INCR --stage retention`.
-
-Freshness (`..._INGESTION_MONITORING_PROCESS`) — no env file, no password:
+`ORDER_CAPTURE_PDP_RECON`:
 
 ```bash
-export INGEST_HIVE_JDBC="jdbc:hive2://<host>:10000/default"; $SCRIPTS/check_freshness.sh smartiq_pdp 26
+export SMARTIQ_ENV_FILE=/datalakebin/prod/gold/integration/params/membership/smartiq_pdp/smartiq.env; export SMARTIQ_DB_PASSWORD="$(cat /datalakebin/prod/gold/integration/params/membership/smartiq_pdp/smartiq.pwd)"; /datalakebin/prod/gold/integration/src/scripts/membership/smartiq_pdp/run_smartiq.sh prod INCR --stage reconcile
+```
+
+`ORDER_CAPTURE_PDP_PURGE` — **no password** (Hive only):
+
+```bash
+export SMARTIQ_ENV_FILE=/datalakebin/prod/gold/integration/params/membership/smartiq_pdp/smartiq.env; /datalakebin/prod/gold/integration/src/scripts/membership/smartiq_pdp/run_smartiq.sh prod INCR --stage retention
+```
+
+`ORDER_CAPTURE_PDP_MONITORING` — no env file, no password:
+
+```bash
+export INGEST_HIVE_JDBC="jdbc:hive2://<your-hiveserver2-host>:10000/default"; /datalakebin/prod/gold/integration/src/scripts/membership/smartiq_pdp/check_freshness.sh smartiq_pdp 26
 ```
 
 ON/DO rules per the tables above. Set Application `TIS_Datalake` /

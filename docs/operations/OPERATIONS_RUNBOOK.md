@@ -950,8 +950,13 @@ groups by purpose and shares notification destinations, the jobs carry
 the calendars; SMARTIQ removed from scheduler-facing names (it remains in
 scripts, entity and params, which are plumbing). The `– PRD_CTM` seen in
 the Planning list is the server annotation, not part of the name. A
-scheduled FULL reload would be its own `..._FULL_LOAD_PROCESS` folder
-rather than a parameter change to the incremental job.
+scheduled FULL reload would be its own `..._FULL_LOAD_PROCESS` folder by
+site convention — but for THIS feed, do not create one: `mode=FULL` does
+NOT bypass the watermark (extraction stays window-bounded) while it DOES
+flip the curated publish to full-overwrite, so a mid-life FULL replaces
+curated with just the delta. FULL is manual-only: the initial load, or a
+full reload preceded by the watermark rewind (§2.3) that makes the window
+total again.
 
 #### Keeping the folders apart
 

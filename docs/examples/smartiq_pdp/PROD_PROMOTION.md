@@ -71,6 +71,9 @@ environment they stop being backlog and start being blockers.
 
 ## Phase 3 — First light (manual, before any schedule)
 
+Step-by-step form with verification SQL: OPERATIONS_RUNBOOK.md
+"Initial load (first light)".
+
 In order, each gating the next:
 
 ```bash

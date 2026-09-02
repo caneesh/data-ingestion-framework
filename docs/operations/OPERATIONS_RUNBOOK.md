@@ -391,6 +391,63 @@ Re-running does not help until the cause is fixed: the same window will
 return the same nothing. The watermark did **not** advance, so no data is
 skipped once the cause is resolved.
 
+## Initial load (first light)
+
+The one time `FULL` mode is simply safe: an empty environment, where the
+watermark at `initial_value` makes the incremental window total and the
+full-overwrite publish builds an empty table. Promotion context and gates:
+PROD_PROMOTION.md (Phase 3 is this procedure).
+
+**Preconditions**: artifacts per the site layout; `INGEST_DRIVER_MEMORY=4g`
+(the wide plan builds before any row is read); tables absent OR pre-created
+one way via the DDLs (never both at one path); control-table collision
+check done; Control-M folders HELD — this run is manual, out of schedule.
+
+1. **Preflight**: `run_smartiq.sh prod INCR --validate-only`, then read
+   `[Build]` (the jar you think you deployed) and `[Jdbc] url=` (the host
+   you intend — the silent-fallback trap).
+
+2. **The check that keeps this the safe case**:
+
+   ```sql
+   SELECT watermark_value, watermark_version
+   FROM   membership_common_raw.ingest_watermarks
+   WHERE  entity = 'smartiq_pdp';
+   ```
+
+   **Expect zero rows.** Any row left by an earlier attempt means the
+   window is no longer total, and FULL would replace curated with a
+   delta — that is the mid-life trap; rewind per §2.3 before proceeding.
+   Also record the source truth to verify against:
+   `SELECT COUNT(*) FROM dbo.SmartIQ_PDP` at the source.
+
+3. Optional rehearsal: `--dry-run` (reads and reconciles, writes nothing).
+
+4. **The load**, detached so a dropped terminal cannot kill the driver
+   mid-run (answer the password prompt, then walk away):
+
+   ```bash
+   nohup run_smartiq.sh prod FULL --run-id pdp-initial-$(date +%Y%m%d) > pdp-initial.log 2>&1 &
+   ```
+
+   If it fails partway: rerun the SAME command plus `--resume` —
+   completed stages skip, nothing double-processes.
+
+5. **Verify against step 2's number**: ledger stages all SUCCESS with
+   `raw_count` = the source count; RAW all `file_type='F'` under today's
+   `ingest_dt`; curated = distinct business keys (LESS than RAW is
+   dedup/quarantine, not loss — check `ingest_rejects` for CUR_001);
+   exactly one watermark row at the source's max `LastModifiedDatetime`;
+   every `ingest_reconciliation` check passed.
+
+6. **The proof**: `run_smartiq.sh prod INCR --stage reconcile` — green
+   means every non-null source key has a curated row.
+
+7. **Hand over**: release the Control-M holds. The first scheduled INCR
+   takes the delta (a clean no-op is SUCCESS), continuity passes because
+   its window starts where the initial run ended, and FULL never runs
+   again except via the §2.3 rewind procedure.
+
 ## 2. Watermark operations
 
 Incremental feeds track their position in an **append-only** history table.

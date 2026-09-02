@@ -958,6 +958,37 @@ curated with just the delta. FULL is manual-only: the initial load, or a
 full reload preceded by the watermark rewind (§2.3) that makes the window
 total again.
 
+#### Schedules: what each cadence rests on
+
+| Job | Schedule | Why this cadence |
+|---|---|---|
+| load (`ORDER_CAPTURE_PDP_INCR_LOAD`) | the source's rhythm (e.g. daily 06:00) | a business fact, not a design choice |
+| `ORDER_CAPTURE_PDP_RECON` | nightly 02:00 | issues real queries against SQL Server (COUNT + key-only pull), so off-peak and outside the load window; nightly caps a loss finding's age at one day |
+| `ORDER_CAPTURE_PDP_PURGE` | Sunday 03:00 | retention periods are days-to-years, so daily purging buys nothing; the staged rewrite is the heaviest audit operation and gets the quietest window |
+| `ORDER_CAPTURE_PDP_MONITORING` | cyclic every 4h, 24/7 | a two-second Hive query — frequency is nearly free, and its interval adds directly to detection latency |
+
+**The arithmetic that couples the monitor's two numbers**: worst-case
+time-to-alert = staleness threshold + cycle interval. At 26h + 4h a
+silently stopped feed is flagged within ~30 hours. Tightening the SLA
+means tightening BOTH — a 26h threshold checked daily allows up to 50
+hours of undetected staleness, quietly halving the guarantee.
+
+Tuning rules, so the schedules age well:
+
+- **Recon nightly is right at current volume** (seconds of source load).
+  If growth makes the key pull a DBA concern, weekly is the fallback —
+  trading detection latency on findings that are, by definition, already
+  outside the pipeline's own checks.
+- **Purge frequency follows the retention block**: with periods like
+  `raw = 365d`, weekly vs daily changes disk usage by a rounding error.
+- **Calendar separation from the load window is about noise, not
+  safety** — the entity lock serializes any collision into a clean
+  exit-10 retry, but a recon retrying through a load is an alert people
+  learn to ignore.
+- **Monitoring never pauses.** It is the only job whose purpose is
+  noticing the others did not run; it must not share their calendars or
+  maintenance windows.
+
 #### Keeping the folders apart
 
 No hard dependency is REQUIRED — the entity lock is authoritative. But a

@@ -1,5 +1,9 @@
 # Documentation
 
+**In a hurry: [QUICK_REFERENCE.md](QUICK_REFERENCE.md)** — one page:
+build, run, minimum feed config, debug order, golden rules. It contains
+only stable facts and points here for everything else.
+
 ## Start here — four documents cover almost everything
 
 | Read this | When |

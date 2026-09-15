@@ -11,6 +11,7 @@ only stable facts and points here for everything else.
 | [operations/OPERATIONS_RUNBOOK.md](operations/OPERATIONS_RUNBOOK.md) | **operating**: error catalog, recovery, watermarks, locks, Control-M design and build guide |
 | [operations/DEPLOYMENT.md](operations/DEPLOYMENT.md) | **installing**: build, site layout, spark-submit, secret providers, promotion checklists |
 | [architecture/CONFIGURATION_MODEL.md](architecture/CONFIGURATION_MODEL.md) | **configuring**: the full feed-config surface, every `CFG_*`/`CUR_*` rule, overrides, reconcile |
+| [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md) | **all config options**: flat table of every key, type, and default — the lookup reference |
 | [development/DEVELOPER_GUIDE.md](development/DEVELOPER_GUIDE.md) | **onboarding a feed**: schema contracts, sources, RAW/CURATED, local runs |
 
 Plus the worked example: [examples/smartiq_pdp/](examples/smartiq_pdp/) — a

@@ -1,5 +1,8 @@
 # Configuration Model
 
+> **Looking for a specific option?** See [CONFIG_REFERENCE.md](../CONFIG_REFERENCE.md)
+> for a flat table of every config key, its type, and default value.
+
 One feed = one HOCON block selecting a strategy per pipeline stage. Every
 section is optional except `source` and `raw`; omitted sections keep the
 legacy defaults. Cross-section compatibility is validated at startup by

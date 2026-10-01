@@ -258,6 +258,7 @@ Options under `feeds.<entity>.raw`.
 | `raw.format` | string | `orc` | Storage format (`orc`, `parquet`) |
 | `raw.strategy` | string | — | `APPEND_BATCH`, `SNAPSHOT`, `CDC_EVENTS` |
 | `raw.delivery_mode` | string | — | Delivery mode |
+| `raw.mode` | string | `COPY` | `COPY` writes a framework RAW table; `SOURCE` (hive sources only) uses the source table as the raw layer — nothing is written, the `raw` ledger row is the checkpoint, replay re-reads the source by the run's recorded window. `SOURCE` requires a windowed source (`source.incremental.watermark_columns`); under it `raw.database/table/delivery_mode/idempotency_key/partitioning` and `retention.raw` are rejected (`CFG_028`). See CONFIGURATION_MODEL "Raw layer mode" |
 
 ### Raw Partitioning (`raw.partitioning.*`)
 

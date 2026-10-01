@@ -118,7 +118,9 @@ rather than corrupting data.
 
 1. **Never null a required column (hard guard before RAW write).**
    `IngestPipeline.runRaw` checks that every required contract column is
-   present in the DataFrame before writing RAW; a missing required column
+   present in the DataFrame before writing RAW (under `raw.mode = SOURCE`,
+   where nothing is written, the same guard runs before the `raw` ledger
+   row is recorded); a missing required column
    throws `SchemaContractViolationException` (`ViolationKind.MissingColumn`,
    surfaced as HDR_001). Schema alignment refuses to auto-create a required
    business column as null; optional columns get their configured default;

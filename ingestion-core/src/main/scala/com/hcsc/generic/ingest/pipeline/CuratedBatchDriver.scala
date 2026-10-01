@@ -148,6 +148,17 @@ final class CuratedBatchDriver(
     * table does not carry the column (pre-lineage feeds). */
   private def filterBySourceSystem(batches: Seq[PendingBatch], system: String): Seq[PendingBatch] = {
     val rawConf = feedConf.getConfig("raw")
+    // raw.mode = SOURCE: there is no RAW table to read source_system from,
+    // and every batch of the feed came from its one configured source — the
+    // selector keeps all of them or none.
+    if (ConfigUtils.optString(rawConf, "mode").exists(_.trim.equalsIgnoreCase("SOURCE"))) {
+      val configured = ConfigUtils.optString(feedConf, "source.system")
+      val keep = configured.exists(_.equalsIgnoreCase(system))
+      logger.info(s"[CuratedBatchDriver] raw.mode = SOURCE: --replay-source-system $system " +
+        s"${if (keep) "matches" else "does not match"} source.system ${configured.getOrElse("<absent>")}; " +
+        s"${if (keep) batches.size else 0} batch(es) selected")
+      return if (keep) batches else Seq.empty
+    }
     val fullTable = s"${ConfigUtils.sqlIdentifier(rawConf, "database")}." +
       ConfigUtils.sqlIdentifier(rawConf, "table")
     require(spark.catalog.tableExists(fullTable),

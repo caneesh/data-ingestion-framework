@@ -61,6 +61,15 @@ final class IngestPipeline(
     if (feedConf.hasPath("schema")) conf.withValue("schema", feedConf.getValue("schema"))
     else conf
 
+  /** raw.mode = SOURCE: the (hive) source table IS the raw layer. Nothing is
+    * written to a RAW table; the raw ledger row — with the partition window
+    * it recorded — is the checkpoint, and every replay re-reads the source
+    * for that window. COPY (default, absent) is the unchanged path. */
+  private val sourceAsRaw: Boolean =
+    ConfigUtils.optConfig(feedConf, "raw")
+      .flatMap(r => ConfigUtils.optString(r, "mode"))
+      .exists(_.trim.equalsIgnoreCase("SOURCE"))
+
   def run(): Unit = {
     // Entity-level run lease: acquired BEFORE any extraction, held through
     // the watermark commit — two concurrent runs of one entity would extract
@@ -129,42 +138,24 @@ final class IngestPipeline(
       requireLedger()
       validateFeedCompatibility()
       val rawConf = feedConf.getConfig("raw")
-      val database = ConfigUtils.sqlIdentifier(rawConf, "database")
-      val table = ConfigUtils.sqlIdentifier(rawConf, "table")
-      val fullTable = s"$database.$table"
-      require(spark.catalog.tableExists(fullTable),
-        s"PIPE_003 curated replay requires the RAW table $fullTable to exist")
-
-      val slice = cli.runId match {
-        case Some(rid) =>
-          // The replay publishes whatever the slice holds and stamps the run
-          // SUCCESS — replaying a run whose raw stage never completed would
-          // publish a PARTIAL slice that later --resume trusts as complete.
-          if (audit.enabled) {
-            // EXISTS-based: a raw SUCCESS is a monotone fact — a resumed
-            // run's later SKIPPED row must not make its batch unreplayable.
-            require(audit.hasStageSuccess(rid, ctx.entity, Stages.Raw),
-              s"PIPE_003 curated replay from run_id=$rid requires a raw SUCCESS row for that " +
-                "run in the ledger (none found). A partial RAW slice must not be published as " +
-                "a complete curated build; re-run or --resume the original run first.")
-          } else
-            logger.warn(s"[Pipeline] Replaying run_id=$rid WITHOUT a ledger check " +
-              "(audit disabled): cannot verify the RAW slice is complete")
-          logger.info(s"[Pipeline] Curated replay from RAW slice run_id=$rid")
-          spark.table(fullTable).filter(col("run_id") === lit(rid))
-        case None =>
-          val dt = cli.resumeIngestDt.getOrElse(throw new IllegalArgumentException(
-            "PIPE_003 --stage curated requires --run-id (replay one run) or " +
-              "--resume-ingest-dt (replay a whole partition)"))
-          require(spark.table(fullTable).columns.exists(_.equalsIgnoreCase("ingest_dt")),
-            s"PIPE_003 $fullTable has no ingest_dt column; replay by --run-id instead")
-          logger.info(s"[Pipeline] Curated replay from RAW partition ingest_dt=$dt flag=${ctx.rawFlag}")
-          spark.table(fullTable)
-            .filter(col("ingest_dt") === lit(dt) && col("file_type") === lit(ctx.rawFlag))
-      }
-
       val rejectService = new RejectService(
         spark, ConfigUtils.optConfig(feedConf, "rejects"), contract, logger)
+
+      // COPY: the RAW slice, resolved eagerly — its preconditions are
+      // PIPE_003 errors, not stage failures. SOURCE: the window the run's raw
+      // ledger row recorded is resolved eagerly for the same reason, but the
+      // source re-read itself is deferred into the curated stage, where a
+      // partition purged since the run (HIVE_008) is recorded as that stage's
+      // failure.
+      val slice: () => DataFrame =
+        if (sourceAsRaw) {
+          val (lower, upper) = replayWindowFromLedger()
+          () => replaySliceFromSource(lower, upper, rawConf, rejectService)
+        } else {
+          val s = replaySliceFromRaw(rawConf)
+          () => s
+        }
+
       val curatedConf =
         if (feedConf.hasPath("curated")) Some(feedConf.getConfig("curated")) else None
 
@@ -174,7 +165,7 @@ final class IngestPipeline(
 
       val result = runStage(Stages.Curated, skippable = false) {
         val r = new CuratedStageRunner(spark, curatedConf, logger)
-          .run(slice, ctx.mode, ctx, contract, Some(rejectService))
+          .run(slice(), ctx.mode, ctx, contract, Some(rejectService))
         val counts = r.map(x => StageCounts(
           insertCount = x.insertCount, updateCount = x.updateCount,
           deleteCount = x.deleteCount + x.absenceDeleteCount
@@ -200,6 +191,101 @@ final class IngestPipeline(
       cached.foreach(df => try df.unpersist(false) catch { case _: Exception => () })
       cached.clear()
     }
+  }
+
+  /** COPY replay slice: one run's rows (--run-id) or a whole ingest_dt
+    * partition (--resume-ingest-dt) of the RAW table. */
+  private def replaySliceFromRaw(rawConf: Config): DataFrame = {
+    val database = ConfigUtils.sqlIdentifier(rawConf, "database")
+    val table = ConfigUtils.sqlIdentifier(rawConf, "table")
+    val fullTable = s"$database.$table"
+    require(spark.catalog.tableExists(fullTable),
+      s"PIPE_003 curated replay requires the RAW table $fullTable to exist")
+
+    cli.runId match {
+      case Some(rid) =>
+        // The replay publishes whatever the slice holds and stamps the run
+        // SUCCESS — replaying a run whose raw stage never completed would
+        // publish a PARTIAL slice that later --resume trusts as complete.
+        if (audit.enabled) {
+          // EXISTS-based: a raw SUCCESS is a monotone fact — a resumed
+          // run's later SKIPPED row must not make its batch unreplayable.
+          require(audit.hasStageSuccess(rid, ctx.entity, Stages.Raw),
+            s"PIPE_003 curated replay from run_id=$rid requires a raw SUCCESS row for that " +
+              "run in the ledger (none found). A partial RAW slice must not be published as " +
+              "a complete curated build; re-run or --resume the original run first.")
+        } else
+          logger.warn(s"[Pipeline] Replaying run_id=$rid WITHOUT a ledger check " +
+            "(audit disabled): cannot verify the RAW slice is complete")
+        logger.info(s"[Pipeline] Curated replay from RAW slice run_id=$rid")
+        spark.table(fullTable).filter(col("run_id") === lit(rid))
+      case None =>
+        val dt = cli.resumeIngestDt.getOrElse(throw new IllegalArgumentException(
+          "PIPE_003 --stage curated requires --run-id (replay one run) or " +
+            "--resume-ingest-dt (replay a whole partition)"))
+        require(spark.table(fullTable).columns.exists(_.equalsIgnoreCase("ingest_dt")),
+          s"PIPE_003 $fullTable has no ingest_dt column; replay by --run-id instead")
+        logger.info(s"[Pipeline] Curated replay from RAW partition ingest_dt=$dt flag=${ctx.rawFlag}")
+        spark.table(fullTable)
+          .filter(col("ingest_dt") === lit(dt) && col("file_type") === lit(ctx.rawFlag))
+    }
+  }
+
+  /** raw.mode = SOURCE: the (lower, upper] window the replayed run's raw
+    * SUCCESS row recorded — the only description of its RAW slice. */
+  private def replayWindowFromLedger(): (String, String) = {
+    val rid = cli.runId.getOrElse {
+      if (cli.resumeIngestDt.isDefined)
+        throw new IllegalArgumentException(
+          "CFG_028 --resume-ingest-dt is unavailable under raw.mode = SOURCE: there is no RAW " +
+            "table and no ingest_dt partition. Replay one run with --stage curated --run-id <id>, " +
+            "or drain batches with --pending / --replay-last / --replay-from / --replay-to / " +
+            "--replay-failed")
+      throw new IllegalArgumentException(
+        "PIPE_003 --stage curated under raw.mode = SOURCE requires --run-id (replay one run by " +
+          "its recorded window) or a batch selector (--pending / --replay-*)")
+    }
+    require(audit.enabled,
+      "PIPE_003 curated replay under raw.mode = SOURCE requires the run ledger: the raw SUCCESS " +
+        "row's window is the only description of the slice to re-read")
+    require(audit.hasStageSuccess(rid, ctx.entity, Stages.Raw),
+      s"PIPE_003 curated replay from run_id=$rid requires a raw SUCCESS row for that run in the " +
+        "ledger (none found). A partial window must not be published as a complete curated " +
+        "build; re-run or --resume the original run first.")
+    audit.rawWindow(rid, ctx.entity).getOrElse(throw new IllegalStateException(
+      s"PIPE_003 curated replay from run_id=$rid under raw.mode = SOURCE needs the extract " +
+        "window its raw SUCCESS row recorded (window_start / window_end); the ledger holds none " +
+        "for that run"))
+  }
+
+  /** raw.mode = SOURCE: rebuilds the ACCEPTED frame a run produced by
+    * re-reading the source for its recorded window and running the same
+    * contract guard, metadata stamping and reject split the raw stage ran.
+    * The reject split's run_id guard keeps a replay from re-appending the
+    * run's reject rows. HIVE_008 when the window's partitions are gone. */
+  private def replaySliceFromSource(
+    lower: String,
+    upper: String,
+    rawConf: Config,
+    rejectService: RejectService
+  ): DataFrame = {
+    val sourceConf = effectiveSourceConf(feedConf.getConfig("source"))
+    val sourceType = ConfigUtils.optString(sourceConf, "type").getOrElse("file")
+    val df = SourceRegistry.resolve(sourceType) match {
+      case r: com.hcsc.generic.ingest.source.WindowReplayable =>
+        logger.info(s"[Pipeline] raw.mode = SOURCE: re-reading the source window ($lower, $upper] " +
+          s"recorded by run_id=${ctx.runId}")
+        r.readWindow(spark, sourceConf, lower, upper)
+      case _ =>
+        throw new IllegalStateException(s"CFG_028 raw.mode = SOURCE requires a source that can " +
+          s"re-read a recorded window; source.type '$sourceType' cannot")
+    }
+    val cachedDf = track(df.persist(StorageLevel.MEMORY_AND_DISK))
+    validateContractBeforeRaw(cachedDf, None, rejectService)
+    val stamped = track(
+      stampRawMetadata(cachedDf, sourceConf, rawConf, Some((lower, Some(upper))), staged = None)
+        .persist(StorageLevel.MEMORY_AND_DISK))
+    rejectService.split(stamped, ctx).accepted
   }
 
   /**
@@ -474,28 +560,14 @@ final class IngestPipeline(
     rejectService: RejectService,
     intake: FileIntakeService
   ): RawOutcome = {
-    // Attach the schema contract for connector-side header resolution, plus
-    // the entity name and run id so stateful sources (JDBC watermarks,
-    // RUN_ID query parameters) see the pipeline's execution context.
-    // run_mode — never `mode`, which is JDBC's extraction mode — gates FULL
-    // on a watermarked hive source (HIVE_007); the run-ledger coordinates let
-    // a source recover its read window in a fresh JVM (--resume, --pending)
-    // instead of silently skipping the watermark commit.
-    val ledgerKeys = ConfigUtils.optConfig(feedConf, "audit").toSeq.flatMap { a =>
-      ConfigUtils.optString(a, "database").toSeq.flatMap(db =>
-        Seq("audit_database" -> db,
-          "audit_run_table" -> ConfigUtils.optString(a, "run_table").getOrElse("ingest_run_audit")))
-    }
-    val effectiveSource = withSchema(ledgerKeys.foldLeft(sourceConf
-      .withValue("entity", ConfigValueFactory.fromAnyRef(ctx.entity))
-      .withValue("run_id", ConfigValueFactory.fromAnyRef(ctx.runId))
-      .withValue("run_mode", ConfigValueFactory.fromAnyRef(ctx.mode))) {
-      case (c, (k, v)) => c.withValue(k, ConfigValueFactory.fromAnyRef(v))
-    })
+    val effectiveSource = effectiveSourceConf(sourceConf)
 
-    val rawDatabase = ConfigUtils.sqlIdentifier(rawConf, "database")
-    val rawTable = ConfigUtils.sqlIdentifier(rawConf, "table")
-    val rawFullTable = s"$rawDatabase.$rawTable"
+    // COPY: the RAW table every write and count below addresses. SOURCE:
+    // None — nothing is written, and raw.database / raw.table are rejected
+    // by CFG_028, so they are never resolved.
+    val rawTarget: Option[(String, String)] =
+      if (sourceAsRaw) None
+      else Some((ConfigUtils.sqlIdentifier(rawConf, "database"), ConfigUtils.sqlIdentifier(rawConf, "table")))
 
     // Header/content/data validation all run BEFORE any RAW write. On a
     // contract violation the outcome is audited (and staged files
@@ -510,7 +582,7 @@ final class IngestPipeline(
         // right after withMeta materializes.
         val cached =
           if (contract.isDefined) track(df.persist(StorageLevel.MEMORY_AND_DISK)) else df
-        validateContractBeforeRaw(cached, rawDatabase, rawTable, rejectService)
+        validateContractBeforeRaw(cached, rawTarget, rejectService)
         cached
       } catch {
         case e: SchemaContractViolationException =>
@@ -529,6 +601,130 @@ final class IngestPipeline(
     // The extract window becomes part of the run ledger (spec: start/end
     // watermark recorded per run).
     audit.setExtractWindow(window.map(_._1), window.flatMap(_._2))
+    val withMetaExt = stampRawMetadata(df0, effectiveSource, rawConf, window, staged)
+    val withMeta1 = ctx.fileIdFilter match {
+      case Some(fileId) if staged.isEmpty => withMetaExt.filter(col("file_id") === lit(fileId))
+      case _ => withMetaExt
+    }
+
+    // Cross-run file idempotency (managed feeds): a crash after the RAW
+    // append but before completion leaves the file in inprogress, and the
+    // NEXT run (new run_id) re-reads it — the run_id guard below cannot see
+    // that. Excluding already-loaded file_ids up front keeps every count,
+    // reject and reconciliation consistent with what is actually written.
+    val withMeta = rawTarget match {
+      case Some((d, t)) if !ctx.dryRun && !ctx.forceReprocess && staged.exists(_.nonEmpty) =>
+        RawIdempotency.excludeLoadedFiles(spark, s"$d.$t", withMeta1, logger)
+      case _ => withMeta1
+    }
+
+    val sourceCount = track(withMeta.persist(StorageLevel.MEMORY_AND_DISK)).count()
+    // withMeta is materialized: the source-level cache from contract
+    // validation has served its purpose — release it now rather than
+    // holding two copies of the batch to end-of-run.
+    if (contract.isDefined)
+      try df0.unpersist(false) catch { case _: Exception => () }
+
+    val split = rejectService.split(withMeta, ctx)
+    val accepted = track(split.accepted.persist(StorageLevel.MEMORY_AND_DISK))
+
+    val (windowSkipped, overlapSkipped, runIdSkipped) = rawTarget match {
+      case Some((d, t)) =>
+        writeRawIdempotently(accepted, rawConf, s"$d.$t", d, t, window, rejectService)
+      case None =>
+        logger.info("[Pipeline] raw.mode = SOURCE: no RAW write — the source table is the raw " +
+          "layer; the raw ledger row and its extract window are this run's checkpoint")
+        (None, 0L, false)
+    }
+
+    val acceptedCount = if (split.acceptedCount >= 0) split.acceptedCount else sourceCount
+    // Measure rawCount from the table itself so the raw_equals_accepted
+    // reconciliation check verifies the write instead of restating its input.
+    // A window-skip (rerun of a failed run under a NEW run id) attributes by
+    // the extract window instead — the rows exist under the failed run's id.
+    // Tables without a run_id column (legacy) cannot attribute rows to this
+    // run, so the count stays unmeasured there.
+    val rawCount = rawTarget match {
+      case _ if ctx.dryRun => 0L
+      // SOURCE: nothing was written; the ledger records what the source
+      // delivered — the slice a replay re-reads and must account for.
+      case None => acceptedCount
+      case Some((d, t)) =>
+        val rawFullTable = s"$d.$t"
+        if (windowSkipped.isDefined)
+          spark.table(rawFullTable)
+            .filter(col("extract_start_ts") === lit(windowSkipped.get._1) &&
+              col("extract_end_ts") === lit(windowSkipped.get._2))
+            .count()
+        else if (spark.catalog.tableExists(rawFullTable) &&
+                 spark.table(rawFullTable).columns.contains("run_id"))
+          spark.table(rawFullTable).filter(col("run_id") === lit(ctx.runId)).count()
+        else -1L
+    }
+
+    // Optional raw version-duplicate measurement: with raw.idempotency_key
+    // configured (e.g. source PK + freshness column), duplicate key-tuples
+    // among THIS run's written rows indicate a source or extraction defect.
+    val idempotencyKey = ConfigUtils.stringList(rawConf, "idempotency_key")
+    val duplicateVersions = rawTarget match {
+      case Some((d, t)) if !ctx.dryRun && idempotencyKey.nonEmpty && windowSkipped.isEmpty &&
+          spark.catalog.tableExists(s"$d.$t") =>
+        val rawFullTable = s"$d.$t"
+        val cols = spark.table(rawFullTable).columns.map(_.toLowerCase).toSet
+        if (!cols.contains("run_id") || !idempotencyKey.forall(k => cols.contains(k.toLowerCase))) -1L
+        else spark.table(rawFullTable)
+          .filter(col("run_id") === lit(ctx.runId))
+          .groupBy(idempotencyKey.map(col): _*)
+          .count()
+          .filter(col("count") > 1)
+          .count()
+      case _ => -1L
+    }
+
+    val counts = StageCounts(
+      sourceCount = sourceCount,
+      rawCount = rawCount,
+      acceptedCount = acceptedCount,
+      rejectedCount = split.rejectedCount,
+      controlTotal = controlTotal(accepted)
+    )
+    RawOutcome(accepted, counts, window, duplicateVersions, overlapSkipped, runIdSkipped)
+  }
+
+  /** The source config as connectors see it: the schema contract attached
+    * for connector-side header resolution, plus the pipeline's execution
+    * context — entity and run id so stateful sources (JDBC watermarks,
+    * RUN_ID query parameters) see it; run_mode — never `mode`, which is
+    * JDBC's extraction mode — gates FULL on a watermarked hive source
+    * (HIVE_007); the run-ledger coordinates let a source recover its read
+    * window in a fresh JVM (--resume, --pending) instead of silently skipping
+    * the watermark commit. */
+  private def effectiveSourceConf(sourceConf: Config): Config = {
+    val ledgerKeys = ConfigUtils.optConfig(feedConf, "audit").toSeq.flatMap { a =>
+      ConfigUtils.optString(a, "database").toSeq.flatMap(db =>
+        Seq("audit_database" -> db,
+          "audit_run_table" -> ConfigUtils.optString(a, "run_table").getOrElse("ingest_run_audit")))
+    }
+    withSchema(ledgerKeys.foldLeft(sourceConf
+      .withValue("entity", ConfigValueFactory.fromAnyRef(ctx.entity))
+      .withValue("run_id", ConfigValueFactory.fromAnyRef(ctx.runId))
+      .withValue("run_mode", ConfigValueFactory.fromAnyRef(ctx.mode))) {
+      case (c, (k, v)) => c.withValue(k, ConfigValueFactory.fromAnyRef(v))
+    })
+  }
+
+  /** RAW metadata for a validated source frame: lineage (source identity +
+    * extract window), the opt-in record hash, the opt-in extended lineage.
+    * Shared by the raw stage and by the raw.mode = SOURCE replay, which must
+    * stamp a re-read window exactly as the original run did. */
+  private def stampRawMetadata(
+    df: DataFrame,
+    effectiveSource: Config,
+    rawConf: Config,
+    window: Option[(String, Option[String])],
+    staged: Option[Seq[StagedFile]]
+  ): DataFrame = {
+    val sourceType = ConfigUtils.optString(effectiveSource, "type").getOrElse("file")
     // String-only reads: the pipeline attaches the schema CONTRACT as an
     // OBJECT under source.schema, so the schema NAME lives at
     // source.source_schema (with a string-typed source.schema still honored).
@@ -546,7 +742,7 @@ final class IngestPipeline(
       extractStart = window.map(_._1),
       extractEnd = window.flatMap(_._2)
     )
-    val withMetaBase = RawMetadata.add(df0, ctx.rawFlag, lineage)
+    val withMetaBase = RawMetadata.add(df, ctx.rawFlag, lineage)
     // Change-detection fingerprint (opt-in raw.record_hash = true): stamped
     // after the metadata columns so only business content is hashed; the
     // curated merge uses it to skip no-change rewrites.
@@ -559,118 +755,45 @@ final class IngestPipeline(
     // source_modified_ts / source_operation / source_primary_key, and no
     // constant file_id for file-less sources. Stamped after the record hash
     // so the hash never covers technical columns.
-    val withMetaExt =
-      if (!ConfigUtils.optBoolean(rawConf, "lineage_extended").getOrElse(false)) withMeta0
-      else {
-        val modifiedColumn = ConfigUtils.optString(rawConf, "source_modified_column")
-          .orElse(contract.flatMap(_.incrementalColumns.headOption))
-          .orElse(ConfigUtils.optConfig(effectiveSource, "incremental")
-            .flatMap(i => ConfigUtils.stringList(i, "watermark_columns").headOption))
-        val softDelete = ConfigUtils.optConfig(feedConf, "curated")
+    if (!ConfigUtils.optBoolean(rawConf, "lineage_extended").getOrElse(false)) withMeta0
+    else {
+      val modifiedColumn = ConfigUtils.optString(rawConf, "source_modified_column")
+        .orElse(contract.flatMap(_.incrementalColumns.headOption))
+        .orElse(ConfigUtils.optConfig(effectiveSource, "incremental")
+          .flatMap(i => ConfigUtils.stringList(i, "watermark_columns").headOption))
+      val softDelete = ConfigUtils.optConfig(feedConf, "curated")
+        .flatMap(c => ConfigUtils.optConfig(c, "merge"))
+        .flatMap(m => ConfigUtils.optConfig(m, "deletes"))
+        .filter(d => ConfigUtils.optString(d, "mode").exists(_.equalsIgnoreCase("SOFT")))
+        .flatMap(d => ConfigUtils.optString(d, "indicator_column").map { indicator =>
+          val values = ConfigUtils.stringList(d, "indicator_values")
+          (indicator, if (values.nonEmpty) values else Seq("true", "1", "y", "d"))
+        })
+      val primaryKey = contract.map(_.businessKeyColumns).filter(_.nonEmpty)
+        .orElse(ConfigUtils.optConfig(feedConf, "curated")
           .flatMap(c => ConfigUtils.optConfig(c, "merge"))
-          .flatMap(m => ConfigUtils.optConfig(m, "deletes"))
-          .filter(d => ConfigUtils.optString(d, "mode").exists(_.equalsIgnoreCase("SOFT")))
-          .flatMap(d => ConfigUtils.optString(d, "indicator_column").map { indicator =>
-            val values = ConfigUtils.stringList(d, "indicator_values")
-            (indicator, if (values.nonEmpty) values else Seq("true", "1", "y", "d"))
-          })
-        val primaryKey = contract.map(_.businessKeyColumns).filter(_.nonEmpty)
-          .orElse(ConfigUtils.optConfig(feedConf, "curated")
-            .flatMap(c => ConfigUtils.optConfig(c, "merge"))
-            .map(m => ConfigUtils.stringList(m, "keys")))
-          .getOrElse(Seq.empty)
-        // Operation semantics honest to source capability: timestamp
-        // polling cannot see insert-vs-update, so non-delete rows default
-        // to UPSERT; sources with real operations configure the value;
-        // legacy 'I' stays available behind an explicit flag.
-        val nonDeleteOp = ConfigUtils.optString(rawConf, "source_operation_default")
-          .map(_.toUpperCase)
-          .getOrElse(
-            if (ConfigUtils.optBoolean(rawConf, "source_operation_legacy_insert").getOrElse(false)) "I"
-            else "UPSERT")
-        require(Seq("UPSERT", "SNAPSHOT", "UNKNOWN", "INSERT", "UPDATE", "I").contains(nonDeleteOp),
-          s"RAW_004 raw.source_operation_default '$nonDeleteOp' must be UPSERT, SNAPSHOT, " +
-            "UNKNOWN, INSERT, UPDATE or I (legacy)")
-        RawMetadata.addExtended(withMeta0, com.hcsc.generic.ingest.transform.ExtendedLineage(
-          sourceModifiedColumn = modifiedColumn,
-          softDeleteIndicator = softDelete,
-          primaryKeyColumns = primaryKey,
-          nullFileId = staged.isEmpty && !sourceType.equalsIgnoreCase("file"),
-          nonDeleteOperation = nonDeleteOp,
-          keyJson = ConfigUtils.optBoolean(rawConf, "source_key_json").getOrElse(false)))
-      }
-    val withMeta1 = ctx.fileIdFilter match {
-      case Some(fileId) if staged.isEmpty => withMetaExt.filter(col("file_id") === lit(fileId))
-      case _ => withMetaExt
+          .map(m => ConfigUtils.stringList(m, "keys")))
+        .getOrElse(Seq.empty)
+      // Operation semantics honest to source capability: timestamp
+      // polling cannot see insert-vs-update, so non-delete rows default
+      // to UPSERT; sources with real operations configure the value;
+      // legacy 'I' stays available behind an explicit flag.
+      val nonDeleteOp = ConfigUtils.optString(rawConf, "source_operation_default")
+        .map(_.toUpperCase)
+        .getOrElse(
+          if (ConfigUtils.optBoolean(rawConf, "source_operation_legacy_insert").getOrElse(false)) "I"
+          else "UPSERT")
+      require(Seq("UPSERT", "SNAPSHOT", "UNKNOWN", "INSERT", "UPDATE", "I").contains(nonDeleteOp),
+        s"RAW_004 raw.source_operation_default '$nonDeleteOp' must be UPSERT, SNAPSHOT, " +
+          "UNKNOWN, INSERT, UPDATE or I (legacy)")
+      RawMetadata.addExtended(withMeta0, com.hcsc.generic.ingest.transform.ExtendedLineage(
+        sourceModifiedColumn = modifiedColumn,
+        softDeleteIndicator = softDelete,
+        primaryKeyColumns = primaryKey,
+        nullFileId = staged.isEmpty && !sourceType.equalsIgnoreCase("file"),
+        nonDeleteOperation = nonDeleteOp,
+        keyJson = ConfigUtils.optBoolean(rawConf, "source_key_json").getOrElse(false)))
     }
-
-    // Cross-run file idempotency (managed feeds): a crash after the RAW
-    // append but before completion leaves the file in inprogress, and the
-    // NEXT run (new run_id) re-reads it — the run_id guard below cannot see
-    // that. Excluding already-loaded file_ids up front keeps every count,
-    // reject and reconciliation consistent with what is actually written.
-    val withMeta =
-      if (ctx.dryRun || ctx.forceReprocess || !staged.exists(_.nonEmpty)) withMeta1
-      else RawIdempotency.excludeLoadedFiles(spark, rawFullTable, withMeta1, logger)
-
-    val sourceCount = track(withMeta.persist(StorageLevel.MEMORY_AND_DISK)).count()
-    // withMeta is materialized: the source-level cache from contract
-    // validation has served its purpose — release it now rather than
-    // holding two copies of the batch to end-of-run.
-    if (contract.isDefined)
-      try df0.unpersist(false) catch { case _: Exception => () }
-
-    val split = rejectService.split(withMeta, ctx)
-    val accepted = track(split.accepted.persist(StorageLevel.MEMORY_AND_DISK))
-
-    val (windowSkipped, overlapSkipped, runIdSkipped) =
-      writeRawIdempotently(accepted, rawConf, rawFullTable, rawDatabase, rawTable, window, rejectService)
-
-    val acceptedCount = if (split.acceptedCount >= 0) split.acceptedCount else sourceCount
-    // Measure rawCount from the table itself so the raw_equals_accepted
-    // reconciliation check verifies the write instead of restating its input.
-    // A window-skip (rerun of a failed run under a NEW run id) attributes by
-    // the extract window instead — the rows exist under the failed run's id.
-    // Tables without a run_id column (legacy) cannot attribute rows to this
-    // run, so the count stays unmeasured there.
-    val rawCount =
-      if (ctx.dryRun) 0L
-      else if (windowSkipped.isDefined)
-        spark.table(rawFullTable)
-          .filter(col("extract_start_ts") === lit(windowSkipped.get._1) &&
-            col("extract_end_ts") === lit(windowSkipped.get._2))
-          .count()
-      else if (spark.catalog.tableExists(rawFullTable) &&
-               spark.table(rawFullTable).columns.contains("run_id"))
-        spark.table(rawFullTable).filter(col("run_id") === lit(ctx.runId)).count()
-      else -1L
-
-    // Optional raw version-duplicate measurement: with raw.idempotency_key
-    // configured (e.g. source PK + freshness column), duplicate key-tuples
-    // among THIS run's written rows indicate a source or extraction defect.
-    val idempotencyKey = ConfigUtils.stringList(rawConf, "idempotency_key")
-    val duplicateVersions =
-      if (ctx.dryRun || idempotencyKey.isEmpty || windowSkipped.isDefined ||
-          !spark.catalog.tableExists(rawFullTable)) -1L
-      else {
-        val cols = spark.table(rawFullTable).columns.map(_.toLowerCase).toSet
-        if (!cols.contains("run_id") || !idempotencyKey.forall(k => cols.contains(k.toLowerCase))) -1L
-        else spark.table(rawFullTable)
-          .filter(col("run_id") === lit(ctx.runId))
-          .groupBy(idempotencyKey.map(col): _*)
-          .count()
-          .filter(col("count") > 1)
-          .count()
-      }
-
-    val counts = StageCounts(
-      sourceCount = sourceCount,
-      rawCount = rawCount,
-      acceptedCount = acceptedCount,
-      rejectedCount = split.rejectedCount,
-      controlTotal = controlTotal(accepted)
-    )
-    RawOutcome(accepted, counts, window, duplicateVersions, overlapSkipped, runIdSkipped)
   }
 
   /** Multi-file batch safety: staged files were validated per-file at
@@ -700,8 +823,7 @@ final class IngestPipeline(
     * nullability deferred to the reject stage when it owns that rule). */
   private def validateContractBeforeRaw(
     df: DataFrame,
-    rawDatabase: String,
-    rawTable: String,
+    rawTarget: Option[(String, String)],
     rejectService: RejectService
   ): Unit = contract.foreach { c =>
     // Hard guard: required canonical columns must exist before RAW.
@@ -722,9 +844,13 @@ final class IngestPipeline(
     val violations = SchemaValidator.validateData(df, c).filterNot(v =>
       rejectService.handlesContractNullability &&
         v.kind == ViolationKind.NullabilityViolation) ++
-      SchemaValidator.versionMismatch(
-        SchemaVersions.stored(spark, rawDatabase, rawTable),
-        SchemaVersions.storedRequired(spark, rawDatabase, rawTable), c)
+      // Version drift is measured against the contract version the RAW table
+      // recorded; under raw.mode = SOURCE there is no table to carry one.
+      rawTarget.toSeq.flatMap { case (rawDatabase, rawTable) =>
+        SchemaValidator.versionMismatch(
+          SchemaVersions.stored(spark, rawDatabase, rawTable),
+          SchemaVersions.storedRequired(spark, rawDatabase, rawTable), c)
+      }
     SchemaValidator.enforce(violations, c.policies, logger)
   }
 
@@ -951,6 +1077,17 @@ final class IngestPipeline(
     * slice of the RAW table so curated can be replayed idempotently. */
   private def readRawSlice(rawConf: Config): Option[RawOutcome] = {
     if (!ctx.resume) return None
+    if (sourceAsRaw) {
+      // The source is the raw layer: the slice is the window the run's raw
+      // SUCCESS row recorded, re-read and re-split exactly as the stage did.
+      return audit.rawWindow(ctx.runId, ctx.entity).map { case (lower, upper) =>
+        logger.info(s"[Pipeline] Resume: replaying curated from the source window ($lower, $upper] " +
+          s"of run_id=${ctx.runId}")
+        val rejectService = new RejectService(
+          spark, ConfigUtils.optConfig(feedConf, "rejects"), contract, logger)
+        RawOutcome(replaySliceFromSource(lower, upper, rawConf, rejectService), StageCounts())
+      }
+    }
     val database = ConfigUtils.sqlIdentifier(rawConf, "database")
     val table = ConfigUtils.sqlIdentifier(rawConf, "table")
     val fullTable = s"$database.$table"
@@ -1007,7 +1144,8 @@ final class IngestPipeline(
         val actual = c.acceptedCount + c.rejectedCount
         checks += (("source_equals_accepted_plus_rejected", expected.toString, actual.toString, expected == actual))
       }
-      if (!ctx.dryRun && c.rawCount >= 0 && c.acceptedCount >= 0) {
+      // raw.mode = SOURCE writes nothing, so there is no write to verify.
+      if (!ctx.dryRun && !sourceAsRaw && c.rawCount >= 0 && c.acceptedCount >= 0) {
         // DEDUPLICATED_APPEND deliberately writes fewer rows than accepted:
         // the overlap already present by source-version identity.
         val expectedRaw = c.acceptedCount - o.overlapSkipped

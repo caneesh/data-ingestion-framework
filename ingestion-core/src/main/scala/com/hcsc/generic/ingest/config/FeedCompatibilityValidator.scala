@@ -123,6 +123,32 @@ object FeedCompatibilityValidator {
       }
     }
 
+    // Raw layer mode: COPY (default) writes a framework RAW table; SOURCE
+    // uses the hive source table itself as the raw layer. Nothing is written
+    // under SOURCE, so every key that names or governs the RAW table would be
+    // a silent no-op — and the run's recorded partition window is the only
+    // description of its slice, so the feed must be windowed.
+    val rawMode = opt("raw.mode")
+    rawMode.filterNot(m => m == "COPY" || m == "SOURCE").foreach { m =>
+      errors += s"CFG_028 raw.mode '$m' must be COPY or SOURCE"
+    }
+    if (rawMode.contains("SOURCE")) {
+      if (!sourceType.contains("hive"))
+        errors += "CFG_028 raw.mode = SOURCE requires source.type = hive (a durable partitioned table " +
+          s"that can be re-read by window); source.type is '${sourceType.getOrElse("absent")}'"
+      else if (!feed.hasPath("source.incremental.watermark_columns"))
+        errors += "CFG_028 raw.mode = SOURCE requires source.incremental.watermark_columns: the run's " +
+          "recorded partition window is the only description of its raw slice (replay re-reads it)"
+      Seq("raw.database", "raw.table", "raw.delivery_mode", "raw.idempotency_key", "raw.partitioning")
+        .filter(feed.hasPath).foreach { k =>
+          errors += s"CFG_028 $k has no effect under raw.mode = SOURCE (nothing is written to a RAW " +
+            "table); remove it"
+        }
+      if (feed.hasPath("retention.raw"))
+        errors += "CFG_028 retention.raw has no effect under raw.mode = SOURCE: there is no RAW table " +
+          "to purge, and the source owner's retention is the replay horizon"
+    }
+
     // An incremental JDBC feed produces window deltas — via the legacy
     // source.mode OR an incremental extraction strategy. A state-deriving
     // curated layer without merge keys publishes FULL overwrites of exactly

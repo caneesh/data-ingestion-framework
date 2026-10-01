@@ -1,7 +1,7 @@
 package com.hcsc.generic.ingest.hive
 
 import com.hcsc.generic.ingest.schema.{SchemaContract, SchemaValidator}
-import com.hcsc.generic.ingest.source.{Source, SourceRegistry, WatermarkAdvancing}
+import com.hcsc.generic.ingest.source.{Source, SourceRegistry, WatermarkAdvancing, WindowReplayable}
 import com.hcsc.generic.ingest.watermark.{HiveWatermarkStore, InMemoryWatermarkStore, VersionedWatermark, WatermarkCommitDetail, WatermarkStore, WatermarkValue}
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
@@ -29,7 +29,7 @@ import scala.util.control.NonFatal
   * watermark, never the rewound bound, so watermark_continuity is
   * unaffected by lookback — exactly how JDBC records its overlap.
   */
-object HiveSource extends Source with WatermarkAdvancing {
+object HiveSource extends Source with WatermarkAdvancing with WindowReplayable {
   private val logger = Logger.getLogger(getClass.getName)
 
   override def sourceType: String = "hive"
@@ -161,6 +161,11 @@ object HiveSource extends Source with WatermarkAdvancing {
     applyMissingFiles(spark, cfg)
     applyContract(spark.table(cfg.fullTable).filter(pred.column), sourceConf)
   }
+
+  /** The pipeline's `WindowReplayable` entry point (`raw.mode = SOURCE`):
+    * bounds arrive serialized exactly as the run ledger recorded them. */
+  override def readWindow(spark: SparkSession, sourceConf: Config, lower: String, upper: String): DataFrame =
+    readWindow(spark, sourceConf, WatermarkValue.deserialize(lower), WatermarkValue.deserialize(upper))
 
   /**
     * The whole table under the feed's `where` — no watermark, no read

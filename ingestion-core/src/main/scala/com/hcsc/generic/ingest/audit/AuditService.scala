@@ -484,6 +484,43 @@ final class AuditService(
       .filter(_ >= 0L)
   }
 
+  /**
+    * The extract window a run's successful raw stage recorded, serialized as
+    * the ledger carries it (`window_start`, `window_end`).
+    *
+    * Under `raw.mode = SOURCE` this is the ONLY description of that run's
+    * RAW slice: nothing was written, so a curated replay re-reads the source
+    * for exactly this window. Latest raw SUCCESS wins (a `--force-reprocess`
+    * re-run records a wider window); a later SKIPPED resume row never hides
+    * it.
+    *
+    * None when the ledger is disabled or not yet migrated, the run never
+    * succeeded at raw, the success was a dry run, or the row carries no
+    * window (a source without window tracking).
+    */
+  def rawWindow(runId: String, entity: String): Option[(String, String)] = {
+    if (!enabled || !spark.catalog.tableExists(runTable)) return None
+    import org.apache.spark.sql.functions.col
+    val cols = spark.table(runTable).columns.map(_.toLowerCase).toSet
+    if (!cols.contains("window_start") || !cols.contains("window_end")) return None
+    spark.table(runTable)
+      .filter(col("run_id") === runId && col("entity") === entity &&
+        col("stage") === com.hcsc.generic.ingest.runtime.Stages.Raw &&
+        col("status") === com.hcsc.generic.ingest.runtime.StageStatus.Success &&
+        notDryRun)
+      .orderBy(col("event_ts").desc)
+      .select("window_start", "window_end")
+      .limit(1)
+      .collect()
+      .headOption
+      .flatMap { r =>
+        for {
+          s <- Option(r.getString(0)).filter(_.nonEmpty)
+          e <- Option(r.getString(1)).filter(_.nonEmpty)
+        } yield (s, e)
+      }
+  }
+
   /** Latest recorded status for a stage of a given run, used by --resume.
     * Terminal statuses win over STARTED when timestamps tie. */
   def stageStatus(runId: String, entity: String, stage: String): Option[String] = {

@@ -134,6 +134,7 @@ feeds.claims {
 | CFG_025 | hive `initial_value` arity differs from `watermark_columns` (components are `\|`-separated) |
 | CFG_026 | `--stage reconcile` on a source type other than `jdbc` or `hive` (raised before the entity lock is taken) |
 | CFG_027 | hive `lookback` naming neither or both of `days` / `partitions`, or a non-positive value |
+| CFG_028 | `raw.mode` not `COPY` / `SOURCE`; `SOURCE` on a non-hive source; `SOURCE` without `source.incremental.watermark_columns` (the recorded window is the only description of a run's slice); under `SOURCE` any of `raw.database`, `raw.table`, `raw.delivery_mode`, `raw.idempotency_key`, `raw.partitioning`, `retention.raw` (nothing is written — each would be a silent no-op); `--resume-ingest-dt` under `SOURCE` (there is no `ingest_dt`) |
 | CFG_021 | `audit.reconciliation.min_accepted_rows` is negative, or set with `audit.enabled = false` (a floor that can never trip reads as protection while detecting nothing) |
 | CUR_010 | `curated.merge.normalize` targets a column absent from the incoming data (skipping it would leave business keys un-normalized and insert duplicates instead of merging) |
 | CFG_019 | `--override-path` names a file that does not exist (fail-closed: an override that silently did not apply is worse than a failed run) |
@@ -185,6 +186,54 @@ CDC-events example and a file-feed example live in `application.conf`'s
 commented blocks; the interactive generator (`ingestion-config-gen`)
 produces feeds that pass this validator by construction.
 
+
+## Raw layer mode (`raw.mode`)
+
+```hocon
+raw {
+  mode = "COPY"      # default: a framework RAW table is written (every feed today)
+  mode = "SOURCE"    # hive sources only: the source table IS the raw layer; nothing is written
+}
+```
+
+`COPY` is unchanged behavior. `SOURCE` is for a `source.type = hive` feed
+whose source is already a durable, partitioned, queryable table in the
+same warehouse (a Sqoop landing, for example): copying it would buy a
+second write and a second retention policy for no isolation.
+
+Under `SOURCE`:
+
+- The raw stage still validates the contract, routes rejects, stamps
+  `RawMetadata` / `record_hash` / extended lineage on the in-memory frame
+  and records the `raw` ledger row with the partition window
+  (`window_start` / `window_end`) and `raw_count = accepted_count` — the
+  ledger row is the checkpoint, not a table. The sink write is skipped.
+- `raw.database`, `raw.table`, `raw.delivery_mode`, `raw.idempotency_key`,
+  `raw.partitioning` and `retention.raw` are rejected (`CFG_028`): each
+  would be a silent no-op. `record_hash`, `lineage_extended`,
+  `source_operation_default`, `record_hash_options`, `source_key_json`
+  remain valid.
+- `SOURCE` requires a windowed source (`source.incremental.watermark_columns`,
+  `CFG_028`): the recorded partition window is the only description of a
+  run's raw slice.
+- Replay re-reads the **source** for the run's recorded window:
+  `--stage curated --run-id <id>`, `--pending`, `--replay-*` and `--resume`
+  all go through it — the same contract guard, metadata stamping and reject
+  split the raw stage ran (the reject table's `run_id` guard keeps a replay
+  from re-appending rows). A `--replay-source-system` selector matches the
+  feed's one `source.system` (all batches or none). `HIVE_008` (DATA_INTEGRITY) when the window's
+  partitions no longer exist at the source — the source owner's retention
+  is the replay horizon. `--resume-ingest-dt` is unavailable (`CFG_028`):
+  there is no `ingest_dt`.
+- `raw_equals_accepted` is not checked (nothing was written);
+  `raw_overlap_reread` is not recorded (it measures `DEDUPLICATED_APPEND`,
+  which does not exist here). `source_equals_accepted_plus_rejected`,
+  `curated_accounts_for_accepted_rows`, `watermark_continuity` and
+  `accepted_meets_minimum` are unchanged.
+- `--stage raw` stays meaningful: it records the window and, with
+  `watermark.advance_after = RAW`, advances the watermark — the DECOUPLED
+  shape works unchanged, with the curated job draining each batch from the
+  source.
 
 ## Source reconciliation (`--stage reconcile`)
 

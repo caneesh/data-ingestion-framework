@@ -216,6 +216,72 @@ class FeedCompatibilityValidatorTest extends AnyFunSuite {
     assert(!errorsOf(withLookback("partitions = 2")).exists(_.startsWith("CFG_027")))
   }
 
+  // ---- raw.mode (CFG_028) ----------------------------------------------------
+
+  private def sourceMode(rawExtra: String = "", extra: String = "", source: String = "") =
+    s"""mode = "INCR"
+       |source { ${if (source.nonEmpty) source else "type = \"hive\", database = \"d\", table = \"t\"" + goodInc} }
+       |raw { mode = "SOURCE" $rawExtra }
+       |curated { merge { keys = ["id"] } }
+       |$extra""".stripMargin
+
+  test("raw.mode accepts COPY and SOURCE only, case-insensitively (CFG_028)") {
+    assert(errorsOf(hive(goodInc, extra = """raw { mode = "COPY", database = "r", table = "t" }""")).isEmpty)
+    assert(errorsOf(hive(goodInc, extra = """raw { mode = "copy", database = "r", table = "t" }""")).isEmpty)
+    assert(errorsOf(sourceMode()).isEmpty, errorsOf(sourceMode()).mkString("; "))
+    assert(errorsOf(hive(goodInc, extra = """raw { mode = "source" }""")).isEmpty)
+    val bad = errorsOf(hive(goodInc, extra = """raw { mode = "MIRROR" }"""))
+    assert(bad.count(_.startsWith("CFG_028")) == 1 && bad.exists(_.contains("MIRROR")))
+  }
+
+  test("an absent raw.mode is COPY: no CFG_028 anywhere on today's feeds") {
+    assert(!errorsOf(hive(goodInc, extra = """raw { database = "r", table = "t", delivery_mode = "AT_LEAST_ONCE_APPEND" }"""))
+      .exists(_.startsWith("CFG_028")))
+    assert(!errorsOf(
+      """source { type = "jdbc", extraction { strategy = "TIMESTAMP",
+        |  boundary { columns = [ { name = "ts" } ], initial = "1900-01-01 00:00:00" } } }
+        |raw { database = "r", table = "t" }
+        |retention { raw = "400d" }""".stripMargin).exists(_.startsWith("CFG_028")))
+  }
+
+  test("raw.mode = SOURCE requires a hive source (CFG_028)") {
+    Seq("""type = "jdbc"""", """type = "file"""", """type = "kafka"""").foreach { s =>
+      val errors = errorsOf(sourceMode(source = s))
+      assert(errors.exists(e => e.startsWith("CFG_028") && e.contains("source.type = hive")), s"$s -> $errors")
+    }
+  }
+
+  test("raw.mode = SOURCE requires a windowed hive source (CFG_028)") {
+    val errors = errorsOf(sourceMode(source = """type = "hive", database = "d", table = "t""""))
+    assert(errors.exists(e => e.startsWith("CFG_028") && e.contains("watermark_columns")))
+  }
+
+  test("under SOURCE every RAW-table key is rejected, one error each (CFG_028)") {
+    Seq("database = \"r\"", "table = \"t\"", "delivery_mode = \"AT_LEAST_ONCE_APPEND\"",
+      "idempotency_key = [\"id\", \"ts\"]", "partitioning { keys = [\"ingest_dt\"] }").foreach { k =>
+      val errors = errorsOf(sourceMode(rawExtra = s", $k"))
+      val key = "raw." + k.takeWhile(c => c != ' ' && c != '=')
+      assert(errors.count(_.startsWith("CFG_028")) == 1, s"$k -> $errors")
+      assert(errors.exists(e => e.startsWith("CFG_028") && e.contains(key)), s"$k -> $errors")
+    }
+    val all = errorsOf(sourceMode(rawExtra =
+      """, database = "r", table = "t", delivery_mode = "AT_LEAST_ONCE_APPEND", idempotency_key = ["id"],
+        |partitioning { keys = ["ingest_dt"] }""".stripMargin))
+    assert(all.count(_.startsWith("CFG_028")) == 5, all.mkString("; "))
+  }
+
+  test("under SOURCE retention.raw is rejected; the other retention keys are not (CFG_028)") {
+    val errors = errorsOf(sourceMode(extra = """retention { raw = "400d", rejects = "90d", audit = "400d", watermarks_keep_last = 30 }"""))
+    assert(errors.count(_.startsWith("CFG_028")) == 1 && errors.exists(_.contains("retention.raw")), errors.mkString("; "))
+    assert(errorsOf(sourceMode(extra = """retention { rejects = "90d", audit = "400d", watermarks_keep_last = 30 }""")).isEmpty)
+  }
+
+  test("under SOURCE the in-memory stamping options stay valid (CFG_028 is silent)") {
+    assert(errorsOf(sourceMode(rawExtra =
+      """, record_hash = true, lineage_extended = true, source_operation_default = "UPSERT",
+        |record_hash_options { trim = true }, source_key_json = true""".stripMargin)).isEmpty)
+  }
+
   test("the file-only and jdbc-only rules stay silent for hive sources") {
     val errors = errorsOf(hive(goodInc))
     assert(!errors.exists(_.startsWith("CFG_008")), "CFG_008 is file-only")

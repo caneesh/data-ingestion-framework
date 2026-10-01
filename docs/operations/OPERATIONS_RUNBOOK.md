@@ -324,6 +324,14 @@ categories classified by `SqlFailureClassifier` are retried.
 
 ---
 
+### 1.3 HIVE_008 (replay window gone at the source — `raw.mode = SOURCE`)
+
+| Code | Meaning | Thrown as | Retry? | Operator action |
+|------|---------|-----------|--------|-----------------|
+| HIVE_008 | A replay (`--stage curated --run-id`, `--pending`, `--resume`) under `raw.mode = SOURCE` found none of the partitions in the window that run recorded: they were dropped from the source table after the run | `IllegalArgumentException` (DATA_INTEGRITY, exit 20) | No | The data is gone from the only place it lived. Confirm with the source owner (retention, a manual drop). If the batch already published curated nothing is lost — leave it. Otherwise the keys are recoverable only from a source re-delivery. The remaining `HIVE_` codes are catalogued with the hive source documentation. |
+
+---
+
 ### source_keys_present_in_curated — rows the source has and curated does not
 
 Raised by `--stage reconcile`. This is the one finding that no in-run check
@@ -515,6 +523,11 @@ run_smartiq.sh prod INCR --stage curated --replay-from 2026-08-15 --replay-to 20
 Rewind the watermark only when the SOURCE must be re-read (data fixed
 upstream, or RAW lost the window).
 
+Under `raw.mode = SOURCE` the first question does not arise: the source
+table is the raw layer, so every replay (`--run-id`, `--replay-*`,
+`--pending`) re-reads it by the run's recorded window, and a rewind is
+only for re-selecting partitions the watermark has already passed.
+
 The store is append-only BY DESIGN — versioning is the answer to Hive's
 lack of ACID. A rewind is therefore an APPEND of a new highest version
 carrying the older value; nothing is ever updated, and history keeps
@@ -679,6 +692,11 @@ Typical support loop:
 - If RAW already succeeded, curated **replays from the RAW `run_id` slice**
   (`resumeCuratedSlice` reads the RAW table filtered by `run_id`) instead of
   re-reading the source or re-appending to RAW.
+- Under `raw.mode = SOURCE` (hive sources) there is no RAW table: a resumed
+  or replayed run re-reads the **source** for the window its `raw` ledger
+  row recorded (`window_start` / `window_end`). `HIVE_008` means those
+  partitions no longer exist at the source — the source owner's retention
+  is the replay horizon; nothing in the framework can recover them.
 
 ### 5.2 Idempotency guarantees
 

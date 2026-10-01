@@ -104,10 +104,15 @@ final class RetentionService(
   private[retention] def cutoffDate(days: Int): LocalDate =
     LocalDate.now(sessionZone).minusDays(days.toLong)
 
+  /** None under raw.mode = SOURCE: the source table is the raw layer and is
+    * never purged by the framework (the source owner's retention is the
+    * replay horizon); retention.raw is rejected there (CFG_028) anyway. */
   private def rawTable: Option[String] =
-    ConfigUtils.optConfig(feedConf, "raw").map { r =>
-      s"${ConfigUtils.sqlIdentifier(r, "database")}.${ConfigUtils.sqlIdentifier(r, "table")}"
-    }
+    ConfigUtils.optConfig(feedConf, "raw")
+      .filterNot(r => ConfigUtils.optString(r, "mode").exists(_.trim.equalsIgnoreCase("SOURCE")))
+      .map { r =>
+        s"${ConfigUtils.sqlIdentifier(r, "database")}.${ConfigUtils.sqlIdentifier(r, "table")}"
+      }
 
   private def rejectTable: Option[String] =
     ConfigUtils.optConfig(feedConf, "rejects").filter(_.hasPath("database")).map { r =>

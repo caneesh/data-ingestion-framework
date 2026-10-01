@@ -1,6 +1,6 @@
 package com.hcsc.generic.ingest.jdbc.mssql
 
-import com.hcsc.generic.ingest.jdbc.watermark.InMemoryWatermarkStore
+import com.hcsc.generic.ingest.watermark.InMemoryWatermarkStore
 import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach, Suite}
 import org.testcontainers.containers.MSSQLServerContainer
 

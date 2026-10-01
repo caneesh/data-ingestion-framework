@@ -2,7 +2,8 @@ package com.hcsc.generic.ingest.jdbc
 
 import com.hcsc.generic.ingest.jdbc.dialect.SqlServerDialect
 import com.hcsc.generic.ingest.jdbc.read.QueryBuilder
-import com.hcsc.generic.ingest.jdbc.watermark.{WatermarkValue, Watermarks}
+import com.hcsc.generic.ingest.jdbc.watermark.Watermarks
+import com.hcsc.generic.ingest.watermark.WatermarkValue
 import com.typesafe.config.ConfigFactory
 import org.scalatest.funsuite.AnyFunSuite
 

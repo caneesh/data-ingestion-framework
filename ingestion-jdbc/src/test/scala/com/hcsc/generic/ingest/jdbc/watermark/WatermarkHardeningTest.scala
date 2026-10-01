@@ -3,6 +3,7 @@ package com.hcsc.generic.ingest.jdbc.watermark
 import com.hcsc.generic.ingest.jdbc.{JdbcSource, JdbcSourceConfig, SharedSparkSession, WatermarkConfig, WatermarkType}
 import com.hcsc.generic.ingest.jdbc.dialect.GenericDialect
 import com.hcsc.generic.ingest.jdbc.read.SqlFailureClassifier
+import com.hcsc.generic.ingest.watermark.{InMemoryWatermarkStore, WatermarkValue}
 import com.typesafe.config.ConfigFactory
 import org.scalatest.funsuite.AnyFunSuite
 

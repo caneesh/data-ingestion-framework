@@ -1,7 +1,7 @@
 package com.hcsc.generic.ingest.jdbc.mssql
 
 import com.hcsc.generic.ingest.jdbc.read.SqlFailureClassifier
-import com.hcsc.generic.ingest.jdbc.watermark.InMemoryWatermarkStore
+import com.hcsc.generic.ingest.watermark.InMemoryWatermarkStore
 import com.hcsc.generic.ingest.jdbc.{JdbcSource, JdbcSourceConfig, SharedSparkSession}
 import com.hcsc.generic.ingest.jdbc.health.JdbcHealthCheck
 import com.typesafe.config.{Config, ConfigFactory}

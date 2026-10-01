@@ -3,7 +3,8 @@ package com.hcsc.generic.ingest.confgen.validate
 import com.hcsc.generic.ingest.jdbc.{JdbcMode, JdbcSourceConfig}
 import com.hcsc.generic.ingest.jdbc.health.JdbcHealthCheck
 import com.hcsc.generic.ingest.jdbc.read.QueryBuilder
-import com.hcsc.generic.ingest.jdbc.watermark.{WatermarkValue, Watermarks}
+import com.hcsc.generic.ingest.jdbc.watermark.Watermarks
+import com.hcsc.generic.ingest.watermark.WatermarkValue
 import com.hcsc.generic.ingest.schema.SchemaContract
 import com.typesafe.config.{Config, ConfigFactory, ConfigValueFactory}
 

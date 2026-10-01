@@ -2,6 +2,7 @@ package com.hcsc.generic.ingest.jdbc.watermark
 
 import com.hcsc.generic.ingest.jdbc.{WatermarkConfig, WatermarkType}
 import com.hcsc.generic.ingest.jdbc.dialect.{GenericDialect, SqlServerDialect}
+import com.hcsc.generic.ingest.watermark.WatermarkValue
 import org.scalatest.funsuite.AnyFunSuite
 
 /** Typed watermark codecs for Azure SQL column types: DATE, DATETIMEOFFSET

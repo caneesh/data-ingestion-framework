@@ -2,6 +2,7 @@ package com.hcsc.generic.ingest.jdbc.watermark
 
 import com.hcsc.generic.ingest.jdbc.{BoundaryConvention, JdbcSource, JdbcSourceConfig, WatermarkConfig, WatermarkType, WatermarkUpperBound}
 import com.hcsc.generic.ingest.jdbc.dialect.SqlServerDialect
+import com.hcsc.generic.ingest.watermark.WatermarkValue
 import com.typesafe.config.ConfigFactory
 import org.scalatest.funsuite.AnyFunSuite
 

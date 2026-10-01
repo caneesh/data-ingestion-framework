@@ -1,6 +1,6 @@
 package com.hcsc.generic.ingest.app
 
-import com.hcsc.generic.ingest.jdbc.watermark.{HiveWatermarkStore, VersionedWatermark, WatermarkConflictException, WatermarkValue}
+import com.hcsc.generic.ingest.watermark.{HiveWatermarkStore, VersionedWatermark, WatermarkConflictException, WatermarkValue}
 import org.apache.spark.sql.SparkSession
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite

@@ -224,6 +224,12 @@ analysis missed.
 
 ### H1 — Move watermark primitives to `ingestion-core`
 
+**Status: DONE 2026-09-30** on branch `h1/watermark-to-core` — full reactor
+green at 890 tests / 0 failures (baseline 884 + 6 new), fat-jar layout
+verified, no reference to the old package remains. Lessons recorded below
+and in the scenario matrix (R-05): config-gen was outside the inventory;
+never resume a cross-module move with `-rf` (core resolves from `~/.m2`).
+
 - New package `com.hcsc.generic.ingest.watermark` in core with:
   `WatermarkValue` (split out of `Watermarks.scala` — it is currently
   co-located with jdbc predicate code), `WatermarkStore` trait,
@@ -234,10 +240,14 @@ analysis missed.
   types. jdbc imports updated; **no behavior change**.
 - Error-code text stays (`JDBC_003` identifier checks, `JDBC_005` conflict)
   so existing operator docs and log greps remain valid. Do not renumber.
-- **Blast radius (verified):** 3 `ingestion-jdbc` main files
-  (`Watermarks.scala`, `WatermarkStore.scala`, `JdbcSource.scala`), 11
-  `ingestion-jdbc` test files and 4 `ingestion-app` test files reference the
-  moved types — all import-path rewrites. `WatermarkCodecsTest` exercises
+- **Blast radius (verified, then corrected in execution):** 3 `ingestion-jdbc`
+  main files (`Watermarks.scala`, `WatermarkStore.scala`, `JdbcSource.scala`),
+  **plus 1 `ingestion-config-gen` main file** —
+  `confgen/validate/DryRunValidator.scala:6` imports `WatermarkValue`;
+  config-gen depends on jdbc and the inventory missed it (caught by the
+  full-reactor compile, not by the module-scoped gate). 11 `ingestion-jdbc`
+  test files and 4 `ingestion-app` test files reference the moved types —
+  all import-path rewrites. `WatermarkCodecsTest` exercises
   `Watermarks.predicate/compare` with dialects, not `WatermarkValue`; it
   stays in jdbc.
 - **Tests:** two `WatermarkValue` round-trip tests already exist and **move
@@ -681,10 +691,12 @@ projection.
 
 ## Execution order and gating
 
-1. **H0 → H1** first, alone, as its own PR. Gate: `ingestion-jdbc` suite
-   green with zero test edits, plus `HiveWatermarkStoreSpec` and
-   `HiveWatermarkDuplicateVersionSpec` in `ingestion-app`. Nothing else
-   starts until this merges — every later item imports from the new package.
+1. **H0 → H1** first, alone, as its own PR. Gate: the **full reactor**
+   compiles (config-gen depends on jdbc — a module-scoped compile missed
+   it), `ingestion-jdbc` suite green with import-only test edits, plus
+   `HiveWatermarkStoreSpec` and `HiveWatermarkDuplicateVersionSpec` in
+   `ingestion-app`. Nothing else starts until this merges — every later
+   item imports from the new package.
 2. **H2 + H3 + H4 + H5** together (the source is not usable without its
    validation). Includes the one-line `run_mode` injection in
    `IngestPipeline.scala` (H5). Gate: H7 unit tests, with the

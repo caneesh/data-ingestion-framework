@@ -1,6 +1,6 @@
 package com.hcsc.generic.ingest.jdbc
 
-import com.hcsc.generic.ingest.jdbc.watermark.InMemoryWatermarkStore
+import com.hcsc.generic.ingest.watermark.InMemoryWatermarkStore
 import com.hcsc.generic.ingest.schema.SchemaContractViolationException
 import com.typesafe.config.{Config, ConfigFactory}
 import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach}
@@ -200,10 +200,10 @@ class JdbcSourceH2Test extends AnyFunSuite with SharedSparkSession with BeforeAn
 
     // A competing run commits first
     InMemoryWatermarkStore.recordIfVersion("race_feed",
-      com.hcsc.generic.ingest.jdbc.watermark.WatermarkValue(Seq("35")), "competitor", 0L)
+      com.hcsc.generic.ingest.watermark.WatermarkValue(Seq("35")), "competitor", 0L)
 
     // Run A's commit must now conflict instead of silently overwriting
-    val ex = intercept[com.hcsc.generic.ingest.jdbc.watermark.WatermarkConflictException] {
+    val ex = intercept[com.hcsc.generic.ingest.watermark.WatermarkConflictException] {
       JdbcSource.advanceWatermark(spark, incremental, "race_feed", "run-a", dfA)
     }
     assert(ex.getMessage.contains("JDBC_005"))

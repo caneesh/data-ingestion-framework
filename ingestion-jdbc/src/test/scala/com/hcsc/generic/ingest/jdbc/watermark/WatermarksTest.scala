@@ -2,6 +2,7 @@ package com.hcsc.generic.ingest.jdbc.watermark
 
 import com.hcsc.generic.ingest.jdbc.{SharedSparkSession, WatermarkConfig, WatermarkType}
 import com.hcsc.generic.ingest.jdbc.dialect.{GenericDialect, SqlServerDialect}
+import com.hcsc.generic.ingest.watermark.{InMemoryWatermarkStore, VersionedWatermark, WatermarkConflictException, WatermarkValue}
 import org.scalatest.funsuite.AnyFunSuite
 
 class WatermarksTest extends AnyFunSuite with SharedSparkSession {

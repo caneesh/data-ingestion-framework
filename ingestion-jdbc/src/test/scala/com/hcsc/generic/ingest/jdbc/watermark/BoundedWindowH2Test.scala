@@ -1,6 +1,7 @@
 package com.hcsc.generic.ingest.jdbc.watermark
 
 import com.hcsc.generic.ingest.jdbc.{JdbcSource, SharedSparkSession}
+import com.hcsc.generic.ingest.watermark.InMemoryWatermarkStore
 import com.typesafe.config.{Config, ConfigFactory}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite

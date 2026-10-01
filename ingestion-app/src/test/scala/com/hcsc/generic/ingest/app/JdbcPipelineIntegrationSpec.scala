@@ -1,7 +1,7 @@
 package com.hcsc.generic.ingest.app
 
 import com.hcsc.generic.ingest.jdbc.JdbcSource
-import com.hcsc.generic.ingest.jdbc.watermark.InMemoryWatermarkStore
+import com.hcsc.generic.ingest.watermark.InMemoryWatermarkStore
 import com.hcsc.generic.ingest.model.Cli
 import com.hcsc.generic.ingest.pipeline.IngestPipeline
 import com.hcsc.generic.ingest.publish.PublishValidationException

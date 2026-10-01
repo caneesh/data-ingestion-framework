@@ -3,9 +3,10 @@ package com.hcsc.generic.ingest.jdbc
 import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.jdbc.health.JdbcHealthCheck
 import com.hcsc.generic.ingest.jdbc.read.{DriverQueries, QueryBuilder, RetryPolicy}
-import com.hcsc.generic.ingest.jdbc.watermark.{WatermarkStores, WatermarkValue, Watermarks}
+import com.hcsc.generic.ingest.jdbc.watermark.{WatermarkStores, Watermarks}
 import com.hcsc.generic.ingest.schema.{SchemaContract, SchemaValidator}
 import com.hcsc.generic.ingest.source.{Source, SourceRegistry, WatermarkAdvancing}
+import com.hcsc.generic.ingest.watermark.WatermarkValue
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SparkSession}
@@ -576,14 +577,14 @@ object JdbcSource extends Source with WatermarkAdvancing {
         case None =>
           logger.info(s"[JdbcSource] entity=$entity nothing beyond current watermark; not advanced")
         case Some(next) =>
-          val detail = com.hcsc.generic.ingest.jdbc.watermark.WatermarkCommitDetail(
+          val detail = com.hcsc.generic.ingest.watermark.WatermarkCommitDetail(
             lower = Some(lower.serialized),
             queryHash = window.flatMap(_.queryHash))
           try {
             store.recordIfVersion(entity, next, runId, version, detail)
             JdbcMetrics.increment("jdbc_watermark_commit_total")
           } catch {
-            case e: com.hcsc.generic.ingest.jdbc.watermark.WatermarkConflictException =>
+            case e: com.hcsc.generic.ingest.watermark.WatermarkConflictException =>
               JdbcMetrics.increment("jdbc_watermark_conflict_total")
               throw e
           }

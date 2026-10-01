@@ -1,6 +1,6 @@
 package com.hcsc.generic.ingest.jdbc
 
-import com.hcsc.generic.ingest.jdbc.watermark.{InMemoryWatermarkStore, WatermarkConflictException}
+import com.hcsc.generic.ingest.watermark.{InMemoryWatermarkStore, WatermarkConflictException}
 import com.typesafe.config.ConfigFactory
 import org.scalatest.funsuite.AnyFunSuite
 

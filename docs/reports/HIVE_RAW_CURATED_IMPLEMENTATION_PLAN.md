@@ -1,4 +1,4 @@
-# Hive Source Implementation Plan (bstar_raw → bluestar_raw → bluestar_curated)
+# Hive Source Implementation Plan (bstar_raw → bluestar_raw → bluestar_current)
 
 **Baseline:** main @ `a4ab516`.
 **Reviewed:** three independent verification passes on 2026-09-30 —
@@ -9,7 +9,7 @@ matrix, regression safeguards, and two decisions (§0) that amend this plan.
 **Goal:** ingest two existing partitioned Hive tables (`bstar_raw.priv_addr`,
 `bstar_raw.sub_prem_det`, partitioned `inc_ful_flag=I|F / file_date=yyyy-MM-dd
 / file_time=HH.mm.ss`) through the framework pipeline into
-`bluestar_curated.<table>` by keyed merge. The source is the raw layer
+`bluestar_current.<table>` by keyed merge. The source is the raw layer
 (`raw.mode = SOURCE`, H11); `bluestar_raw` hosts only the control tables.
 Each run picks up partitions newer than a stored watermark over
 `(file_date, file_time)` minus a lookback. A physical-copy mode (`COPY`)
@@ -107,7 +107,7 @@ feeds {
     }
 
     curated {
-      database = bluestar_curated
+      database = bluestar_current
       table    = <table>
       merge {
         keys = ["<unique identifier>"]
@@ -642,8 +642,8 @@ projection.
 - `docs/examples/bstar_<table>/params/feed-bstar-<table>.conf` and
   `lower-env/` variant, cloned from the smartiq layout (control tables in
   `bluestar_raw`, explicit table names, retention, notifications).
-- `ddl/curated_ddl.sql` for `bluestar_curated.priv_addr` and
-  `bluestar_curated.sub_prem_det` — **written** (`docs/examples/bstar/ddl/`,
+- `ddl/curated_ddl.sql` for `bluestar_current.priv_addr` and
+  `bluestar_current.sub_prem_det` — **written** (`docs/examples/bstar/ddl/`,
   committed `f9ecf10`) and handed to consumers ahead of the pipeline.
   Unpartitioned, latest-per-key, every framework audit column verified as
   stamped. **No RAW DDL for the bstar feeds** — they run `raw.mode = SOURCE`

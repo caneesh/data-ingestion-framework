@@ -1,8 +1,8 @@
-# bstar → bluestar_curated — consumer notes
+# bstar → bluestar_current — consumer notes
 
 Two curated tables, created ahead of the pipeline so downstream work can
-start against a fixed schema: `bluestar_curated.priv_addr` and
-`bluestar_curated.sub_prem_det`. DDL in `ddl/curated_ddl.sql`.
+start against a fixed schema: `bluestar_current.priv_addr` and
+`bluestar_current.sub_prem_det`. DDL in `ddl/curated_ddl.sql`.
 
 ## What the tables are
 

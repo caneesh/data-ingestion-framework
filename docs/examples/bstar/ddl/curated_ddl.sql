@@ -14,7 +14,7 @@
 --   beeline -u '<jdbc-url>' --hivevar LOCATION=hdfs://NAMESERVICE/base -f THIS_FILE
 --
 -- Verify afterwards — the Location row must contain no '$':
---   DESCRIBE FORMATTED bluestar_curated.<table>;
+--   DESCRIBE FORMATTED bluestar_current.<table>;
 --
 -- Pre-creating is OPTIONAL. The framework creates these tables itself when
 -- they are absent, which sidesteps this entirely.
@@ -81,7 +81,7 @@
 -- (addr_type_cd may belong in the key instead of / as well as addr_seq_nbr).
 -- Source: 227 partitions, 144 files, ~77 KB — trivial volume.
 -- ---------------------------------------------------------------------------
-CREATE EXTERNAL TABLE IF NOT EXISTS bluestar_curated.priv_addr (
+CREATE EXTERNAL TABLE IF NOT EXISTS bluestar_current.priv_addr (
   `corp_ent_cd`           STRING        COMMENT 'src: char(3)       | KEY (proposed)',
   `acct_grp_nbr`          STRING        COMMENT 'src: char(9)       | KEY (proposed)',
   `sub_seq_nbr`           INT           COMMENT 'src: int           | KEY (proposed)',
@@ -125,7 +125,7 @@ LOCATION '${LOCATION}/priv_addr';
 -- Source: 637 partitions, 414 files, ~30.9 GB UNCOMPRESSED TEXT — first
 -- light is a real Spark job; parse cost, not scan cost, dominates.
 -- ---------------------------------------------------------------------------
-CREATE EXTERNAL TABLE IF NOT EXISTS bluestar_curated.sub_prem_det (
+CREATE EXTERNAL TABLE IF NOT EXISTS bluestar_current.sub_prem_det (
   `corp_ent_cd`           STRING        COMMENT 'src: char(3)       | KEY (proposed)',
   `acct_nbr`              STRING        COMMENT 'src: char(6)       | KEY (proposed)',
   `ben_agmt_nbr`          SMALLINT      COMMENT 'src: smallint      | KEY (proposed)',

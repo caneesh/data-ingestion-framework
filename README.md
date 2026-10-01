@@ -30,6 +30,7 @@ data-ingestion-framework/
 ├── ingestion-jdbc/      # JDBC source connector (SQL Server, DB2, Oracle, etc.)
 ├── ingestion-config-gen/  # Interactive feed configuration generator (CLI wizard)
 ├── ingestion-kafka/     # Kafka batch source connector (offset-tracked)
+├── ingestion-hive/      # Hive table source connector (partition-value watermark)
 └── ingestion-app/       # Main application entry point
 ```
 
@@ -41,6 +42,7 @@ data-ingestion-framework/
 | `ingestion-file` | File source: CSV, JSON, Parquet with header handling, aliases, trailer removal |
 | `ingestion-jdbc` | JDBC subsystem: dialect registry (Azure SQL Server, PostgreSQL, Oracle, DB2, MySQL), four read modes, secret providers, watermark-based incremental loading, health checks, retries |
 | `ingestion-kafka` | Kafka source: batch reads with JSON/string parsing |
+| `ingestion-hive` | Hive source: an existing partitioned table read incrementally by a lexicographic watermark over its partition values, with lookback, partition pruning at the catalog, and the shared watermark store |
 | `ingestion-app` | Application entry point bundling all connectors |
 
 ## Features
@@ -49,6 +51,7 @@ data-ingestion-framework/
 - **File**: CSV, JSON, Parquet, ORC with configurable delimiters, headers, multiline
 - **JDBC**: Any JDBC-compliant database with parallel partition reads
 - **Kafka**: Batch consumption with JSON/string value parsing
+- **Hive**: An existing partitioned Hive table, selected by partition values newer than a stored watermark (minus a lookback); only the matching partitions are scanned
 
 ### Core Capabilities
 - Configuration-driven pipeline definition (Typesafe Config / HOCON)

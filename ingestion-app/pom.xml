@@ -32,6 +32,10 @@
     </dependency>
     <dependency>
       <groupId>com.hcsc.generic</groupId>
+      <artifactId>ingestion-hive</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.hcsc.generic</groupId>
       <artifactId>ingestion-config-gen</artifactId>
     </dependency>
     <dependency>

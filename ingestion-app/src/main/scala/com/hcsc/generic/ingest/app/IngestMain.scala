@@ -2,6 +2,7 @@ package com.hcsc.generic.ingest.app
 
 import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.file.FileSource
+import com.hcsc.generic.ingest.hive.HiveSource
 import com.hcsc.generic.ingest.jdbc.JdbcSource
 import com.hcsc.generic.ingest.kafka.KafkaSource
 import com.hcsc.generic.ingest.model.{Cli, CliParser}
@@ -411,6 +412,7 @@ object IngestMain {
     FileSource.register()
     JdbcSource.register()
     KafkaSource.register()
+    HiveSource.register()
     HiveSink.register()
   }
 }

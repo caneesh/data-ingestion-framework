@@ -104,8 +104,10 @@ trait WatermarkAdvancing { self: Source =>      // source/WatermarkAdvancing.sca
 }
 ```
 
-`JdbcSource` mixes in `WatermarkAdvancing`; `FileSource`/`KafkaSource` are
-plain `Source`s.
+`JdbcSource`, `KafkaSource` and `HiveSource` mix in `WatermarkAdvancing`;
+`FileSource` is a plain `Source`. `HiveSource` (`ingestion-hive`) registers
+like the others from `IngestMain.registerConnectors` and keeps its watermark
+in the shared `ingest_watermarks` store via the core `HiveWatermarkStore`.
 
 ---
 

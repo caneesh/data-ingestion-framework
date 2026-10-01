@@ -37,6 +37,19 @@ remains the framework default for feeds that need their own RAW.
   feeds; it is **not** a framework assumption — the source must keep
   handling several partitions per day, late and out-of-order deliveries,
   and `F` snapshots whenever they arrive.
+- **2026-10-01:** `cdc_src_actn_cd` vocabulary is `DL` (delete), `PT`
+  (insert), `UP` (update) — `deletes.mode = SOFT` with
+  `indicator_values = ["dl"]`. Partitions are **never rewritten in place**;
+  lookback exists for late files, not for rewrites.
+- **2026-10-01:** `bstar_raw` is a **Sqoop landing from the Bluestar DB2
+  database**: the `cdc_*` columns come from DB2 change capture, `F`
+  partitions are full Sqoop extracts, `I` partitions the daily deltas, and
+  the DB2 `CHAR` padding and microsecond `TIMESTAMP` precision arrive
+  through Sqoop unchanged. The framework reads the landing rather than DB2
+  directly — one extraction, one source of truth that consumers already
+  query, no second load on DB2. Consequence: a Sqoop run that never lands
+  a file is invisible to every in-run check (a zero-partition run is a
+  healthy run) — see the H10 monitoring note.
 
 **Global constraints honored:** Scala 2.12 / Spark 3.5 / Java 11 unchanged;
 no library upgrades; every new config key is opt-in; existing tests never
@@ -44,10 +57,12 @@ modified to force a pass; no credential/PII logging; docs, reference config
 and DDL land in the same change as the code.
 
 **Open question carried into H10 (gating):** the owner has confirmed the
-source loads once a day in the morning, which sizes `lookback` at a few
-days; still to confirm: whether a partition is ever rewritten in place, and
-the business keys. Inside the lookback window late and rewritten partitions
-are handled by re-reading; beyond it, `--stage reconcile` is the detector.
+source loads once a day in the morning (sizes `lookback` at a few days),
+that partitions are **never rewritten in place**, the action-code
+vocabulary (`DL` / `PT` / `UP`), and both business keys (from the CDC key
+markers). Nothing gating remains. Inside the lookback window late
+partitions are handled by re-reading; beyond it, `--stage reconcile` is
+the detector.
 
 ---
 
@@ -110,16 +125,31 @@ feeds {
       database = bluestar_current
       table    = <table>
       merge {
-        keys = ["<unique identifier>"]
-        # Partition tuple is the natural freshness; both are zero-padded
-        # strings so lexicographic order is chronological.
-        freshness { column = "file_date", tie_breakers = ["file_time"], compare_as = "string" }
-        # Two rows with the same key AND the same (file_date, file_time) —
-        # duplicates inside one partition — have no winner here. Add a source
-        # sequence/timestamp column to tie_breakers if bstar_raw has one; if
-        # not, H9 records that such ties resolve by row order.
-        deletes { mode = "IGNORE" }
+        # Confirmed 2026-10-01 from the source CDC key markers (DB2 PK):
+        #   priv_addr:    corp_ent_cd, acct_grp_nbr, sub_seq_nbr, mem_nbr, addr_seq_nbr
+        #   sub_prem_det: corp_ent_cd, acct_nbr, ben_agmt_nbr, sub_seq_nbr,
+        #                 sub_prm_hst_sq_nbr, sub_prm_eff_sq_nbr, sub_prm_det_sq_nbr
+        keys = ["<per table, above>"]
+        # CDC feed: the capture timestamp is the freshness. Samples show
+        # yyyy-MM-dd HH:mm:ss.SSSSSS (fixed width), so compare_as = timestamp
+        # and string tie-breaks are both safe. The partition tuple breaks
+        # ties: later delivery wins.
+        freshness {
+          column       = "cdc_src_last_updt_ts"
+          compare_as   = "timestamp"
+          tie_breakers = ["<table>_lcts", "file_date", "file_time"]
+        }
+        # Source deletes are signaled by cdc_src_actn_cd — owner-confirmed
+        # vocabulary (2026-10-01): DL = delete, PT = insert, UP = update.
+        # The match is lower(trim(value)), so the CHAR(2) padding and case
+        # are irrelevant; the value must be lowercase here.
+        deletes {
+          mode             = "SOFT"
+          indicator_column = "cdc_src_actn_cd"
+          indicator_values = ["dl"]
+        }
       }
+      dedup { order_by = ["cdc_src_last_updt_ts", "<table>_lcts"] }
     }
 
     # audit / rejects / concurrency / reconcile / retention / notifications:
@@ -676,10 +706,29 @@ projection.
   with no cast (`:90-93`); plus the `RawMetadata.ColumnTypes` set
   (`transform/RawMetadata.scala:48-67`). That guidance lives in the
   reference config, not in a bstar file.
-- **Business keys: to be supplied by the owner.** Proposed keys are in the
-  DDL comments; `publish.enforce_unique_keys` catches a too-coarse key at
-  the first publish, a too-fine key is caught by nothing — confirm against
-  the source primary key, do not infer.
+- **Business keys: confirmed 2026-10-01** against the source's CDC
+  replication definition (key-marked columns = DB2 primary key); both match
+  the proposals in the DDL. `priv_addr`: `corp_ent_cd, acct_grp_nbr,
+  sub_seq_nbr, mem_nbr, addr_seq_nbr`. `sub_prem_det`: `corp_ent_cd,
+  acct_nbr, ben_agmt_nbr, sub_seq_nbr, sub_prm_hst_sq_nbr,
+  sub_prm_eff_sq_nbr, sub_prm_det_sq_nbr` — `tier_agrgt_seq_nbr`,
+  `corp_tier_nbr`, `mem_nbr` are not keys; `addr_type_cd` is not a key
+  either (owner-confirmed). Both key sets are final.
+- **Sample rows (PROD, 2026-10-01) settled the formats and overturned one
+  assumption.** Timestamps (`cdc_src_last_updt_ts`, `*_lcts`) are
+  `yyyy-MM-dd HH:mm:ss.SSSSSS`; dates (`addr_eff_dt`, `addr_end_dt`) are
+  `yyyy-MM-dd`; `file_date` / `file_time` are `yyyy-MM-dd` / `HH.mm.ss`,
+  zero-padded — `watermark_formats` and `compare_as = timestamp` stand as
+  configured. Changes captured around 23:00 land in the next morning's
+  file (~05:00), matching the once-daily load. `cdc_src_actn_cd` is a
+  two-letter code, not I/U/D as first assumed — owner-confirmed on
+  2026-10-01 as `DL` (delete), `PT` (insert), `UP` (update), so
+  `deletes.indicator_values = ["dl"]`; the former first-light blocker is
+  closed.
+  `mem_nbr` is NULL in `sub_prem_det` samples — excluded from that key;
+  `tier_agrgt_seq_nbr` varied with `sub_prm_det_sq_nbr` and may belong in
+  it. Sample values are PII and are not stored in the repo; only these
+  derived facts are.
 - `params/bstar-<table>-schema.conf` — a schema contract is **mandatory**
   here, not the optional nicety it is for smartiq, for two reasons.
   (1) Without one, `record_hash` covers every non-framework column
@@ -706,10 +755,12 @@ projection.
 
 ### H10 — Rollout
 
-- Ask the source owner **before** first light: how late can a file arrive
-  (largest `file_date`-to-landing gap), and is a partition ever rewritten
-  in place? Set `lookback` from the answer with margin; record both the
-  answer and the setting in the feed config header.
+- Confirmed with the source owner: both primary keys (from the CDC key
+  markers), action codes `DL`/`PT`/`UP`, partitions never rewritten in
+  place, daily morning load, `addr_type_cd` not a key. The only open
+  detail, non-blocking: the largest `file_date`-to-landing gap if known
+  more precisely than "once a day" (sets `lookback` margin). Record every
+  answer in the feed config header.
 - Lower-env: first light from `initial_value`, then an empty run, then a
   two-partition delta, then `--stage reconcile` and `--stage retention
   --dry-run`.
@@ -721,7 +772,12 @@ projection.
   duplicate-definition situation seen on ORDER_CAPTURE_PDP). The cadence
   is a scheduling fact, not a framework assumption: a second morning file,
   a late afternoon re-delivery, or an `F` snapshot on any day are handled by
-  the same run.
+  the same run. **MONITORING must check the source side too:** the newest
+  `file_date` partition in `bstar_raw` must be no older than N days. A
+  Sqoop run that never lands leaves curated's latest SUCCESS fresh — the
+  INCR run finds no new partition and succeeds with zero rows — so only
+  the source-side age reveals it. Add `audit.reconciliation.min_accepted_rows
+  = 1` only if the owner confirms a day can never have zero changes.
 - Production first light per the runbook's "Initial load" section.
 
 ### H11 — `raw.mode = SOURCE`: the Hive source as the raw layer

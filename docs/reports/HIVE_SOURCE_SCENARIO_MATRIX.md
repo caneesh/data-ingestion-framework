@@ -2,8 +2,9 @@
 
 **Status:** author pass merged with an independent QA enumeration and a
 regression inventory of every touched file (2026-09-30). Baseline `mvn test`
-recorded (R-01: 884 tests, 0 failures). Items marked ◆ were found by the
-independent pass and missed by the author pass. Companion to `HIVE_RAW_CURATED_IMPLEMENTATION_PLAN.md`;
+recorded (R-01: 884 tests, 0 failures; after H1: 890). Items marked ◆ were
+found by the independent pass and missed by the author pass. Section L
+(2026-09-30) covers `raw.mode = SOURCE`, decided after the first pass. Companion to `HIVE_RAW_CURATED_IMPLEMENTATION_PLAN.md`;
 plan item references (H0–H10) are to that document.
 
 **Purpose:** before any code, (1) enumerate every scenario the `hive` source
@@ -225,6 +226,22 @@ the item that covers it, or **GAP**.
 | K12 | ◆ Source partition **key set** changes after first light (a 4th partition column appears) | Pruning is still correct on the watermark columns; every value of the new column is selected — silent semantic widening | WARN naming the new column; no error | H3 step 2 (amended, low) |
 | K13 | ◆ Long HMS enumeration vs. lock lease | Heartbeat runs on its own thread every `lease/3`; enumeration cannot starve it | Assert renewals during a slow (mocked) enumeration | H7 (low) |
 
+### L. `raw.mode = SOURCE` — the source as the raw layer (decided 2026-09-30)
+
+| # | Scenario | Expected | Pass | Plan |
+|---|----------|----------|------|------|
+| L1 | First light under `SOURCE` | No RAW table is written or created; ledger `raw SUCCESS` row carries the partition window and `raw_count` = accepted; curated built; watermark committed | `SHOW TABLES IN bluestar_raw` shows only control tables; ledger row present | H11 |
+| L2 | `--stage curated --pending` in a fresh JVM | Re-reads the *source* for the recorded `window_start`/`window_end` of that run and publishes; watermark advanced from the ledger (C3 fix) | Curated current; no RAW access attempted | H11 |
+| L3 | A recorded window's partition was purged from the source before replay | `HIVE_008`, fail loudly naming the partition; nothing published | Clear error; ledger `curated FAILED` | H11 — the coupling cost of `SOURCE` |
+| L4 | `--resume-ingest-dt` under `SOURCE` | Rejected at CLI validation — there is no `ingest_dt` | Clear error pointing at `--pending` / `--replay-from` | H11 |
+| L5 | `retention.raw`, `raw.database/table`, `delivery_mode`, `idempotency_key`, `partitioning` present under `SOURCE` | `CFG_028` each | Validator test per key | H11 |
+| L6 | `raw.mode = SOURCE` with `source.type = jdbc` / `file` / `kafka` | `CFG_028` — only a Hive source is a durable table | Validator test | H11 |
+| L7 | Lookback re-read under `SOURCE` | Re-read rows re-feed curated; freshness absorbs; `raw_overlap_reread` recorded; no RAW-duplicate question exists | Accounting identity holds | H11 |
+| L8 | `raw_equals_accepted` and the run-id idempotency guard | Skipped under `SOURCE`; `source_equals_accepted_plus_rejected`, `curated_accounts_for_accepted_rows`, `watermark_continuity` unchanged | Reconciliation rows present for the unchanged checks only | H11 |
+| L9 | A `COPY`-mode hive feed (future) and every existing JDBC/file feed | Byte-identical behavior before and after H11 | R-17 goldens | H11 |
+| L10 | Source retention shorter than the replay horizon | Replay beyond the source's retention is impossible by construction; `--stage reconcile` still proves curated against whatever the source retains | Runbook: `SOURCE` makes the source owner's retention promise part of the feed's contract | H8 |
+| L11 | Daily morning load, one partition per table per day (the bstar cadence) | INCR once daily after the load window reads exactly one new partition plus the lookback re-read; a second same-day file, a late afternoon re-delivery or an `F` on any day are read by the same run — the cadence is scheduling, not an assumption | Integration: two partitions in one day land in one run | H3, H10 |
+
 ---
 
 ## 2. Regression safeguards
@@ -254,6 +271,7 @@ a behavior the plan touches has **no test today**, a golden test is added
 | R-14 | No `source.type` site changes its default for an absent or unknown type | Complete inventory: `IngestionPattern:63, 74-78`; `FeedCompatibilityValidator:20, 29, 86, 97`; `RawStageRunner:38`; `IngestPipeline:80, 244, 369, 511, 586, 669`; `confgen/DryRunValidator:39-45`, `ConfigAssembler:37-38, 122`, `ConfigGeneratorMain:100, 131`. No exhaustive match throws on an unknown type |
 | R-15 | Kafka path unchanged | **`ingestion-kafka` has no test directory** — nothing can prove this. The plan cites `KafkaSource` as the `WatermarkAdvancing` template; it is the shape to copy, not verified behavior. Adding Kafka tests is out of scope; recorded |
 | R-16 | Legacy 5-column `ingest_watermarks` tables | Pre-existing, untested: `HiveTables.ensure` is `CREATE IF NOT EXISTS` only, so a store created before `lower_value`/`query_hash` fails positional `insertInto`. Not hive-specific; `bluestar_raw` is new and cannot hit it. Backlog |
+| R-17 | `raw.mode = COPY` (default) path byte-identical after H11 | Goldens: a `COPY`-mode hive feed through the full pipeline, plus the existing `JdbcPipelineIntegrationSpec` / `PipelineIntegrationSpec` / `IngestFlowIntegrationSpec` unchanged; the `SOURCE` branch is reached only when the flag is set |
 
 ---
 
@@ -277,3 +295,4 @@ author pass. *(Amended)* = the plan has been edited accordingly.
 13. **`MSCK REPAIR` obligation, `watermark_columns` change → reset, `initial_value` override no-op — undocumented** (A7, D10, D9). *(Amended: H8)*
 14. **Empty-window version-bump and `allow_empty` interplay unverified** (A3, I6). *(Amended: H7)*
 15. ◆ **Ledger-write ordering after the commit** (C11) and **heartbeat during long enumeration** (K13) — verify, low. *(Amended: H7)*
+16. **`raw.mode = SOURCE` decided 2026-09-30** — the bstar feeds use the source as the raw layer; Section L and R-17 added; plan H11 written. *(Amended: plan Goal, Decisions, target config, H9, H10, H11, Out-of-scope, execution order)*

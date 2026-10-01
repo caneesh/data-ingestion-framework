@@ -6,12 +6,14 @@ citation accuracy, pipeline integration gaps, refactor/test feasibility —
 against this branch; every finding is folded into the items below.
 **Pre-implementation gate:** `HIVE_SOURCE_SCENARIO_MATRIX.md` — scenario
 matrix, regression safeguards, and two decisions (§0) that amend this plan.
-**Goal:** ingest an existing partitioned Hive table (`bstar_raw.<table>`,
-partitioned `inc_ful_flag=I|F / file_date=yyyy-MM-dd / file_time=HH.mm.ss`)
-through the unchanged framework pipeline: a framework RAW copy
-(`bluestar_raw.<table>`, `ingest_dt`-partitioned, lineage-stamped) and a
-keyed merge into `bluestar_curated.<table>`. Each run picks up only
-partitions newer than a stored watermark over `(file_date, file_time)`.
+**Goal:** ingest two existing partitioned Hive tables (`bstar_raw.priv_addr`,
+`bstar_raw.sub_prem_det`, partitioned `inc_ful_flag=I|F / file_date=yyyy-MM-dd
+/ file_time=HH.mm.ss`) through the framework pipeline into
+`bluestar_curated.<table>` by keyed merge. The source is the raw layer
+(`raw.mode = SOURCE`, H11); `bluestar_raw` hosts only the control tables.
+Each run picks up partitions newer than a stored watermark over
+`(file_date, file_time)` minus a lookback. A physical-copy mode (`COPY`)
+remains the framework default for feeds that need their own RAW.
 
 **Decisions already taken (2026-09-29 discussion):**
 - Incremental selection: watermark on partition values, not a date range
@@ -25,17 +27,27 @@ partitions newer than a stored watermark over `(file_date, file_time)`.
   an older `file_date`) and over a processed-partition set ledger (breaks
   `watermark_continuity`, forgoes the reset/retention procedures). See
   `HIVE_SOURCE_SCENARIO_MATRIX.md` §0.1.
+- **2026-09-30:** `raw.mode = SOURCE` — the Hive source *is* the raw layer
+  for the bstar feeds; nothing is copied into `bluestar_raw`, which hosts
+  only the control tables. Both modes are framework capabilities: `COPY`
+  (default, today's behavior) and `SOURCE` (H11). Chosen because the same
+  team owns both databases, so a copy would buy isolation nobody needs.
+- **2026-09-30:** the bstar source tables are loaded **once a day, in the
+  morning**. That sizes `lookback` and the Control-M cadence for these two
+  feeds; it is **not** a framework assumption — the source must keep
+  handling several partitions per day, late and out-of-order deliveries,
+  and `F` snapshots whenever they arrive.
 
 **Global constraints honored:** Scala 2.12 / Spark 3.5 / Java 11 unchanged;
 no library upgrades; every new config key is opt-in; existing tests never
 modified to force a pass; no credential/PII logging; docs, reference config
 and DDL land in the same change as the code.
 
-**Open question carried into H10 (gating):** how late can a file arrive —
-the largest gap between a partition's `file_date` and the day it lands — and
-is an existing partition ever rewritten in place? The answer sizes
-`source.incremental.lookback` (H3 step 4). Inside the window both cases are
-handled by re-reading; beyond it, `--stage reconcile` is the detector.
+**Open question carried into H10 (gating):** the owner has confirmed the
+source loads once a day in the morning, which sizes `lookback` at a few
+days; still to confirm: whether a partition is ever rewritten in place, and
+the business keys. Inside the lookback window late and rewritten partitions
+are handled by re-reading; beyond it, `--stage reconcile` is the detector.
 
 ---
 
@@ -66,26 +78,32 @@ feeds {
         # file for an older file_date, a partition registered before its
         # files landed, or an in-place rewrite inside the window all land.
         # N comes from the source owner: "how late can a file arrive?"
-        lookback          = { days = 7 }                 # or { partitions = N }
+        lookback          = { days = 3 }                 # or { partitions = N }
+        # bstar loads once a day in the morning; 3 days covers a late or
+        # re-run delivery with margin. The framework does not assume a
+        # cadence — several partitions a day are handled identically.
         watermark_formats = ["yyyy-MM-dd", "HH.mm.ss"]   # strict: the length guard alone lets 99.99.99 through
         watermark_store { type = "hive", database = "bluestar_raw" }
       }
     }
 
     raw {
-      database = bluestar_raw
-      table    = <table>
-      record_hash = true
+      mode = "SOURCE"            # the Hive source IS the raw layer; nothing is
+                                 # written (H11). COPY (default) writes a
+                                 # physical RAW table as every feed does today.
+      record_hash      = true    # stamped on the in-memory frame; curated keeps it
       lineage_extended = true
-      # Lookback re-reads re-append rows RAW already holds. Dedup on the
-      # source-version identity so RAW stays one row per (key, partition);
-      # the raw_overlap_reread check reports how much was re-read.
-      delivery_mode   = "DEDUPLICATED_APPEND"
-      idempotency_key = ["<unique identifier>", "file_date", "file_time"]
-      partitioning {
-        keys = ["ingest_dt"]
-        derive { ingest_dt = "date_format(current_timestamp(), 'yyyy-MM-dd')" }
-      }
+      # Under SOURCE: database/table are FORBIDDEN (nothing to name);
+      # delivery_mode / idempotency_key / partitioning do not apply (nothing
+      # is written); retention.raw is rejected (CFG_028). Lookback re-reads
+      # simply re-feed curated, where freshness absorbs them.
+      #
+      # COPY-mode equivalent, for a feed that needs its own physical RAW:
+      #   mode = "COPY"
+      #   database = bluestar_raw;  table = <table>
+      #   delivery_mode = "DEDUPLICATED_APPEND"
+      #   idempotency_key = ["<key>", "file_date", "file_time"]
+      #   partitioning { keys = ["ingest_dt"]; derive { ingest_dt = "date_format(current_timestamp(), 'yyyy-MM-dd')" } }
     }
 
     curated {
@@ -113,8 +131,8 @@ feeds {
 The source partition columns (`inc_ful_flag`, `file_date`, `file_time`)
 arrive in RAW as ordinary data columns; RAW is partitioned by `ingest_dt`
 only, so retention partition-drops and `--resume-ingest-dt` keep working.
-They must be declared in the contract so the RAW write keeps them and the
-change-detection hash ignores them (H9 has the why):
+They must be declared in the contract so the change-detection hash ignores
+them and curated alignment keeps them (H9 has the why):
 
 ```hocon
 schema {
@@ -184,6 +202,11 @@ Cited so the reviewer can confirm nothing here is a change.
   `com.hcsc.generic.ingest.jdbc.reconcile.SourceReconciliationService`
   unconditionally (`IngestMain.scala:351-352`), which parses a JDBC config —
   it throws for a Hive source. The Control-M RECON job would fail.
+- The pipeline has no way to treat the source as the raw layer: `runRaw`
+  always writes through the sink, the decoupled curated reader always reads
+  a RAW slice by `run_id` (`IngestPipeline.scala:154`), and the
+  `raw_equals_accepted` / run-id idempotency checks assume a physical
+  write. A `SOURCE` mode (H11) is new capability.
 
 ---
 
@@ -619,17 +642,22 @@ projection.
 - `docs/examples/bstar_<table>/params/feed-bstar-<table>.conf` and
   `lower-env/` variant, cloned from the smartiq layout (control tables in
   `bluestar_raw`, explicit table names, retention, notifications).
-- `ddl/raw_ddl.sql`, `ddl/curated_ddl.sql` for `bluestar_raw.<table>` and
-  `bluestar_curated.<table>`. RAW carries the source columns **including
-  `inc_ful_flag`, `file_date`, `file_time` as STRING data columns** —
-  `HiveSink`'s pre-created-table path drops any non-framework column absent
-  from the target with only a WARN (`sink/HiveSink.scala:57-63`) and writes
-  by positional `insertInto` with no cast (`:90-93`), so a missing or
-  mistyped column silently loses the freshness key. Plus the
-  `RawMetadata.ColumnTypes` set (`transform/RawMetadata.scala:48-67`) with
-  `record_hash` and the `lineage_extended` columns; partitioned by
-  `ingest_dt`. Curated unpartitioned (latest-per-key, same reasoning as
-  smartiq).
+- `ddl/curated_ddl.sql` for `bluestar_curated.priv_addr` and
+  `bluestar_curated.sub_prem_det` — **written** (`docs/examples/bstar/ddl/`,
+  committed `f9ecf10`) and handed to consumers ahead of the pipeline.
+  Unpartitioned, latest-per-key, every framework audit column verified as
+  stamped. **No RAW DDL for the bstar feeds** — they run `raw.mode = SOURCE`
+  (H11). For a future `COPY`-mode hive feed the RAW DDL must carry the
+  source partition columns as STRING data columns: `HiveSink`'s pre-created
+  path drops any non-framework column absent from the target with only a
+  WARN (`sink/HiveSink.scala:57-63`) and writes by positional `insertInto`
+  with no cast (`:90-93`); plus the `RawMetadata.ColumnTypes` set
+  (`transform/RawMetadata.scala:48-67`). That guidance lives in the
+  reference config, not in a bstar file.
+- **Business keys: to be supplied by the owner.** Proposed keys are in the
+  DDL comments; `publish.enforce_unique_keys` catches a too-coarse key at
+  the first publish, a too-fine key is caught by nothing — confirm against
+  the source primary key, do not infer.
 - `params/bstar-<table>-schema.conf` — a schema contract is **mandatory**
   here, not the optional nicety it is for smartiq, for two reasons.
   (1) Without one, `record_hash` covers every non-framework column
@@ -638,8 +666,9 @@ projection.
   makes every re-delivery look changed; with a contract only
   `category = "business"` columns hash (`:49-51`; valid categories at
   `schema/SchemaContract.scala:299`) — tag the three partition columns
-  `category = "audit"`. (2) `required = true` on them turns the `HiveSink`
-  WARN-and-drop above into a failed run.
+  `category = "audit"`. (2) `required = true` fails the run if a partition
+  column ever goes missing from the source — and, for a `COPY`-mode feed,
+  turns `HiveSink`'s WARN-and-drop into a failure.
 - `watermark_formats = ["yyyy-MM-dd", "HH.mm.ss"]` is **set**, not left
   optional: the equal-length guard alone admits `99.99.99`, which sorts past
   every real time and jumps the watermark.
@@ -662,10 +691,68 @@ projection.
 - Lower-env: first light from `initial_value`, then an empty run, then a
   two-partition delta, then `--stage reconcile` and `--stage retention
   --dry-run`.
-- Control-M: INCR, MONITORING, RECON, PURGE jobs on the smartiq schedules,
-  in the `TIDLAK_MBRSHP_DATALAKE_*` folder (avoid the duplicate-definition
-  situation seen on ORDER_CAPTURE_PDP).
+- Control-M: the source loads **once a day in the morning**, so INCR runs
+  **once daily after the load window** (not the smartiq 30-minute cadence);
+  MONITORING's freshness threshold is ~36h rather than 26h; RECON daily
+  off-peak; PURGE weekly (rejects/audit/watermarks only — no RAW under
+  `SOURCE`). In the `TIDLAK_MBRSHP_DATALAKE_*` folder (avoid the
+  duplicate-definition situation seen on ORDER_CAPTURE_PDP). The cadence
+  is a scheduling fact, not a framework assumption: a second morning file,
+  a late afternoon re-delivery, or an `F` snapshot on any day are handled by
+  the same run.
 - Production first light per the runbook's "Initial load" section.
+
+### H11 — `raw.mode = SOURCE`: the Hive source as the raw layer
+
+New capability, `hive` sources only. `COPY` stays the default and is the
+unchanged path every existing feed runs; `SOURCE` is new code behind the
+flag — that is what keeps the regression story intact.
+
+- **Config.** `raw.mode = COPY | SOURCE` (default `COPY`). `CFG_028`:
+  `SOURCE` requires `source.type = hive`; under `SOURCE`, `raw.database`,
+  `raw.table`, `raw.delivery_mode`, `raw.idempotency_key`,
+  `raw.partitioning` and `retention.raw` are rejected (nothing is written,
+  so each would be a silent no-op). `record_hash` and `lineage_extended`
+  remain valid — they stamp the in-memory frame and flow to curated.
+- **Raw stage** (`IngestPipeline.runRaw`): under `SOURCE` skip the sink
+  write; still run contract validation, reject routing, accepted/rejected
+  counting and `RawMetadata` stamping; record the raw `SUCCESS` ledger row
+  with its partition window (`window_start`/`window_end`). The ledger row
+  is the checkpoint, not the table — dry-run already records a row while
+  writing nothing (`IngestPipeline.scala:364`), so the precedent exists.
+  `raw_count` records the accepted count (what would have been written) so
+  `raw_count`-based expectations stay meaningful.
+- **Replay** (`RawStageRunner.readFromRaw` and the `--pending` reader at
+  `IngestPipeline.scala:154`): under `SOURCE`, instead of
+  `spark.table(raw).filter(run_id)`, call a new
+  `HiveSource.readWindow(lower, upper)` that re-reads the *source* for the
+  window that run recorded. `--resume-ingest-dt` is rejected under `SOURCE`
+  (there is no `ingest_dt`); `--pending`, `--replay-from/to` and
+  `--resume --run-id` work via the recorded window. **`HIVE_008`** when a
+  recorded window's partitions no longer exist at the source (purged since
+  the run) — fail loudly; this is the one coupling cost of `SOURCE`, and it
+  is the source owner's retention promise.
+- **Accounting:** `raw_equals_accepted` and the run-id idempotency guard
+  (`IngestPipeline.scala:597-633`) are skipped under `SOURCE`;
+  `source_equals_accepted_plus_rejected`, `curated_accounts_for_accepted_rows`
+  and `watermark_continuity` are unchanged. `raw_overlap_reread` is still
+  recorded — it measures the lookback re-read, which exists in both modes.
+- **Curated** keeps whichever lineage columns its DDL declares (the bstar
+  DDL carries `inc_ful_flag`, `file_date`, `file_time`, `record_hash` and
+  the framework audit set); alignment drops the rest as today.
+- **Retention:** rejects, audit and `watermarks_keep_last` unchanged;
+  `retention.raw` rejected. Reconcile unchanged — it already compares source
+  to curated.
+- **Tests (H7 additions):** `SOURCE` first light writes no RAW table and
+  records the ledger row with the window; `--pending` in a fresh JVM
+  re-reads the source by the recorded window and publishes; `HIVE_008` when
+  a window partition is gone; `CFG_028` for each forbidden key and for a
+  non-hive source; **golden:** a `COPY`-mode hive feed and the existing
+  JDBC/file integration specs behave byte-identically before and after
+  (R-17).
+- **Cost:** the one item that touches the pipeline core. Its own PR, after
+  H2–H5 (it needs `HiveSource.readWindow`) and before the bstar feed
+  configs (H9).
 
 ---
 
@@ -687,7 +774,9 @@ projection.
   watermark; `FULL_SNAPSHOT` every run is possible but not this feed's need.
   `CFG_023` rejects `mode = INCR` on such a table; `mode = FULL` is allowed
   and reads the whole table.
-- **Straight-to-curated** (skipping RAW). Decided against.
+- **A physical RAW copy for the bstar feeds.** Decided against — same owner,
+  same warehouse, source retention under our control; `raw.mode = SOURCE`
+  (H11) instead. `COPY` remains available for feeds that need isolation.
 
 ## Execution order and gating
 
@@ -704,7 +793,11 @@ projection.
    landed **first** so the "before" is pinned.
 3. **H6** may run in parallel with (2) once H1 is in; it depends on
    `HiveSourceConfig` from H3 for the `where` scoping, so land after (2).
-4. **H7 integration + H8 docs + H9 feed config** in one PR — the repo rule
+4. **H11** as its own PR after (2) — it needs `HiveSource.readWindow` and
+   it is the only item that touches the pipeline core, so it carries the
+   R-17 golden tests and a full-reactor gate of its own.
+5. **H7 integration + H8 docs + H9 feed config** in one PR — the repo rule
    is docs in the same change as code; the reference config is the
    documentation.
-5. **H10** is not a code item; it gates on the open question.
+6. **H10** is not a code item; it gates on the business keys and the
+   source-owner confirmation of the daily-load timing.

@@ -552,6 +552,12 @@ jdbc 256, app 175, hive 42; others unchanged).
 
 ### H6 — `--stage reconcile` for a Hive source
 
+**Status: DONE 2026-09-30** — commit `58ee3a6` on `main`: `SourceReconciler`
+trait and `ReconcileCheck` moved to core, `HiveSourceReconciliation`
+(`left_anti` on the whole source under `source.where`), dispatch by source
+type in `IngestMain.runReconcile` **before** the lock (`CFG_026` for an
+unsupported type). Full reactor 962 / 0.
+
 `IngestMain.runReconcile` (`:344-352`) hard-instantiates the JDBC service.
 For Hive both sides are Spark tables, so the key comparison is a
 `left_anti` join — the same Tier 1/Tier 2 checks as
@@ -576,6 +582,27 @@ projection.
   `runReconcile`.
 
 ### H7 — Tests
+
+**Status: DONE 2026-10-01** on branch `h7-9/bstar-feeds-docs` — unit and
+golden coverage landed with H2–H6/H11; this item added
+`HivePipelineScenarioSpec` (14 `IngestMain`-driven scenarios: HIVE_002/
+003/004/007 exits, missing required column, volume floor, late partition
+inside/outside the lookback + reconcile REPORT, reject HOLD/ADVANCE and the
+reject ceiling, cross-JVM `--resume`/`--pending`, watermark retention) and
+`BstarConfigTest` (14 canaries over the four bstar feeds, the DDL and the
+hive reference config). Full reactor **1032 run / 0 failed / 0 canceled /
+0 ignored / 0 pending** (core 388, file 26, jdbc 256, hive 46, config-gen
+78, app 238); fat jar built.
+Two findings surfaced by the scenarios, resolved 2026-10-01: (1) **a bug
+in our own change, fixed** — `IngestPipeline` (`:496`) handed
+`advanceWatermark` the un-injected source config, so in a NEW JVM
+`--resume` published curated but never committed the watermark
+(`HiveSource.recoverFromLedger` had no `audit_database`/`audit_run_table`);
+it now receives `effectiveSourceConf(...)`, and the cross-JVM resume test
+asserts the commit. (2) **intended guard, documented** — an EMPTY first
+light exits 20 (`allow_empty = false`, nothing to build) while later empty
+windows are no-ops; pinned by test and stated in the runbook's hive
+first-light variant.
 
 **Unit (`ingestion-hive`, in-memory catalog):**
 - Composite predicate: single column; two columns; equal-first-column
@@ -659,6 +686,16 @@ projection.
 
 ### H8 — Documentation and reference config (same change as the code)
 
+**Status: DONE 2026-10-01** on branch `h7-9/bstar-feeds-docs` —
+`feed-hive-reference.conf`; DEVELOPER_GUIDE Step 4 hive subsection + Step 5
+`raw.mode`; CONFIG_REFERENCE "Source — Hive" + "Hive Incremental",
+`source.type`/`source.mode`/`retention.raw` rows; CONFIGURATION_MODEL hive
+example; runbook: REPORT-exits-0 sentence, §1.3 `HIVE_001–008` catalog
+(absorbing the H11 `HIVE_008` section) with the MSCK and late-partition
+notes, hive first-light variant, §2 tuple-serialization note and corrected
+store path, `BSTAR_INGESTION`/`BSTAR_AUDIT` Control-M design (8 jobs, two
+freshness monitors); root README pointers.
+
 - `docs/development/DEVELOPER_GUIDE.md` §Step 4: new subsection
   "### Hive (partitioned table, partition-value watermark)" after Kafka
   (`:240`).
@@ -695,6 +732,16 @@ projection.
   should show a second source type — judgment call at review.
 
 ### H9 — The bstar feed itself
+
+**Status: DONE 2026-10-01** on branch `h7-9/bstar-feeds-docs` —
+`docs/examples/bstar/params/` (two feeds, two contracts: 24 and 30 columns,
+`raw.mode = SOURCE`, confirmed keys, `dl` soft delete, override example),
+`lower-env/` (two e2e feeds + contract copies, synthetic
+`source_test_data.sql`, `curated_ddl_e2e.sql`, `LOWER_ENV_TEST_PLAN.md`),
+`PROD_PROMOTION.md`, README operator pointer; `scripts/run_bstar.sh`,
+`bstar.env.example` (gitignored `bstar.env`), `check_source_freshness.sh`
+(`SHOW PARTITIONS`, metadata only). All four feeds validate clean
+(`BstarConfigTest`). No real sample value anywhere.
 
 - `docs/examples/bstar_<table>/params/feed-bstar-<table>.conf` and
   `lower-env/` variant, cloned from the smartiq layout (control tables in
@@ -787,6 +834,13 @@ projection.
 
 ### H11 — `raw.mode = SOURCE`: the Hive source as the raw layer
 
+**Status: DONE 2026-09-30** — commit `b5ba544` on `main`: `rawTarget:
+Option[(db, table)]`, no sink write under `SOURCE`, `raw_count =
+accepted_count`, `AuditService.rawWindow` + `WindowReplayable` for replay
+from the ledger's window, `--resume-ingest-dt` → `CFG_028`, `--stage raw`
+kept for DECOUPLED. R-17 goldens (`HivePipelineIntegrationSpec`, COPY cases
+written before the change) unchanged. Full reactor 1004 / 0.
+
 New capability, `hive` sources only. `COPY` stays the default and is the
 unchanged path every existing feed runs; `SOURCE` is new code behind the
 flag — that is what keeps the regression story intact.
@@ -860,6 +914,22 @@ flag — that is what keeps the regression story intact.
 - **A physical RAW copy for the bstar feeds.** Decided against — same owner,
   same warehouse, source retention under our control; `raw.mode = SOURCE`
   (H11) instead. `COPY` remains available for feeds that need isolation.
+
+## Backlog (pre-existing, found during H7–H9)
+
+Not caused by this work and not fixed by it; recorded so they are not
+rediscovered.
+
+- **`RetentionService.trimWatermarkHistory` trims every entity in the
+  shared `ingest_watermarks` table** to the running feed's
+  `watermarks_keep_last` (`Window.partitionBy(entity)` with one `keepLast`
+  for all), so the most recently run purge wins for every entity sharing the
+  table. Harmless for the bstar pair (both 10); a hazard for a shared
+  control database with differing policies. Matrix R-18.
+- **`scripts/sync_artifacts.sh` and `scripts/build_bundle.sh` are
+  smartiq-only** (hard-coded file lists and `SMARTIQ_*` settings).
+  `run_bstar.sh` carries its own repo-copy drift warning instead; a generic
+  bundle/sync would take a feed manifest.
 
 ## Execution order and gating
 

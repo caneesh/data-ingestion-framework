@@ -25,8 +25,8 @@ Options under `feeds.<entity>.source`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `source.type` | string | `file` | Source type: `file`, `jdbc`, or `kafka` |
-| `source.mode` | string | — | Extraction mode (overrides feed-level `mode`) |
+| `source.type` | string | `file` | Source type: `file`, `jdbc`, `kafka`, or `hive` |
+| `source.mode` | string | — | Extraction mode (overrides feed-level `mode`). Not read by a `hive` source — the pipeline injects the CLI mode as `source.run_mode` instead |
 
 ---
 
@@ -178,6 +178,52 @@ Options for `source.type = "jdbc"`.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `source.health_check.enabled` | boolean | — | Enable pre-flight health check |
+
+---
+
+## Source — Hive
+
+Options under `feeds.<entity>.source` when `source.type = "hive"`: an
+existing partitioned Hive table, read by partition values newer than a
+stored watermark. No credential, no driver — the Spark session's own
+metastore access. Annotated catalog: `docs/examples/feed-hive-reference.conf`;
+runnable feeds: `docs/examples/bstar/params/`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `source.database` | string | <required> | Source Hive database (`CFG_023` if absent; `HIVE_002` if the table is not visible) |
+| `source.table` | string | <required> | Source table name |
+| `source.system` | string | entity | Lineage `source_system` stamped on every row |
+| `source.where` | string | — | Extra partition filter pushed to the metastore. **Partition columns only** — a data column is `HIVE_004`. Also scopes `--stage reconcile` |
+| `source.missing_files` | string | `FAIL` | `FAIL`: files vanished under a registered partition error the read. `IGNORE`: sets `spark.sql.files.ignoreMissingFiles` for the session (every read in it) and logs zero-row partitions |
+| `source.log_partition_counts` | boolean | `false` | Log a row count per selected partition (one count per partition — a scan on text tables) |
+
+Injected by the pipeline, never set by hand: `source.entity`, `source.run_id`,
+`source.run_mode`, `source.audit_database`, `source.audit_run_table`. Their
+absence selects validate mode (`--validate-only`: table and column checks,
+no read). A hive source derives `ingestion.pattern = PARTITION_INCREMENTAL`;
+declaring another pattern is `CFG_011`.
+
+### Hive Incremental (`source.incremental.*`, hive sources)
+
+The watermark is the **tuple** of partition values, compared component by
+component as text. Required under `mode = INCR` (`CFG_023`).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `source.incremental.watermark_columns` | list | <required> | Partition columns forming the watermark, in comparison order. Each must be a **STRING** partition column (`HIVE_003`) |
+| `source.incremental.initial_value` | string | <required> | One component per column, `\|`-separated (`CFG_025` on an arity mismatch). Used only while no watermark row exists; a later edit is a no-op — rewind instead (runbook §2.3) |
+| `source.incremental.watermark_formats` | list | — | One `DateTimeFormatter` pattern per column. Every partition value in the window must parse and be uniformly zero-padded (`HIVE_006`); strongly recommended for date/time components |
+| `source.incremental.lookback.days` | int | — | Re-read partitions newer than (watermark − N days) on every run. Rewinds the first component, which must parse with `watermark_formats[0]`. Exactly one of `days` \| `partitions` (`CFG_027`) |
+| `source.incremental.lookback.partitions` | int | — | Re-read the last N registered partitions below the watermark |
+| `source.incremental.watermark_store.type` | string | `hive` | `hive` (shared `ingest_watermarks`) or `memory` (tests) |
+| `source.incremental.watermark_store.database` | string | <required> | Database of the watermark table (hive store) |
+| `source.incremental.watermark_store.table` | string | `ingest_watermarks` | Watermark table name |
+
+The JDBC watermark knobs — `watermark_type`, `overlap`, `upper_bound`,
+`clock_zone` — are rejected on a hive source (`CFG_024`). The ledger records
+the **stored** watermark as `window_start`, never the rewound lookback bound;
+the watermark advances only when a partition above it was read.
 
 ---
 
@@ -506,7 +552,7 @@ Options under `feeds.<entity>.retention`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `retention.raw` | string | — | Raw retention policy |
+| `retention.raw` | string | — | Raw retention policy (partition drops on the `ingest_dt` key). Rejected under `raw.mode = SOURCE` (`CFG_028`): there is no RAW table, and the source owner's retention is the replay horizon |
 | `retention.curated` | string | — | Curated retention policy |
 | `retention.rejects` | string | — | Rejects retention policy |
 | `retention.database` | string | `ingest_audit` | Retention metadata database |

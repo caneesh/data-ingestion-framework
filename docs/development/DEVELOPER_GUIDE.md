@@ -104,6 +104,7 @@ option — copy from them rather than memorizing keys:
 
 - [examples/feed-file-reference.conf](examples/feed-file-reference.conf) — file ingestion (managed folders, pre-read validation, contract, rejects, idempotency)
 - [examples/feed-jdbc-reference.conf](examples/feed-jdbc-reference.conf) — SQL ingestion (all four read modes, every secret provider, watermarks, partitioning)
+- [examples/feed-hive-reference.conf](../examples/feed-hive-reference.conf) — an existing partitioned Hive table as the source (partition-tuple watermark, lookback, `raw.mode = COPY | SOURCE`)
 
 Optional blocks add production hardening as you need it:
 
@@ -249,6 +250,46 @@ source {
 }
 ```
 
+### Hive (an existing partitioned table)
+
+For a table some other process already lands in the warehouse — a Sqoop
+landing, a file drop with `MSCK REPAIR` — and keeps appending partitions
+to. The framework reads the partitions whose values are newer than a
+stored watermark, so only new (plus lookback) partitions are scanned, and
+nothing is copied unless you ask for it.
+
+```hocon
+source {
+  type     = "hive"
+  system   = "bstar"                       # lineage source_system
+  database = "bstar_raw"
+  table    = "priv_addr"
+  # where  = "inc_ful_flag IN ('I','F')"   # partition columns only (HIVE_004)
+  incremental {
+    watermark_columns = ["file_date", "file_time"]   # STRING partition columns, in order
+    initial_value     = "1900-01-01|00.00.00"        # one component per column
+    watermark_formats = ["yyyy-MM-dd", "HH.mm.ss"]   # strict parse + zero-padding (HIVE_006)
+    lookback          = { days = 3 }                 # re-read late partitions
+    watermark_store   { type = "hive", database = "bluestar_raw" }
+  }
+}
+```
+
+> **The watermark is the partition tuple**, compared as text component by
+> component — which is why the columns must be `STRING` partition columns
+> (`HIVE_003`) and why `watermark_formats` matters: `2026-1-5` sorts after
+> `2026-01-05`. The ledger records the stored watermark as `window_start`,
+> never the rewound lookback bound. `FULL` is refused once a watermark row
+> exists (`HIVE_007`) — rewind instead. No credential and no driver jar
+> are involved; the Spark session's own metastore access is the
+> authorization.
+
+Declare the partition columns in the contract with `category = "audit"` so
+the record hash ignores them and curated keeps them. Every option:
+[examples/feed-hive-reference.conf](../examples/feed-hive-reference.conf);
+a complete production pair with lower-env test plan and promotion
+checklist: [examples/bstar/](../examples/bstar/README.md).
+
 ---
 
 ## Step 5 — RAW and CURATED layers
@@ -270,6 +311,17 @@ raw {
   }
 }
 ```
+
+**`raw.mode`** — `COPY` (the default, above) writes that table. A hive
+source whose table is already durable, partitioned and queryable can set
+`raw { mode = "SOURCE" }` instead: nothing is written, the `raw` ledger row
+(partition window + counts) is the checkpoint, and replay re-reads the
+source for the recorded window. Under `SOURCE` the keys that name or
+govern a RAW table — `database`, `table`, `delivery_mode`,
+`idempotency_key`, `partitioning` — and `retention.raw` are rejected
+(`CFG_028`); `record_hash` and `lineage_extended` still apply to the
+in-memory frame. Trade-off and replay semantics:
+[CONFIGURATION_MODEL "Raw layer mode"](../architecture/CONFIGURATION_MODEL.md#raw-layer-mode-rawmode).
 
 **CURATED** is the consumer-facing current state: typed columns, derived
 fields, audit columns (`create_timestamp`, `last_modified_ts`,

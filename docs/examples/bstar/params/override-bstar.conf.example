@@ -1,0 +1,52 @@
+# Operational override — bstar feeds
+#
+# Every value in this file WINS over the deployed feed config. It exists so
+# an operational change can happen in the time an incident allows rather
+# than in the time a change order takes.
+#
+#   INGEST_OVERRIDE_FILE=/path/to/params/bluestar/override-bstar.conf
+#
+# in bstar.env is all that is needed; run_bstar.sh ships it and lists the
+# paths it sets before submitting.
+#
+# RULES
+#   - Objects merge; lists are replaced wholesale.
+#   - A path named here but absent on disk FAILS the run (CFG_019).
+#   - Every path set is logged by name; the ledger's config_fingerprint
+#     gains an "+ovr:" suffix. Values are never logged.
+#   - Both feeds can be addressed from one file; only the entity being run
+#     is read.
+#
+# DELETE THIS FILE once the underlying change is deployed through the normal
+# process.
+
+feeds.bstar_priv_addr {
+
+  # ---- the common cases ----------------------------------------------------
+
+  # A long first light or a large catch-up kept tripping the lease.
+  # concurrency.lease_minutes = 120
+
+  # The source owner says a delivery can now be up to a week late.
+  # (Lists are replaced, objects merge — this is an object, so it merges.)
+  # source.incremental.lookback = { days = 7 }
+
+  # A known upstream problem is producing rejects above 1%, and the batch
+  # must still land while the source team fixes it.
+  # rejects.max_reject_percent = 5.0
+
+  # Route alerts somewhere else for an on-call handover.
+  # notifications.webhook.url = "https://hooks.example.com/services/XXXX"
+
+  # ---- the loud ones -------------------------------------------------------
+  # These REDUCE a guarantee and are logged as an explicit WARNING. Pair
+  # each with a ticket.
+
+  # Source files were removed under a registered partition and the owner has
+  # confirmed the partition is legitimately empty.
+  # source.missing_files = "IGNORE"
+}
+
+feeds.bstar_sub_prem_det {
+  # concurrency.lease_minutes = 120
+}

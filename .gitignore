@@ -9,3 +9,4 @@ spark-warehouse
 
 # site settings, not framework config
 scripts/smartiq.env
+scripts/bstar.env

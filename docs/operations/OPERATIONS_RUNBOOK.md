@@ -32,6 +32,12 @@ scheduler rerun of a failed job has always been safe.
 | `30` | `CONFIGURATION` — `CFG_*`, `HIVE_*`, missing file, bad credential | **never retry**; alert |
 | `1` | unclassified | retry once, then alert |
 
+`--stage reconcile` under `reconcile.on_mismatch = "REPORT"` (the default)
+exits `0` **with findings**: the mismatch is a `passed = false` row in
+`ingest_reconciliation` plus a notification, not an exit code. A green
+RECON job therefore proves the comparison ran, not that it agreed — read
+the table (or switch to `FAIL`, exit `20`).
+
 Classification is deliberately conservative: anything not confidently
 identified stays `1`, exactly as before. A missed `TRANSIENT` costs one
 manual rerun; a wrong one would make a scheduler retry a data-integrity
@@ -324,11 +330,42 @@ categories classified by `SqlFailureClassifier` are retried.
 
 ---
 
-### 1.3 HIVE_008 (replay window gone at the source — `raw.mode = SOURCE`)
+### 1.3 HIVE_001 – HIVE_008 (hive source: an existing partitioned table)
 
-| Code | Meaning | Thrown as | Retry? | Operator action |
-|------|---------|-----------|--------|-----------------|
-| HIVE_008 | A replay (`--stage curated --run-id`, `--pending`, `--resume`) under `raw.mode = SOURCE` found none of the partitions in the window that run recorded: they were dropped from the source table after the run | `IllegalArgumentException` (DATA_INTEGRITY, exit 20) | No | The data is gone from the only place it lived. Confirm with the source owner (retention, a manual drop). If the batch already published curated nothing is lost — leave it. Otherwise the keys are recoverable only from a source re-delivery. The remaining `HIVE_` codes are catalogued with the hive source documentation. |
+Defined in `ingestion-hive/.../hive/HiveSource.scala` and
+`HiveSourceConfig.scala`. Every code but `HIVE_008` is `CONFIGURATION`
+(exit 30, never retry); `HIVE_008` is `DATA_INTEGRITY` (exit 20). A
+metastore that cannot be reached is `TRANSIENT` (exit 10) by message text,
+not a `HIVE_` code. Static shape errors in the same block are `CFG_023`
+(required keys), `CFG_024` (JDBC knobs on a hive source), `CFG_025`
+(`initial_value` arity), `CFG_027` (lookback shape), `CFG_028` (`raw.mode`).
+
+| Code | Meaning | Retry? | Operator action |
+|------|---------|--------|-----------------|
+| HIVE_001 | The pipeline injected `run_id` without `entity` — an internal wiring fault, not a config error | No | Should not occur from the CLI; report with the driver log. |
+| HIVE_002 | `source.database.table` does not exist or is not visible to the Spark session | No | Check `SHOW TABLES IN <db>` as the pipeline's principal; a correct name that fails here is a GRANT problem. Also raised by `--validate-only`. |
+| HIVE_003 | A `watermark_columns` entry is not a partition column, or is a typed (`DATE`/`INT`) partition column — only STRING partition columns compare safely as text | No | Name the partition columns exactly as `DESCRIBE` lists them; a typed partition column cannot be a watermark component. |
+| HIVE_004 | `source.where` does not parse, or references a non-partition column | No | The filter is pushed to the metastore and can only prune partitions. Move data-column conditions to the contract (`rejects.rules`) or the curated stage. |
+| HIVE_005 | Component-count mismatch between `watermark_columns` and `initial_value`, the stored watermark, or a replay window | No | `initial_value` is static (`CFG_025` catches it first). A **stored** value with the wrong arity means `watermark_columns` changed after the first run: the watermark must be reset to the new shape (§2.3 with the new serialization) — the history is not convertible. |
+| HIVE_006 | A partition value in the window does not parse with `watermark_formats`, or values of one column are not uniformly zero-padded | No | The SOURCE is malformed (`file_date=2026-1-5` beside `2026-01-05`). The source owner must rename or drop the partition; the pipeline will not guess an order. |
+| HIVE_007 | `--mode FULL` while a watermark row exists for the entity | No | FULL is accepted only before first light. To reload from a point in time, rewind the watermark (§2.3) and run INCR; to reload everything, rewind to `initial_value`. Never delete the watermark history to make FULL "work". |
+| HIVE_008 | A replay (`--stage curated --run-id`, `--pending`, `--resume`) under `raw.mode = SOURCE` found none of the partitions in the window that run recorded: they were dropped from the source table after the run | No | The data is gone from the only place it lived. Confirm with the source owner (retention, a manual drop). If the batch already published curated nothing is lost — leave it. Otherwise the keys are recoverable only from a source re-delivery. |
+
+**The `MSCK REPAIR` obligation.** The hive source sees the **metastore**,
+never the filesystem. Files that land under a partition directory that
+was never registered (`ALTER TABLE ... ADD PARTITION` / `MSCK REPAIR
+TABLE`) are invisible to it, and nothing fails: the window is simply
+empty, the run is SUCCESS, the watermark does not move. Registration is
+the **source owner's** job and must complete before the ingest job's
+schedule. `scripts/check_source_freshness.sh` (`SHOW PARTITIONS`, metadata
+only) is the Control-M job that notices when it stops happening — the
+ledger alone cannot.
+
+**Late partitions.** A partition registered *below* the current watermark
+is picked up only if it falls inside `source.incremental.lookback`;
+beyond that, `--stage reconcile` reports its keys as
+`source_keys_present_in_curated` failures and the recovery is a §2.3
+rewind to just below the late partition's values.
 
 ---
 
@@ -461,12 +498,46 @@ check done; Control-M folders HELD — this run is manual, out of schedule.
    its window starts where the initial run ended, and FULL never runs
    again except via the §2.3 rewind procedure.
 
+### First light for a hive-source feed (`raw.mode = SOURCE`)
+
+The same seven steps with three differences (the bstar feeds,
+`docs/examples/bstar/PROD_PROMOTION.md` Phase 3):
+
+- **Run INCR, not FULL.** With no watermark row, INCR's window is the whole
+  table above `initial_value`, so it IS the full load — and it commits the
+  watermark. FULL is accepted too, but it is refused forever after
+  (`HIVE_007`), so there is nothing to gain by using it.
+- **There is no RAW table to verify**; the `raw` ledger row's
+  `window_start = initial_value`, `window_end` = the newest partition and
+  `raw_count = accepted_count` are the checkpoint. Record `SHOW PARTITIONS`
+  and `SELECT COUNT(*)` on the source beforehand as the truth to verify.
+- **First light must select at least one partition** — set `initial_value`
+  just below the latest `F` partition (or leave the default and let it read
+  everything) — because an EMPTY first light exits 20 (`DATA_INTEGRITY`)
+  **by design**: with no curated table yet there is nothing to build, and a
+  feed scheduled before its source ever landed deserves a page. Only after a
+  real first light is an empty window the normal daily no-op.
+- **No password prompt**, so `nohup` needs no interaction:
+  `nohup run_bstar.sh prod priv_addr INCR --run-id pa-initial-$(date +%Y%m%d) > pa-initial.log 2>&1 &`.
+  Before it, `run_bstar.sh prod priv_addr INCR --validate-only` proves the
+  table is visible (`HIVE_002`) and the watermark columns are STRING
+  partition columns (`HIVE_003`).
+
 ## 2. Watermark operations
 
 Incremental feeds track their position in an **append-only** history table.
 The production store is `HiveWatermarkStore`
-(`ingestion-jdbc/.../watermark/WatermarkStore.scala`); tests use
-`InMemoryWatermarkStore`.
+(`ingestion-core/.../watermark/WatermarkStore.scala`, shared by the JDBC
+and hive sources); tests use `InMemoryWatermarkStore`.
+
+For a **hive source** the stored value is the partition tuple serialized
+with `|` between components — `2026-03-05|04.00.00` for
+`watermark_columns = ["file_date", "file_time"]` — and every §2 procedure
+below applies verbatim with that serialization. A manual record whose
+component count disagrees with `watermark_columns` is refused at the next
+run as `HIVE_005`. The lookback never moves the stored value: the ledger's
+`window_start` is this value, and a run that read only lookback partitions
+leaves it (and its version) unchanged.
 
 - **Table:** `ingest_watermarks` by default (override with
   `incremental.watermark_store.table`), in `incremental.watermark_store.database`.
@@ -1224,3 +1295,88 @@ it only reads).
 **5. Check in, verify, then enable calendars.** Run Phase 2 above, all
 five steps in order, ordering each job manually and reading sysout in
 Monitoring. Calendars go live only after step 5 passes.
+
+#### bstar feeds — `BSTAR_INGESTION` / `BSTAR_AUDIT` (hive source, `raw.mode = SOURCE`)
+
+The same two-folder split for the two hive-source feeds
+(`docs/examples/bstar/`), with the differences the source dictates. Eight
+jobs; every command is `scripts/run_bstar.sh` or a check script, with
+`BSTAR_ENV_FILE` exported in the job's environment. **No password export
+anywhere** — the hive source reads through the Spark principal's own
+metastore/HDFS access, so the credential asymmetry of the smartiq design
+disappears entirely.
+
+**Folder `TIDLAK_MBRSHP_BSTAR_INGEST_PROCESS`** (the SLA path), after the
+source's morning landing — and after its `MSCK REPAIR` / `ADD PARTITION`
+step, which is the source owner's job and the one dependency this folder
+should carry:
+
+| Job | Command | Schedule |
+|---|---|---|
+| `BSTAR_PRIV_ADDR_INCR_LOAD` | `run_bstar.sh prod priv_addr INCR --resume --run-id pa_%%ORDERID` | daily, after the landing |
+| `BSTAR_SUB_PREM_DET_INCR_LOAD` | `run_bstar.sh prod sub_prem_det INCR --resume --run-id sp_%%ORDERID` | daily, after the landing |
+
+Same ON rules as the smartiq folder (10 → rerun ×3; 20 and 30 → never
+rerun). Two hive-specific notes:
+
+- **Never schedule FULL.** It is refused once a watermark exists
+  (`HIVE_007`, exit 30) and there is nothing it does that a §2.3 rewind
+  plus INCR does not do better.
+- **An empty window is SUCCESS.** The source lands once a day; if it has
+  not landed yet the job exits 0 having read nothing and the watermark does
+  not move. That is correct — the next run takes the partition — but it is
+  also why the ledger freshness check alone is insufficient (below).
+
+**Folder `TIDLAK_MBRSHP_BSTAR_AUDIT_PROCESS`** (detection and governance):
+
+| Job | Command | Schedule |
+|---|---|---|
+| `BSTAR_PRIV_ADDR_RECON` | `run_bstar.sh prod priv_addr INCR --stage reconcile` | nightly, off-peak |
+| `BSTAR_SUB_PREM_DET_RECON` | `run_bstar.sh prod sub_prem_det INCR --stage reconcile` | nightly, off-peak — a key-only projection of ~30 GB of text; give it the quiet hours |
+| `BSTAR_PRIV_ADDR_PURGE` | `run_bstar.sh prod priv_addr INCR --stage retention` | weekly, quiet window |
+| `BSTAR_SUB_PREM_DET_PURGE` | `run_bstar.sh prod sub_prem_det INCR --stage retention` | weekly, quiet window |
+| `BSTAR_LEDGER_MONITORING` | `check_freshness.sh bstar_priv_addr 50 && check_freshness.sh bstar_sub_prem_det 50` | cyclic, every 4h |
+| `BSTAR_SOURCE_MONITORING` | `check_source_freshness.sh bstar_raw priv_addr 3 && check_source_freshness.sh bstar_raw sub_prem_det 3` | cyclic, every 4h |
+
+Why **two** monitoring jobs: `check_freshness.sh` asks the ledger "did a
+run succeed recently?" — and under `raw.mode = SOURCE` a run that read an
+empty window succeeds every morning while the upstream landing has quietly
+stopped. `check_source_freshness.sh` asks the source "has a new `file_date`
+partition appeared within N days?" (metadata only, `SHOW PARTITIONS`, safe
+at any hour). The first catches the pipeline not running; the second
+catches the source not landing — including the un-registered-partition
+case the pipeline cannot see. Both use the 1 = stale / 2 = check broke
+split, with different alert destinations. Size the ledger threshold above
+the longest legitimate gap (50 h covers a weekend without a Monday page);
+size the source threshold from the landing's rhythm (3 days matches the
+feeds' `lookback`).
+
+Retention purges only `bluestar_raw.ingest_*` rows (rejects, ledger,
+watermark history): there is no RAW table (`retention.raw` is rejected
+under `SOURCE`, `CFG_028`) and the source is **never** touched — the purge
+job needs no privilege on `bstar_raw` beyond read.
+
+Mutex: quantitative resource `BSTAR_<TABLE>_ENTITY`, quantity 1, on each
+entity's load, reconcile and purge (not on monitoring). The two entities
+are independent and may run concurrently.
+
+**Description field values** (paste verbatim):
+
+`BSTAR_PRIV_ADDR_INCR_LOAD`:
+
+> bstar PRIV_ADDR incremental load (entity bstar_priv_addr): Hive
+> bstar_raw.priv_addr (partition watermark file_date|file_time, lookback 3
+> days, source IS the raw layer) -> curated bluestar_current.priv_addr.
+> Script: .../src/scripts/bluestar/run_bstar.sh; params: .../params/bluestar
+> (no password — Hive session access). Exit 10=transient (auto-rerun x3),
+> 20=data integrity (page on-call, NEVER rerun), 30=config incl. HIVE_007
+> FULL-refused (notify feed owner). Empty window = exit 0, expected before
+> the landing. See OPERATIONS_RUNBOOK.md "bstar feeds".
+
+`BSTAR_SOURCE_MONITORING`:
+
+> Source-landing freshness for bstar_raw.priv_addr / sub_prem_det:
+> SHOW PARTITIONS only, newest file_date must be within 3 days. Exit 1 =
+> the LANDING is stale (upstream Sqoop / MSCK REPAIR — not the ingest
+> pipeline, whose ledger stays green on an empty window); exit 2 = the check
+> itself failed (Hive unreachable; platform destination).

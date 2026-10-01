@@ -493,7 +493,11 @@ final class IngestPipeline(
               "documented duplicates (the curated merge absorbs them). Fix the reject cause to " +
               "recover the rows, or switch to ADVANCE to accept the loss.")
           } else if (curatedResult.isDefined || curatedResumedComplete || advanceAfter == "RAW")
-            w.advanceWatermark(spark, sourceConf, ctx.entity, ctx.runId, rawOutcome.accepted)
+            // The INJECTED config, as the raw read saw it: on a resumed run
+            // the raw stage was skipped and the source holds no in-memory
+            // window, so the commit must recover it from the ledger — which
+            // needs audit_database / audit_run_table (and entity / run_id).
+            w.advanceWatermark(spark, effectiveSourceConf(sourceConf), ctx.entity, ctx.runId, rawOutcome.accepted)
           else
             logger.warn(s"[Pipeline] Watermark NOT advanced: no curated publish in this run " +
               s"(stage=${cli.stage}, curated config ${if (curatedConf.isEmpty) "absent" else "present but produced no publish"}). " +

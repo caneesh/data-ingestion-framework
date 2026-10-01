@@ -187,6 +187,58 @@ commented blocks; the interactive generator (`ingestion-config-gen`)
 produces feeds that pass this validator by construction.
 
 
+## Hive source example (partition watermark, `raw.mode = SOURCE`)
+
+The second shape the model supports end to end: an existing partitioned
+Hive table as the source, its partition tuple as the watermark, and the
+source itself as the raw layer. Everything outside `source {}` and
+`raw.mode` is the same vocabulary as the JDBC example above. Runnable
+version with the full rationale: `docs/examples/bstar/params/`.
+
+```hocon
+feeds {
+  bstar_priv_addr {
+    entity = "bstar_priv_addr"
+    mode   = "INCR"
+    include required("bstar-priv-addr-schema.conf")   # partition columns declared category = "audit"
+
+    source {
+      type     = "hive"
+      system   = "bstar"
+      database = "bstar_raw"
+      table    = "priv_addr"
+      incremental {
+        watermark_columns = ["file_date", "file_time"]     # STRING partition columns
+        initial_value     = "1900-01-01|00.00.00"
+        watermark_formats = ["yyyy-MM-dd", "HH.mm.ss"]
+        lookback          = { days = 3 }
+        watermark_store   { type = "hive", database = "bluestar_raw" }
+      }
+    }
+    raw { mode = "SOURCE", record_hash = true, lineage_extended = true }
+    curated {
+      database = "bluestar_current"
+      table    = "priv_addr"
+      merge {
+        keys = ["corp_ent_cd", "acct_grp_nbr", "sub_seq_nbr", "mem_nbr", "addr_seq_nbr"]
+        freshness { column = "cdc_src_last_updt_ts", compare_as = "timestamp",
+                    tie_breakers = ["priv_addr_lcts", "file_date", "file_time"] }
+        deletes   { mode = "SOFT", indicator_column = "cdc_src_actn_cd", indicator_values = ["dl"] }
+      }
+    }
+    reconcile { enabled = true, on_mismatch = "REPORT" }
+    retention { rejects = "90d", audit = "365d", watermarks_keep_last = 10 }   # no retention.raw
+  }
+}
+```
+
+What the validator enforces for this shape: `CFG_023` (explicit
+`watermark_columns` + `initial_value` under INCR), `CFG_024` (no JDBC
+watermark knobs), `CFG_025` (`initial_value` arity), `CFG_027` (one
+lookback shape), `CFG_028` (`raw.mode` rules, below). The derived pattern
+is `PARTITION_INCREMENTAL`; `--stage reconcile` compares the whole source
+key set against curated.
+
 ## Raw layer mode (`raw.mode`)
 
 ```hocon

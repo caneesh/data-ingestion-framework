@@ -32,6 +32,25 @@ Append-only. New columns are added with `ALTER TABLE … ADD COLUMNS`; existing
 columns are never renamed, retyped or removed. Pin to column names, not
 positions.
 
+## For operators (not consumers)
+
+The pipeline that fills these tables:
+
+| What | Where |
+|------|-------|
+| Feed configs + contracts (production) | `params/feed-bstar-priv-addr.conf`, `params/feed-bstar-sub-prem-det.conf`, `params/bstar-*-schema.conf` |
+| Operational override | `params/override-bstar.conf.example` |
+| Lower-environment feeds, synthetic source, scenario walk | `lower-env/` (`LOWER_ENV_TEST_PLAN.md` first) |
+| Promotion to production | `PROD_PROMOTION.md` |
+| Launcher + site settings | `scripts/run_bstar.sh`, `scripts/bstar.env.example` |
+| Source-partition freshness (Control-M audit job) | `scripts/check_source_freshness.sh` |
+| Every hive-source option, annotated | `docs/examples/feed-hive-reference.conf` |
+| Design and scenario matrix | `docs/reports/HIVE_RAW_CURATED_IMPLEMENTATION_PLAN.md`, `docs/reports/HIVE_SOURCE_SCENARIO_MATRIX.md` |
+
+The source (`bstar_raw.*`) is read directly as the raw layer
+(`raw.mode = SOURCE`); `bluestar_raw` holds only the framework's control
+tables. Nothing in this pipeline ever writes to, alters or drops the source.
+
 ## Questions
 
 Ingestion owner: see `docs/reports/HIVE_RAW_CURATED_IMPLEMENTATION_PLAN.md`.

@@ -132,6 +132,7 @@ feeds.claims {
 | CFG_023 | hive source with `mode = INCR` without explicit `source.incremental.watermark_columns` and `initial_value` (a hive watermark has no contract fallback) |
 | CFG_024 | JDBC watermark settings (`overlap`, `watermark_type`, `upper_bound`, `clock_zone`) on a hive source — they have no effect there |
 | CFG_025 | hive `initial_value` arity differs from `watermark_columns` (components are `\|`-separated) |
+| CFG_026 | `--stage reconcile` on a source type other than `jdbc` or `hive` (raised before the entity lock is taken) |
 | CFG_027 | hive `lookback` naming neither or both of `days` / `partitions`, or a non-positive value |
 | CFG_021 | `audit.reconciliation.min_accepted_rows` is negative, or set with `audit.enabled = false` (a floor that can never trip reads as protection while detecting nothing) |
 | CUR_010 | `curated.merge.normalize` targets a column absent from the incoming data (skipping it would leave business keys un-normalized and insert duplicates instead of merging) |
@@ -206,6 +207,18 @@ reconcile {
 
 Run it as a **separate schedule** — it issues real queries against the
 source system — not as part of every load.
+
+### Supported sources
+
+| `source.type` | Source side of the comparison |
+|---|---|
+| `jdbc` | A key-only projection against the source database, under the same non-watermark filters the extraction uses |
+| `hive` | The whole source table under the feed's `source.where` (partition columns only) — every partition, never the watermark window |
+
+Any other type fails **before** the entity lock is taken with `CFG_026`
+(`--stage reconcile is not supported for source.type = '<t>'; supported:
+jdbc, hive`). Both implementations produce the same three checks below,
+so the ledger, the runbook and the Control-M RECON job are shared.
 
 ### Why it is key-based, not timestamp-bounded
 

@@ -3,13 +3,11 @@ package com.hcsc.generic.ingest.jdbc.reconcile
 import com.hcsc.generic.ingest.config.ConfigUtils
 import com.hcsc.generic.ingest.jdbc.JdbcSourceConfig
 import com.hcsc.generic.ingest.jdbc.read.{DriverQueries, QueryBuilder}
+import com.hcsc.generic.ingest.reconcile.{ReconcileCheck, SourceReconciler}
 import com.hcsc.generic.ingest.schema.SchemaContract
 import com.typesafe.config.Config
 import org.apache.log4j.Logger
 import org.apache.spark.sql.{DataFrame, SparkSession}
-
-/** One comparison, in the shape the reconciliation ledger already stores. */
-final case class ReconcileCheck(name: String, expected: String, actual: String, passed: Boolean)
 
 /**
   * Independent SOURCE-vs-CURATED reconciliation.
@@ -56,7 +54,7 @@ final class SourceReconciliationService(
   spark: SparkSession,
   feedConf: Config,
   logger: Logger
-) {
+) extends SourceReconciler {
 
   private val reconcileConf = ConfigUtils.optConfig(feedConf, "reconcile")
 

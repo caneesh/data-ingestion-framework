@@ -339,6 +339,11 @@ SELECT s.<key> FROM <source_keys> s
 LEFT ANTI JOIN <curated_db>.<table> c ON s.<key> = c.<key>;
 ```
 
+For a **hive** source the source side is the landing table itself under the
+feed's `source.where` — every partition, never the watermark window — so the
+anti-join above runs directly between `bstar_raw.<table>` and the curated
+table; no key pull is needed.
+
 Then work through the causes, most likely first:
 
 1. **A run that never happened.** Check the ledger for a gap in

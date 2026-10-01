@@ -111,6 +111,35 @@ class HiveSourceTest extends AnyFunSuite with SharedSparkSession with BeforeAndA
 
   private val emptyDf: DataFrame = spark.emptyDataFrame
 
+  // ---- readAll: reconciliation's source side ----------------------------------
+
+  test("readAll reads every partition regardless of the stored watermark and captures nothing") {
+    seed("e1", wv("2025-01-10", "04.52.00"))
+    untouched {
+      val df = HiveSource.readAll(spark, conf())
+      assert(ids(df) == (1 to 7), "the watermark must never scope a reconciliation read")
+      assert(HiveSource.lastWindow("e1", Some("r1")).isEmpty, "readAll captures no read window")
+      assert(latest("e1").get.version == 1L, "readAll never touches the watermark store")
+    }
+  }
+
+  test("readAll honors where on a partition column — the extraction's own scoping") {
+    untouched {
+      assert(ids(HiveSource.readAll(spark, conf(where = Some("inc_ful_flag = 'I'")))) == Seq(1, 2, 3, 7))
+    }
+  }
+
+  test("readAll works without an incremental block") {
+    untouched {
+      assert(ids(HiveSource.readAll(spark, conf(incremental = false))) == (1 to 7))
+    }
+  }
+
+  test("HIVE_004: readAll rejects where on a data column") {
+    val e = intercept[IllegalArgumentException](HiveSource.readAll(spark, conf(where = Some("id > 1"))))
+    assert(e.getMessage.contains("HIVE_004"))
+  }
+
   // ---- selection and watermark lifecycle --------------------------------------
 
   test("first light from initial_value reads every partition and commits the max tuple") {

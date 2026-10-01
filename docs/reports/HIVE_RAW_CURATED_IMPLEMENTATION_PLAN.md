@@ -675,7 +675,12 @@ projection.
   from `--mode` (`IngestPipeline.scala:44`) and is unrelated to the source's
   `inc_ful_flag`; `--explain-mapping` renders only for managed-folder feeds
   (`:235`) and is a no-op for hive; the two partition-pruning settings from
-  H3 step 5. Also: the source owner's obligation to register partitions
+  H3 step 5. Also (found while pinning H6's golden): under
+  `reconcile.on_mismatch = REPORT` a failing check records the `reconcile`
+  ledger stage as **FAILED while the job exits 0** — pre-existing and
+  deliberate (the ledger tells the truth, the scheduler is not paged), but
+  the exit-code table must say a 0 can sit beside a FAILED `reconcile` row.
+  Also: the source owner's obligation to register partitions
   (`MSCK REPAIR TABLE` or explicit `ADD PARTITION`) before files count as
   delivered — unregistered files are invisible, and a later partition
   advances the watermark past them; changing `watermark_columns` mid-life

@@ -162,6 +162,23 @@ object HiveSource extends Source with WatermarkAdvancing {
     applyContract(spark.table(cfg.fullTable).filter(pred.column), sourceConf)
   }
 
+  /**
+    * The whole table under the feed's `where` — no watermark, no read
+    * window, no store access. Reconciliation needs the same scoping the
+    * extraction uses (`where`) but never its window: key existence is
+    * timestamp-independent, which is what makes the comparison trustworthy.
+    */
+  def readAll(spark: SparkSession, sourceConf: Config): DataFrame = {
+    val cfg = HiveSourceConfig.parse(sourceConf)
+    val partCols = partitionColumns(spark, cfg)
+    cfg.where.foreach(w => checkWhere(w, partCols))
+    val pred = PartitionPredicate(partCols.map(_._1), None, None, cfg.where)
+    logger.info(s"[HiveSource] ${cfg.fullTable}: reading every partition" +
+      cfg.where.map(w => s" where $w").getOrElse("") + " (no watermark — reconciliation read)")
+    applyMissingFiles(spark, cfg)
+    applyContract(spark.table(cfg.fullTable).filter(pred.column), sourceConf)
+  }
+
   override def advanceWatermark(
     spark: SparkSession,
     sourceConf: Config,

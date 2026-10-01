@@ -33,6 +33,24 @@ object IngestMain {
     val feedConf = baseConf.getConfig(s"feeds.${cli.entity}")
 
     val spark = SparkSession.builder().enableHiveSupport().getOrCreate()
+    // execute rethrows an UNCLASSIFIED failure — the JVM then exits 1 exactly
+    // as an uncaught throw always did — and returns the exit code of a
+    // CLASSIFIED one, applied only after the context has stopped cleanly.
+    val exit = try execute(spark, baseConf, feedConf, cli) finally spark.stop()
+    if (exit != 0) System.exit(exit)
+  }
+
+  /**
+    * Runs one CLI invocation against an existing session and returns the
+    * process exit code it should end with: 0 on success, the classified code
+    * on a classified failure. An unclassified failure is rethrown after the
+    * same logging and notification — the caller decides what an uncaught
+    * throw means (for `main`: JVM exit 1, unchanged). Separated from `main`
+    * only so a test can drive a stage end to end without a JVM exit or a
+    * stopped session; every log line, the classification and the
+    * notification are on this path exactly as before.
+    */
+  private[app] def execute(spark: SparkSession, baseConf: Config, feedConf: Config, cli: Cli): Int = {
     try {
       spark.sqlContext.setConf("spark.sql.caseSensitive", "false")
       // All framework-stamped timestamps (load_timestamp, create_timestamp,
@@ -73,6 +91,7 @@ object IngestMain {
         case _ =>
           new IngestPipeline(spark, feedConf, cli, logger).run()
       }
+      0
     } catch {
       case error: Throwable =>
         logger.error(s"Ingest failed entity=${cli.entity}", error)
@@ -102,22 +121,13 @@ object IngestMain {
             logger.warn(s"[Notify] failure notification could not be sent: " +
               s"${notifyError.getMessage}")
         }
-        classifiedExit = failure.exitCode
-        throw error
-    } finally {
-      spark.stop()
-      // AFTER spark.stop(), so the context shuts down cleanly first. Only an
-      // explicitly classified failure changes the code; Unclassified is 1,
-      // exactly what an uncaught throw already produced.
-      if (classifiedExit != 0 &&
-          classifiedExit != com.hcsc.generic.ingest.runtime.FailureClass.Unclassified.exitCode)
-        System.exit(classifiedExit)
+        // Only an explicitly classified failure changes the exit code;
+        // Unclassified is rethrown — exactly what an uncaught throw already
+        // produced.
+        if (failure == com.hcsc.generic.ingest.runtime.FailureClass.Unclassified) throw error
+        failure.exitCode
     }
   }
-
-  /** Set by the failure handler, read by the finally block after the Spark
-    * context has stopped. */
-  @volatile private var classifiedExit: Int = 0
 
   /**
     * Loads the base configuration, tolerating a BARE filename on either
@@ -349,8 +359,16 @@ object IngestMain {
       entity = cli.entity, mode = cli.mode,
       rawFlag = cli.rawFlag.getOrElse(""), dryRun = cli.dryRun)
     val audit = com.hcsc.generic.ingest.audit.AuditService(spark, feedConf)
-    val service = new com.hcsc.generic.ingest.jdbc.reconcile
-      .SourceReconciliationService(spark, feedConf, logger)
+    // Dispatched on source type BEFORE the lock is taken: a feed that cannot
+    // be reconciled must not claim the entity, leave a lock row, or write a
+    // ledger row on its way to a config error.
+    val service: com.hcsc.generic.ingest.reconcile.SourceReconciler =
+      ConfigUtils.optString(feedConf, "source.type").map(_.toLowerCase).getOrElse("file") match {
+        case "jdbc" => new com.hcsc.generic.ingest.jdbc.reconcile.SourceReconciliationService(spark, feedConf, logger)
+        case "hive" => new com.hcsc.generic.ingest.hive.reconcile.HiveSourceReconciliation(spark, feedConf, logger)
+        case other => throw new IllegalArgumentException(
+          s"CFG_026 --stage reconcile is not supported for source.type = '$other'; supported: jdbc, hive")
+      }
 
     // The entity lock keeps the comparison from reading a half-written
     // curated table, and the HEARTBEAT keeps a long comparison from losing
@@ -408,7 +426,7 @@ object IngestMain {
     }
   }
 
-  private def registerConnectors(): Unit = {
+  private[app] def registerConnectors(): Unit = {
     FileSource.register()
     JdbcSource.register()
     KafkaSource.register()

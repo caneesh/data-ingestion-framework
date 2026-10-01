@@ -2,7 +2,7 @@
 
 **Status:** author pass merged with an independent QA enumeration and a
 regression inventory of every touched file (2026-09-30). Baseline `mvn test`
-recorded (R-01: 884 tests, 0 failures; after H1: 890). Items marked ◆ were
+recorded (R-01: 884 tests, 0 failures; after H1: 890; after H2–H5: 949). Items marked ◆ were
 found by the independent pass and missed by the author pass. Section L
 (2026-09-30) covers `raw.mode = SOURCE`, decided after the first pass. Companion to `HIVE_RAW_CURATED_IMPLEMENTATION_PLAN.md`;
 plan item references (H0–H10) are to that document.
@@ -255,7 +255,7 @@ a behavior the plan touches has **no test today**, a golden test is added
 
 | # | Invariant | Evidence / action |
 |---|-----------|-------------------|
-| R-01 | Baseline test counts per module, before any change | **Recorded 2026-09-30, main @ `a4ab516`, `mvn test -fae -Dmaven.test.failure.ignore=true`, BUILD SUCCESS in 11:17** — core 356 tests / 48 suites; file 26 / 4; jdbc 251 / 35; kafka **0 / 0 (no test directory)**; config-gen 78 / 15; app 173 / 19. **Total 884 tests, 121 suites, 0 failed / canceled / ignored.** Re-run after each PR; a module whose count drops or whose failures rise above 0 is a stop. **After H1** (branch `h1/watermark-to-core`, 2026-09-30): core 358 (+2 `WatermarkValueTest`), file 26, jdbc 255 (+4 `WatermarkStoresTest`), kafka 0, config-gen 78, app 173 — **total 890, 0 failed / canceled / ignored**, BUILD SUCCESS 11:32, fat-jar layout verified |
+| R-01 | Baseline test counts per module, before any change | **Recorded 2026-09-30, main @ `a4ab516`, `mvn test -fae -Dmaven.test.failure.ignore=true`, BUILD SUCCESS in 11:17** — core 356 tests / 48 suites; file 26 / 4; jdbc 251 / 35; kafka **0 / 0 (no test directory)**; config-gen 78 / 15; app 173 / 19. **Total 884 tests, 121 suites, 0 failed / canceled / ignored.** Re-run after each PR; a module whose count drops or whose failures rise above 0 is a stop. **After H1** (branch `h1/watermark-to-core`, 2026-09-30): core 358 (+2 `WatermarkValueTest`), file 26, jdbc 255 (+4 `WatermarkStoresTest`), kafka 0, config-gen 78, app 173 — **total 890, 0 failed / canceled / ignored**, BUILD SUCCESS 11:32, fat-jar layout verified. **After H2–H4** (`8df162f`): + hive 42 → **932**. **After H5**: core 372 (+2 goldens, +3 pattern, +6 validator, +3 FailureClass incl. the `ARCHIVE_` regression), jdbc 256 (+1 R-09), app 175 (+2 R-10), hive 42, others unchanged → **949, 0 failed / canceled / ignored**, BUILD SUCCESS 11:31; goldens pass before and after the pattern change |
 | R-02 | JDBC watermark behavior unchanged after H1 (predicates, overlap, bounded windows, CAS, duplicate-version pick) | `WatermarksTest`, `WatermarkCodecsTest`, `WatermarkHardeningTest:60`, `IncrementalWindowFixesTest:69, :97`, `BoundedWindowH2Test`, `JdbcSourceH2Test:184`; `HiveWatermarkStoreSpec`, `HiveWatermarkDuplicateVersionSpec:47` (app) |
 | R-03 | `JDBC_003` / `JDBC_005` message text unchanged by the package move | Asserted in `HiveWatermarkStoreSpec:70-74, :86`, `JdbcSourceH2Test`, `PartitionStrategiesH2Test:80`, `BoundedFullLoadTest:49` — the strings are the contract |
 | R-04 | `WatermarkValue` codec: the two existing round-trip tests move with the type | `WatermarkCodecsTest:89` (+ legacy unescaped at :102-103), `WatermarksTest:103`. The plan's "no codec test exists" was wrong; corrected in H1 |

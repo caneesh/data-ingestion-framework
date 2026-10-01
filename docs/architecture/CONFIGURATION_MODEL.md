@@ -129,6 +129,10 @@ feeds.claims {
 | CFG_017 | `freshness.compare_as` not a valid Spark type; `compare_as` and `compare_format` both declared; unparseable `tie_breakers` / `dedup.order_by` ordering syntax |
 | CFG_018 | `--conf-path` names a file that does not exist (typically: not shipped with `--files`) |
 | CFG_022 | `reconcile.on_mismatch` is not REPORT/FAIL; `--stage reconcile` on a feed with no curated block, a missing curated table, or a business key absent from it |
+| CFG_023 | hive source with `mode = INCR` without explicit `source.incremental.watermark_columns` and `initial_value` (a hive watermark has no contract fallback) |
+| CFG_024 | JDBC watermark settings (`overlap`, `watermark_type`, `upper_bound`, `clock_zone`) on a hive source — they have no effect there |
+| CFG_025 | hive `initial_value` arity differs from `watermark_columns` (components are `\|`-separated) |
+| CFG_027 | hive `lookback` naming neither or both of `days` / `partitions`, or a non-positive value |
 | CFG_021 | `audit.reconciliation.min_accepted_rows` is negative, or set with `audit.enabled = false` (a floor that can never trip reads as protection while detecting nothing) |
 | CUR_010 | `curated.merge.normalize` targets a column absent from the incoming data (skipping it would leave business keys un-normalized and insert duplicates instead of merging) |
 | CFG_019 | `--override-path` names a file that does not exist (fail-closed: an override that silently did not apply is worse than a failed run) |

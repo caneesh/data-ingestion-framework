@@ -169,7 +169,10 @@ object HiveSource extends Source with WatermarkAdvancing {
     runId: String,
     accepted: DataFrame
   ): Unit = {
+    // The bare-entity key covers a standalone read whose config carried no
+    // run_id (the pipeline always injects one), as JdbcSource does.
     val window = Option(readWindows.remove(windowKey(entity, Some(runId))))
+      .orElse(Option(readWindows.remove(windowKey(entity, None))))
     val cfg = window.map(_.cfg).getOrElse(HiveSourceConfig.parse(sourceConf))
     cfg.watermark match {
       case None =>
@@ -370,8 +373,10 @@ object HiveSource extends Source with WatermarkAdvancing {
   private def applyMissingFiles(spark: SparkSession, cfg: HiveSourceConfig): Unit = {
     val ignore = cfg.missingFiles == "IGNORE"
     spark.conf.set("spark.sql.files.ignoreMissingFiles", ignore.toString)
-    logger.warn(s"[HiveSource] spark.sql.files.ignoreMissingFiles=$ignore set SESSION-wide from " +
-      s"source.missing_files = ${cfg.missingFiles}; it applies to every read in this Spark session")
+    val message = s"[HiveSource] spark.sql.files.ignoreMissingFiles=$ignore set SESSION-wide from " +
+      s"source.missing_files = ${cfg.missingFiles}; it applies to every read in this Spark session"
+    // FAIL is Spark's own default — only the deviation deserves a warning.
+    if (ignore) logger.warn(message) else logger.info(message)
   }
 
   private def logZeroRowPartitions(df: DataFrame, partNames: Seq[String], selected: Seq[Map[String, String]]): Unit = {

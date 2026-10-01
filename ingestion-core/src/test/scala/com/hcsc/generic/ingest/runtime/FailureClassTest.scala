@@ -105,4 +105,25 @@ class FailureClassTest extends AnyFunSuite {
     assert(all.map(_.exitCode).distinct.length == all.length)
     assert(!all.map(_.exitCode).contains(0), "0 must stay reserved for success")
   }
+
+  // ---- hive source ------------------------------------------------------------
+
+  test("HIVE_ codes are CONFIGURATION, except HIVE_008 which is data gone at the source") {
+    assert(classOf("HIVE_003 watermark column 'x' is not a partition column") == FailureClass.Configuration)
+    assert(classOf("HIVE_007 run_mode = FULL refused") == FailureClass.Configuration)
+    val gone = classOf("HIVE_008 no partition exists in the window (a, b]")
+    assert(gone == FailureClass.DataIntegrity)
+    assert(!gone.retryable, "re-reading a purged partition cannot succeed; a human must look")
+  }
+
+  test("the HIVE_ match is letter-bounded: an archive path must not read as a hive code") {
+    assert(classOf("copy to hdfs:///data/membership/archive_2026/x failed") == FailureClass.Unclassified)
+    assert(classOf("HIVE_003 watermark column 'x' is not a partition column") == FailureClass.Configuration)
+  }
+
+  test("metastore transport faults are TRANSIENT; a MetaException alone is not") {
+    assert(classOf("org.apache.thrift.transport.TTransportException: java.net.SocketException") == FailureClass.Transient)
+    assert(classOf("MetaException(message:Could not connect to meta store using any of the URIs provided)") == FailureClass.Transient)
+    assert(classOf("MetaException(message:Table not found)") != FailureClass.Transient)
+  }
 }

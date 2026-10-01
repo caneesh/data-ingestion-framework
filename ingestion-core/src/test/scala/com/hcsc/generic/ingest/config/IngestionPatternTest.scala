@@ -99,4 +99,55 @@ class IngestionPatternTest extends AnyFunSuite {
       jdbc("INCREMENTAL", tsBlock) + """
         curated { merge { keys = ["id"] } }""")).isEmpty)
   }
+
+  // ---- goldens: pinned BEFORE the hive branch was added ---------------------
+
+  test("golden: a source type the model does not know falls through to FILE / FULL_SNAPSHOT") {
+    val (custom, e1) = derive("""source { type = "custom" }""")
+    assert(e1.isEmpty)
+    assert(custom.extractionMode == "FILE")
+    assert(custom.pattern == IngestionPattern.FullSnapshot)
+    assert(custom.watermarkStrategy == "NONE")
+    assert(custom.upperBoundStrategy == "NONE")
+    assert(derive("""source { type = "kafka" }""")._1.extractionMode == "KAFKA")
+  }
+
+  test("golden: a jdbc incremental block without upper_bound defaults to MAX_VALUE") {
+    val (spec, errors) = derive(jdbc("INCREMENTAL", tsBlock))
+    assert(errors.isEmpty)
+    assert(spec.upperBoundStrategy == "MAX_VALUE")
+  }
+
+  // ---- hive ------------------------------------------------------------------
+
+  private val hiveInc =
+    """source { type = "hive", database = "d", table = "t",
+      |  incremental { watermark_columns = ["file_date", "file_time"],
+      |    initial_value = "1900-01-01|00.00.00" } }""".stripMargin
+
+  test("a hive source with an incremental block derives PARTITION_INCREMENTAL") {
+    val (spec, errors) = derive(hiveInc)
+    assert(errors.isEmpty, errors.mkString("; "))
+    assert(spec.pattern == IngestionPattern.PartitionIncremental)
+    assert(spec.extractionMode == "HIVE")
+    assert(spec.watermarkStrategy == "PARTITION")
+    assert(spec.upperBoundStrategy == "PARTITION")
+    assert(spec.watermarkCommitAllowed)
+  }
+
+  test("a hive source without an incremental block is a FULL_SNAPSHOT with no watermark") {
+    val (spec, errors) = derive("""source { type = "hive", database = "d", table = "t" }""")
+    assert(errors.isEmpty)
+    assert(spec.pattern == IngestionPattern.FullSnapshot)
+    assert(spec.extractionMode == "HIVE")
+    assert(spec.watermarkStrategy == "NONE")
+    assert(spec.upperBoundStrategy == "NONE")
+  }
+
+  test("an explicit PARTITION_INCREMENTAL matches a hive feed; a jdbc pattern contradicts it (CFG_011)") {
+    assert(derive(hiveInc + """
+      ingestion { pattern = "PARTITION_INCREMENTAL" }""")._2.isEmpty)
+    assert(derive(hiveInc + """
+      ingestion { pattern = "TIMESTAMP_INCREMENTAL" }""")._2.exists(_.startsWith("CFG_011")))
+  }
 }

@@ -477,9 +477,21 @@ final class IngestPipeline(
     // Attach the schema contract for connector-side header resolution, plus
     // the entity name and run id so stateful sources (JDBC watermarks,
     // RUN_ID query parameters) see the pipeline's execution context.
-    val effectiveSource = withSchema(sourceConf
+    // run_mode — never `mode`, which is JDBC's extraction mode — gates FULL
+    // on a watermarked hive source (HIVE_007); the run-ledger coordinates let
+    // a source recover its read window in a fresh JVM (--resume, --pending)
+    // instead of silently skipping the watermark commit.
+    val ledgerKeys = ConfigUtils.optConfig(feedConf, "audit").toSeq.flatMap { a =>
+      ConfigUtils.optString(a, "database").toSeq.flatMap(db =>
+        Seq("audit_database" -> db,
+          "audit_run_table" -> ConfigUtils.optString(a, "run_table").getOrElse("ingest_run_audit")))
+    }
+    val effectiveSource = withSchema(ledgerKeys.foldLeft(sourceConf
       .withValue("entity", ConfigValueFactory.fromAnyRef(ctx.entity))
-      .withValue("run_id", ConfigValueFactory.fromAnyRef(ctx.runId)))
+      .withValue("run_id", ConfigValueFactory.fromAnyRef(ctx.runId))
+      .withValue("run_mode", ConfigValueFactory.fromAnyRef(ctx.mode))) {
+      case (c, (k, v)) => c.withValue(k, ConfigValueFactory.fromAnyRef(v))
+    })
 
     val rawDatabase = ConfigUtils.sqlIdentifier(rawConf, "database")
     val rawTable = ConfigUtils.sqlIdentifier(rawConf, "table")

@@ -26,6 +26,8 @@ object IngestionPattern {
   val TimestampOverlap      = "TIMESTAMP_OVERLAP"
   val CompositeWatermark    = "COMPOSITE_WATERMARK"
   val RowversionIncremental = "ROWVERSION_INCREMENTAL"
+  /** Hive source: partitions selected by a tuple watermark over partition columns. */
+  val PartitionIncremental  = "PARTITION_INCREMENTAL"
   val ChangeTracking        = "CHANGE_TRACKING"
   val CdcBatch              = "CDC_BATCH"
   val Backfill              = "BACKFILL"
@@ -33,7 +35,7 @@ object IngestionPattern {
 
   val all: Seq[String] = Seq(
     FullSnapshot, FullThenIncremental, TimestampIncremental, TimestampOverlap,
-    CompositeWatermark, RowversionIncremental, ChangeTracking, CdcBatch,
+    CompositeWatermark, RowversionIncremental, PartitionIncremental, ChangeTracking, CdcBatch,
     Backfill, RawReplay)
 
   /** Declared-but-unimplemented extraction capabilities. */
@@ -74,11 +76,15 @@ object IngestionPattern {
     val extractionMode = sourceType match {
       case "jdbc"  => jdbcMode.getOrElse("FULL_TABLE")
       case "kafka" => "KAFKA"
+      case "hive"  => "HIVE"
       case _       => "FILE"
     }
 
+    val hiveIncremental = sourceType == "hive" && incremental.isDefined
+
     val derivedPattern =
-      if (sourceType != "jdbc") FullSnapshot
+      if (sourceType == "hive") (if (hiveIncremental) PartitionIncremental else FullSnapshot)
+      else if (sourceType != "jdbc") FullSnapshot
       else if (jdbcMode.contains("INCREMENTAL")) watermarkType match {
         case Some("COMPOSITE")  => CompositeWatermark
         case Some("ROWVERSION") => RowversionIncremental
@@ -132,8 +138,11 @@ object IngestionPattern {
     (IngestionSpec(
       pattern = pattern,
       extractionMode = extractionMode,
-      watermarkStrategy = watermarkType.getOrElse("NONE"),
-      upperBoundStrategy = upperBound,
+      watermarkStrategy = if (hiveIncremental) "PARTITION" else watermarkType.getOrElse("NONE"),
+      // A hive watermark is bounded by the enumerated partitions, never by a
+      // MAX_VALUE / SOURCE_CLOCK capture — the JDBC default must not leak.
+      upperBoundStrategy =
+        if (sourceType == "hive") (if (hiveIncremental) "PARTITION" else "NONE") else upperBound,
       rawPolicy = "APPEND",
       curatedStrategy = curatedStrategy,
       deleteStrategy = deleteStrategy,

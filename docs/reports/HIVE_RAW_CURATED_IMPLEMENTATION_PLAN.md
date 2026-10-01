@@ -293,6 +293,11 @@ never resume a cross-module move with `-rf` (core resolves from `~/.m2`).
 
 ### H2 — New module `ingestion-hive`
 
+**Status: H2–H4 DONE 2026-09-30** on branch `h2-5/hive-source`, commit
+`8df162f` — module, `HiveSource`, `HiveSourceConfig`, `PartitionPredicate`,
+42 tests including the source-table invariant; full reactor 932 / 0,
+every pre-existing module unchanged; fat jar carries the package.
+
 - Mirror `ingestion-file/pom.xml` exactly (parent, `ingestion-core`,
   `scala-library`, `spark-sql`, scalatest; scala-maven / scalatest / surefire
   plugins). No new third-party dependency.
@@ -307,6 +312,10 @@ never resume a cross-module move with `-rf` (core resolves from `~/.m2`).
   `ingestion-jdbc` do.
 
 ### H3 — `HiveSource.read`
+
+**Status: DONE** — see H2. Implemented as specified, with `readWindow`
+for H11 and the fingerprint carried in `WatermarkCommitDetail.queryHash`
+under a `pk:` prefix.
 
 `object HiveSource extends Source with WatermarkAdvancing`,
 `sourceType = "hive"`. Same `readWindows: ConcurrentHashMap[(entity,runId)]`
@@ -420,6 +429,10 @@ the store is empty for the entity.
 
 ### H4 — `HiveSource` commit path
 
+**Status: DONE** — see H2. The ledger fallback declines to re-commit when
+the store is already at or beyond the ledger `window_end`, so `--resume`
+and `--pending` are idempotent.
+
 - `advanceWatermark`: remove the window; `recordIfVersion(entity, upper,
   runId, version, WatermarkCommitDetail(lower = Some(lower.serialized),
   queryHash = None))`. A `WatermarkConflictException` propagates — the run
@@ -441,6 +454,15 @@ the store is empty for the entity.
   and intent-override paths — nothing else to do.
 
 ### H5 — Validation and pattern derivation
+
+**Status: DONE 2026-09-30** on branch `h2-5/hive-source` — pattern branch,
+`CFG_023/024/025/027`, `run_mode` + `audit_database`/`audit_run_table`
+injection (never `mode`), exit-code classes, docs rows. Golden tests for
+the two previously untested `IngestionPattern` branches were written
+before the change and pass after it. Review finding fixed in the same
+change: the `HIVE_` → CONFIGURATION rule matched `ARCHIVE_…` paths; now
+letter-bounded, with a regression test. Full reactor 949 / 0 (core 372,
+jdbc 256, app 175, hive 42; others unchanged).
 
 - `config/IngestionPattern.derive`: add `case "hive" => "HIVE"` to
   `extractionMode` (`:74-78`) and a derived pattern

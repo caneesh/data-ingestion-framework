@@ -27,9 +27,9 @@ scheduler rerun of a failed job has always been safe.
 | Exit | Class | Scheduler action |
 |---|---|---|
 | `0` | success (including an empty no-op) | — |
-| `10` | `TRANSIENT` — connection reset, YARN preemption, lock contention, watermark conflict | retry with backoff |
-| `20` | `DATA_INTEGRITY` — reconciliation, contract, curated integrity | **never retry**; alert |
-| `30` | `CONFIGURATION` — `CFG_*`, missing file, bad credential | **never retry**; alert |
+| `10` | `TRANSIENT` — connection reset, YARN preemption, lock contention, watermark conflict, metastore unreachable | retry with backoff |
+| `20` | `DATA_INTEGRITY` — reconciliation, contract, curated integrity, `HIVE_008` (a replay window's partitions were purged at the source) | **never retry**; alert |
+| `30` | `CONFIGURATION` — `CFG_*`, `HIVE_*`, missing file, bad credential | **never retry**; alert |
 | `1` | unclassified | retry once, then alert |
 
 Classification is deliberately conservative: anything not confidently

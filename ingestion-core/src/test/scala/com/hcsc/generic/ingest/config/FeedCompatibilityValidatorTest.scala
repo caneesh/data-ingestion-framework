@@ -157,4 +157,68 @@ class FeedCompatibilityValidatorTest extends AnyFunSuite {
         |curated { strategy = "TYPE1_MERGE", merge { keys = [] } }""".stripMargin)
     assert(errors.size >= 2)
   }
+
+  // ---- hive sources (CFG_023, CFG_024, CFG_025, CFG_027) ---------------------
+
+  private def hive(inc: String, mode: String = "mode = \"INCR\"", extra: String = ""): String =
+    s"""$mode
+       |source { type = "hive", database = "d", table = "t" $inc }
+       |curated { merge { keys = ["id"] } }
+       |$extra""".stripMargin
+
+  private val goodInc =
+    """, incremental { watermark_columns = ["file_date", "file_time"],
+      |  initial_value = "1900-01-01|00.00.00", watermark_store { type = "memory" } }""".stripMargin
+
+  test("a coherent hive incremental feed validates cleanly") {
+    assert(errorsOf(hive(goodInc)).isEmpty, errorsOf(hive(goodInc)).mkString("; "))
+  }
+
+  test("hive with mode = INCR requires explicit watermark columns and an initial value (CFG_023)") {
+    assert(errorsOf(hive("")).exists(_.startsWith("CFG_023")), "no incremental block")
+    assert(errorsOf(hive(""", incremental { initial_value = "1900-01-01" }"""))
+      .exists(_.startsWith("CFG_023")), "no watermark_columns")
+    assert(errorsOf(hive(""", incremental { watermark_columns = [] , initial_value = "x" }"""))
+      .exists(_.startsWith("CFG_023")), "empty watermark_columns")
+    assert(errorsOf(hive(""", incremental { watermark_columns = ["file_date"] }"""))
+      .exists(_.startsWith("CFG_023")), "no initial_value")
+    // Not an INCR feed: the rule is silent
+    assert(!errorsOf(hive("", mode = "")).exists(_.startsWith("CFG_023")))
+    assert(!errorsOf(hive("", mode = "mode = \"FULL\"")).exists(_.startsWith("CFG_023")))
+  }
+
+  test("JDBC watermark settings on a hive source are rejected, one error each (CFG_024)") {
+    Seq("overlap = \"300\"", "watermark_type = \"TIMESTAMP\"", "upper_bound = \"SOURCE_CLOCK\"",
+      "clock_zone = \"UTC\"").foreach { k =>
+      val errors = errorsOf(hive(
+        s""", incremental { watermark_columns = ["file_date"], initial_value = "1900-01-01", $k }"""))
+      assert(errors.count(_.startsWith("CFG_024")) == 1, s"$k -> $errors")
+      assert(errors.exists(e => e.startsWith("CFG_024") && e.contains(k.takeWhile(_ != ' '))))
+    }
+  }
+
+  test("an initial_value whose arity differs from watermark_columns is rejected (CFG_025)") {
+    assert(errorsOf(hive(
+      """, incremental { watermark_columns = ["file_date", "file_time"], initial_value = "1900-01-01" }"""))
+      .exists(_.startsWith("CFG_025")))
+    assert(!errorsOf(hive(goodInc)).exists(_.startsWith("CFG_025")))
+  }
+
+  test("lookback must name exactly one positive bound (CFG_027)") {
+    def withLookback(lb: String) = hive(
+      s""", incremental { watermark_columns = ["file_date"], initial_value = "1900-01-01",
+         |  lookback { $lb } }""".stripMargin)
+    assert(errorsOf(withLookback("")).exists(_.startsWith("CFG_027")), "neither")
+    assert(errorsOf(withLookback("days = 3, partitions = 2")).exists(_.startsWith("CFG_027")), "both")
+    assert(errorsOf(withLookback("days = 0")).exists(_.startsWith("CFG_027")), "zero")
+    assert(errorsOf(withLookback("partitions = -1")).exists(_.startsWith("CFG_027")), "negative")
+    assert(!errorsOf(withLookback("days = 3")).exists(_.startsWith("CFG_027")))
+    assert(!errorsOf(withLookback("partitions = 2")).exists(_.startsWith("CFG_027")))
+  }
+
+  test("the file-only and jdbc-only rules stay silent for hive sources") {
+    val errors = errorsOf(hive(goodInc))
+    assert(!errors.exists(_.startsWith("CFG_008")), "CFG_008 is file-only")
+    assert(!errorsOf(hive(goodInc, extra = "")).exists(_.startsWith("CFG_009")), "CFG_009 is jdbc-only")
+  }
 }

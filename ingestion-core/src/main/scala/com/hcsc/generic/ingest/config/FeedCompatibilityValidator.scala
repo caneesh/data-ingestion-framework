@@ -1,5 +1,6 @@
 package com.hcsc.generic.ingest.config
 
+import com.hcsc.generic.ingest.watermark.WatermarkValue
 import com.typesafe.config.Config
 
 /**
@@ -85,6 +86,42 @@ object FeedCompatibilityValidator {
     // configured on them will be silently ignored — reject instead.
     if (sourceType.contains("file") && feed.hasPath("source.incremental"))
       errors += "CFG_008 source.incremental (JDBC watermarks) has no effect on file sources"
+
+    // A hive source selects partitions by a tuple watermark over partition
+    // columns: the columns are explicit (no contract fallback), the JDBC
+    // watermark knobs do not apply, and the lookback has exactly one shape.
+    // Message texts match HiveSourceConfig so both surfaces agree.
+    if (sourceType.contains("hive")) {
+      val inc = ConfigUtils.optConfig(feed, "source").flatMap(s => ConfigUtils.optConfig(s, "incremental"))
+      val wmColumns = inc.map(i => ConfigUtils.stringList(i, "watermark_columns")).getOrElse(Seq.empty)
+      val initial = inc.flatMap(i => ConfigUtils.optString(i, "initial_value"))
+      if (opt("mode").contains("INCR") && (inc.isEmpty || wmColumns.isEmpty || initial.isEmpty))
+        errors += "CFG_023 a hive source with mode = INCR requires source.incremental.watermark_columns " +
+          "(explicit, non-empty) and source.incremental.initial_value"
+      Seq("overlap", "watermark_type", "upper_bound", "clock_zone").foreach { k =>
+        if (feed.hasPath(s"source.incremental.$k"))
+          errors += s"CFG_024 source.incremental.$k is a JDBC watermark setting with no effect on a hive source"
+      }
+      initial.filter(_ => wmColumns.nonEmpty).foreach { iv =>
+        val arity = WatermarkValue.deserialize(iv).values.size
+        if (arity != wmColumns.size)
+          errors += s"CFG_025 source.incremental.initial_value '$iv' has $arity component(s) but " +
+            s"watermark_columns has ${wmColumns.size}; separate components with '|'"
+      }
+      inc.flatMap(i => ConfigUtils.optConfig(i, "lookback")).foreach { lb =>
+        (ConfigUtils.optInt(lb, "days"), ConfigUtils.optInt(lb, "partitions")) match {
+          case (Some(_), Some(_)) =>
+            errors += "CFG_027 source.incremental.lookback must name exactly one of days | partitions, not both"
+          case (None, None) =>
+            errors += "CFG_027 source.incremental.lookback must name one of days | partitions"
+          case (Some(d), None) if d <= 0 =>
+            errors += s"CFG_027 source.incremental.lookback.days must be a positive integer, found $d"
+          case (None, Some(p)) if p <= 0 =>
+            errors += s"CFG_027 source.incremental.lookback.partitions must be a positive integer, found $p"
+          case _ => ()
+        }
+      }
+    }
 
     // An incremental JDBC feed produces window deltas — via the legacy
     // source.mode OR an incremental extraction strategy. A state-deriving

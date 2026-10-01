@@ -43,6 +43,14 @@ object FailureClass {
     "JDBC_005"  // watermark optimistic-concurrency conflict — a racing run won
   )
 
+  /** A hive source error code, letter-bounded: a plain substring match on
+    * "HIVE_" would also hit "ARCHIVE_" — a message carrying a path such as
+    * /data/membership/archive_2026/x must not become CONFIGURATION. */
+  private val hiveCode = "(?<![A-Z])HIVE_\\d{3}".r
+  private def hasHiveCode(upper: String, code: String = ""): Boolean =
+    if (code.isEmpty) hiveCode.findFirstIn(upper).isDefined
+    else hiveCode.findAllIn(upper).contains(code)
+
   /** Exception types that carry their own verdict, checked before any text. */
   private def byType(error: Throwable): Option[FailureClass] = error match {
     case _: com.hcsc.generic.ingest.lock.PipelineLockException      => Some(Transient)
@@ -59,7 +67,10 @@ object FailureClass {
     "connection reset", "connection refused", "connection timed out",
     "broken pipe", "the tcp/ip connection to the host",
     "socket closed", "no route to host", "temporarily unavailable",
-    "container killed by yarn", "container preempted", "executor lost")
+    "container killed by yarn", "container preempted", "executor lost",
+    // Hive metastore transport faults. Not MetaException — that can be
+    // permanent (a bad table definition raises one too).
+    "ttransportexception", "could not connect to meta store")
 
   /**
     * Classifies a failure by exception type, then error code, then a narrow
@@ -75,8 +86,10 @@ object FailureClass {
 
       if (transientCodes.exists(upper.contains)) Transient
       else if (upper.contains("RECONCILIATION FAILED")) DataIntegrity
-      else if (Seq("CUR_", "HDR_").exists(upper.contains)) DataIntegrity
-      else if (Seq("CFG_", "RAW_001", "JDBC_002", "JDBC_003").exists(upper.contains)) Configuration
+      // HIVE_008 (a recorded replay window no longer exists at the source)
+      // is data gone, not config wrong — it must be matched before HIVE_.
+      else if (Seq("CUR_", "HDR_").exists(upper.contains) || hasHiveCode(upper, "HIVE_008")) DataIntegrity
+      else if (Seq("CFG_", "RAW_001", "JDBC_002", "JDBC_003").exists(upper.contains) || hasHiveCode(upper)) Configuration
       else if (transientText.exists(text.toLowerCase.contains)) Transient
       else Unclassified
     }

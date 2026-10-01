@@ -26,6 +26,24 @@ class JdbcSourceConfigTest extends AnyFunSuite {
     assert(cfg.healthCheckEnabled)
   }
 
+  test("the pipeline's injected execution context never shadows source.mode (R-09)") {
+    // The pipeline injects run_mode (FULL | INCR) beside entity / run_id and
+    // the run-ledger coordinates. Had that key been `mode`, every incremental
+    // JDBC feed would silently become a full-table extract.
+    val cfg = parse(sqlServerBase +
+      """
+        |mode = "INCREMENTAL"
+        |incremental { watermark_type = "TIMESTAMP", watermark_columns = ["ts"],
+        |  initial_value = "1900-01-01 00:00:00", watermark_store { type = "memory" } }
+        |entity = "e"
+        |run_id = "r1"
+        |run_mode = "FULL"
+        |audit_database = "ingest_audit"
+        |audit_run_table = "ingest_run_audit"
+      """.stripMargin)
+    assert(cfg.mode == "INCREMENTAL")
+  }
+
   test("companion query timeout defaults to 300s and is configurable") {
     assert(parse(sqlServerBase).companionTimeoutSeconds == 300)
     assert(parse(sqlServerBase + "\ncompanion_timeout_seconds = 60").companionTimeoutSeconds == 60)
